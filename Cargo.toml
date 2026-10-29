@@ -1,0 +1,31 @@
+[workspace]
+members = [
+  "components/libs/cu_kinematics",
+]
+default-members = [
+  "components/libs/cu_kinematics",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+authors = ["Lucas"]
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+keywords = ["robotics", "manipulation", "kinematics", "copper", "real-time"]
+categories = ["science::robotics"]
+repository = "https://github.com/copper-project/copper-rs"
+
+[workspace.dependencies]
+cu29 = { version = "1.3.1", default-features = false, features = ["units"] }
+cu-spatial-payloads = { version = "1.3.0", default-features = false }
+bincode = { package = "cu-bincode", version = "2.2.0", default-features = false, features = [
+  "derive",
+  "alloc",
+] }
+serde = { version = "1.0", default-features = false, features = [
+  "derive",
+  "alloc",
+] }
+libm = "0.2"

@@ -1,0 +1,5 @@
+/target
+Cargo.lock
+*.copper
+logs/
+.DS_Store

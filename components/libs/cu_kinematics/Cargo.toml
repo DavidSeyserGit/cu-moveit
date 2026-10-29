@@ -1,0 +1,27 @@
+[package]
+name = "cu-kinematics"
+description = "Deterministic, allocation-free serial robot kinematics (FK, Jacobian, IK) for copper-rs"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+repository.workspace = true
+
+[package.metadata.copper]
+kind = "lib"
+domains = ["math/kinematics", "algorithm/manipulation"]
+environments = ["host", "embedded"]
+
+[dependencies]
+bincode = { workspace = true }
+cu-spatial-payloads = { workspace = true }
+cu29 = { workspace = true }
+libm = { workspace = true }
+serde = { workspace = true }
+
+[features]
+default = ["std"]
+std = ["cu29/std", "bincode/std", "serde/std"]
