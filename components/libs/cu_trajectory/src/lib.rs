@@ -9,7 +9,12 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
+pub mod parameterize;
 pub mod serde_arrays;
+
+pub use parameterize::CuJointTrajectoryLimits;
+pub use parameterize::CuParameterizeStatus;
+pub use parameterize::parameterize_trajectory;
 
 use bincode::Decode;
 use bincode::Encode;

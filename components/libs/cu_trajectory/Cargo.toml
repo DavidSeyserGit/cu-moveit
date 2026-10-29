@@ -20,6 +20,7 @@ environments = ["host", "embedded"]
 bincode = { workspace = true }
 cu-kinematics = { version = "0.1.0", path = "../cu_kinematics", default-features = false }
 cu29 = { workspace = true }
+libm = { workspace = true }
 serde = { workspace = true }
 
 [features]
