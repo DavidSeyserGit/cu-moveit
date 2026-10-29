@@ -12,7 +12,7 @@ in that order.
 
 - Every phase below is closed only when all of its done-criteria hold
   (see Validation Plan).
-- The stack runs end-to-end in a Copper example app: robot description in,
+- The stack runs end-to-end in a local demonstration: robot description in,
   planned and timed trajectory out, executed under collision monitoring.
 - Public APIs are documented, semver-stable in intent, and crates.io-ready;
   no placeholder surfaces ship as "done".
@@ -47,8 +47,9 @@ tasks, deterministic replay-compatible behaviour.
    geometric paths under velocity/acceleration/jerk limits (TOPP-style) into
    fixed-capacity trajectory payloads; `CuFollowTrajectoryTask<N>` with
    interpolation, progress/failure reporting, preemption, and abort; execution
-   monitoring against the collision model. Example app proves URDF → RRT* →
-   timed trajectory → simulated execution end-to-end.
+   monitoring against the collision model. A local-only demonstration (in the
+   git-excluded `playground/`, never committed) proves URDF → RRT* → timed
+   trajectory → simulated execution end-to-end.
 2. **Planning completeness.** Versioned, fixed-capacity planning-scene API
    (attached objects, obstacle add/remove) shared by collision and planner
    tasks; Cartesian paths and pose-goal planning on the existing IK; added
@@ -87,7 +88,8 @@ A phase counts as done only when all four hold:
 2. The phase's public API is documented and semver-stable in intent.
 3. Packaging metadata (repository, license, keywords, categories) is correct
    and crates.io-ready.
-4. A runnable Copper example app demonstrates the phase end-to-end.
+4. A runnable local demonstration (in `playground/`, never committed)
+   demonstrates the phase end-to-end.
 
 Passing tests alone does not close a phase.
 
@@ -117,4 +119,4 @@ Passing tests alone does not close a phase.
 - Undecided: additional robot presets beyond the igus ReBeL (added only when a
   bridge or user needs one); the second bridge target after `cu-igus-cri`
   (decided by hardware access); whether benchmark results ship as a report
-  crate or as example apps.
+  crate or as local demonstrations.
