@@ -2,6 +2,8 @@
 //! and velocity/twist differential inverse kinematics with singularity and joint-limit damping.
 
 use crate::chain::CuKinematicChain;
+use crate::joint::CuJointPosition;
+use crate::joint::CuJointVelocity;
 use bincode::Decode;
 use bincode::Encode;
 use cu_spatial_payloads::Transform3D;
@@ -30,6 +32,8 @@ pub struct CuIkConfig {
     pub damping: f64,
     /// Maximum per-iteration joint step magnitude.
     pub max_step: Angle64,
+    /// Maximum per-iteration prismatic displacement.
+    pub max_linear_step: Length64,
     /// Whether to clamp joint angles to joint limits at each step.
     pub enforce_joint_limits: bool,
 }
@@ -42,6 +46,7 @@ impl Default for CuIkConfig {
             orientation_tolerance: Angle64::new::<radian>(1e-3),
             damping: 0.05,
             max_step: Angle64::new::<radian>(0.25),
+            max_linear_step: Length64::new::<meter>(0.025),
             enforce_joint_limits: true,
         }
     }
@@ -71,6 +76,9 @@ impl CuIkConfig {
         }
         if let Some(v) = cfg.get::<f64>("max_step_rad")? {
             out.max_step = Angle64::new::<radian>(v);
+        }
+        if let Some(v) = cfg.get::<f64>("max_linear_step_m")? {
+            out.max_linear_step = Length64::new::<meter>(v);
         }
         if let Some(v) = cfg.get::<bool>("enforce_joint_limits")? {
             out.enforce_joint_limits = v;
@@ -192,6 +200,8 @@ pub struct CuDiffIkConfig {
     pub singularity_threshold_sq: f64,
     /// Joint-limit proximity margin within which motion toward a limit is smoothly damped.
     pub limit_margin: Angle64,
+    /// Prismatic joint-limit damping distance.
+    pub linear_limit_margin: Length64,
     /// Whether to uniformly scale output joint velocities when any joint exceeds `max_velocity`.
     pub enforce_velocity_limits: bool,
 }
@@ -203,6 +213,7 @@ impl Default for CuDiffIkConfig {
             max_singularity_damping: 0.25,
             singularity_threshold_sq: 1e-4,
             limit_margin: Angle64::new::<radian>(0.15),
+            linear_limit_margin: Length64::new::<meter>(0.015),
             enforce_velocity_limits: true,
         }
     }
@@ -229,6 +240,9 @@ impl CuDiffIkConfig {
         }
         if let Some(v) = cfg.get::<f64>("limit_margin_rad")? {
             out.limit_margin = Angle64::new::<radian>(v);
+        }
+        if let Some(v) = cfg.get::<f64>("linear_limit_margin_m")? {
+            out.linear_limit_margin = Length64::new::<meter>(v);
         }
         if let Some(v) = cfg.get::<bool>("enforce_velocity_limits")? {
             out.enforce_velocity_limits = v;
@@ -262,7 +276,7 @@ impl Default for CuDiffIkStatus {
 
 impl<const N: usize> CuKinematicChain<N> {
     /// Computes Yoshikawa's manipulability index squared $w^2 = \max(0, \det(J J^T))$ at `q`.
-    pub fn manipulability_squared(&self, q: &[Angle64; N]) -> CuResult<f64> {
+    pub fn manipulability_squared(&self, q: &[CuJointPosition; N]) -> CuResult<f64> {
         let mut jac = [[0.0_f64; N]; 6];
         self.geometric_jacobian(q, &mut jac)?;
         Ok(manipulability_sq_from_jacobian(&jac))
@@ -272,10 +286,10 @@ impl<const N: usize> CuKinematicChain<N> {
     /// singularity-robust and joint-limit-aware damped least squares.
     pub fn differential_ik(
         &self,
-        q: &[Angle64; N],
+        q: &[CuJointPosition; N],
         twist: &CuTwist6D,
         cfg: &CuDiffIkConfig,
-        out_qd: &mut [AngularVelocity64; N],
+        out_qd: &mut [CuJointVelocity; N],
     ) -> CuResult<CuDiffIkStatus> {
         if cfg.base_damping <= 0.0
             || !cfg.base_damping.is_finite()
@@ -289,6 +303,15 @@ impl<const N: usize> CuKinematicChain<N> {
             ));
         }
 
+        if !cfg.limit_margin.get::<radian>().is_finite()
+            || cfg.limit_margin.get::<radian>() < 0.0
+            || !cfg.linear_limit_margin.get::<meter>().is_finite()
+            || cfg.linear_limit_margin.get::<meter>() < 0.0
+        {
+            return Err(CuError::from(
+                "Joint-limit damping margins must be finite and nonnegative",
+            ));
+        }
         let v_raw = twist.to_raw_array();
         let mut idx_v = 0;
         while idx_v < 6 {
@@ -340,7 +363,7 @@ impl<const N: usize> CuKinematicChain<N> {
 
         // Compute raw joint velocities qd = J^T * y and apply smooth joint-limit margin damping
         // when moving toward a joint limit.
-        let margin = cfg.limit_margin.get::<radian>();
+
         let joints = self.joints();
         let mut raw_qd = [0.0_f64; N];
         let mut velocity_scale = 1.0_f64;
@@ -354,10 +377,19 @@ impl<const N: usize> CuKinematicChain<N> {
                 row += 1;
             }
 
-            if margin > 0.0 {
-                let q_rad = q[j].get::<radian>();
-                let lower = joints[j].limits.lower.get::<radian>();
-                let upper = joints[j].limits.upper.get::<radian>();
+            let margin = match q[j] {
+                CuJointPosition::Prismatic(_) => cfg.linear_limit_margin.get::<meter>(),
+                _ => cfg.limit_margin.get::<radian>(),
+            };
+            if margin > 0.0
+                && !matches!(
+                    joints[j].limits,
+                    crate::joint::CuJointLimits::Continuous { .. }
+                )
+            {
+                let q_rad = q[j].si_value();
+                let lower = joints[j].limits.lower().si_value();
+                let upper = joints[j].limits.upper().si_value();
                 if qd_j < 0.0 {
                     let dist_low = (q_rad - lower).max(0.0);
                     if dist_low < margin {
@@ -376,9 +408,9 @@ impl<const N: usize> CuKinematicChain<N> {
             raw_qd[j] = qd_j;
 
             if cfg.enforce_velocity_limits {
-                let max_v = joints[j].limits.max_velocity.get::<radian_per_second>();
+                let max_v = joints[j].limits.max_velocity().si_value();
                 let abs_v = libm::fabs(qd_j);
-                if max_v > 0.0 && abs_v > max_v {
+                if abs_v > max_v {
                     let candidate_scale = max_v / abs_v;
                     if candidate_scale < velocity_scale {
                         velocity_scale = candidate_scale;
@@ -390,7 +422,7 @@ impl<const N: usize> CuKinematicChain<N> {
 
         let mut i = 0;
         while i < N {
-            out_qd[i] = AngularVelocity64::new::<radian_per_second>(raw_qd[i] * velocity_scale);
+            out_qd[i] = CuJointVelocity::from_coordinate(q[i], raw_qd[i] * velocity_scale);
             i += 1;
         }
 
@@ -417,9 +449,9 @@ impl<const N: usize> CuKinematicChain<N> {
     pub fn inverse_kinematics_dls(
         &self,
         target: &Transform3D<f64>,
-        seed: &[Angle64; N],
+        seed: &[CuJointPosition; N],
         cfg: &CuIkConfig,
-        out_q: &mut [Angle64; N],
+        out_q: &mut [CuJointPosition; N],
     ) -> CuResult<CuIkStatus> {
         if cfg.damping <= 0.0 || !cfg.damping.is_finite() {
             return Err(CuError::from(
@@ -429,15 +461,29 @@ impl<const N: usize> CuKinematicChain<N> {
         let pos_tol = cfg.position_tolerance.get::<meter>();
         let ori_tol = cfg.orientation_tolerance.get::<radian>();
         let max_step = cfg.max_step.get::<radian>();
-        if pos_tol <= 0.0 || ori_tol <= 0.0 || max_step <= 0.0 {
+        if !pos_tol.is_finite()
+            || !ori_tol.is_finite()
+            || !max_step.is_finite()
+            || !cfg.max_linear_step.get::<meter>().is_finite()
+            || cfg.max_linear_step.get::<meter>() <= 0.0
+            || pos_tol <= 0.0
+            || ori_tol <= 0.0
+            || max_step <= 0.0
+        {
             return Err(CuError::from(
                 "cu_kinematics: IK tolerances and max_step must be positive",
             ));
         }
 
+        for (joint, &position) in self.joints().iter().zip(seed) {
+            joint.validate_coordinate(position)?;
+        }
+        if target.to_matrix().iter().flatten().any(|v| !v.is_finite()) {
+            return Err(CuError::from("Non-finite IK target"));
+        }
         *out_q = *seed;
         if cfg.enforce_joint_limits {
-            self.clamp_to_limits(out_q);
+            self.clamp_to_limits(out_q)?;
         }
 
         let mut current_pose = Transform3D::<f64>::identity();
@@ -492,7 +538,11 @@ impl<const N: usize> CuKinematicChain<N> {
                     row += 1;
                 }
                 dq[j] = delta;
-                let abs_d = libm::fabs(delta);
+                let joint_step = match out_q[j] {
+                    CuJointPosition::Prismatic(_) => cfg.max_linear_step.get::<meter>(),
+                    _ => max_step,
+                };
+                let abs_d = libm::fabs(delta) * max_step / joint_step;
                 if abs_d > max_abs_dq {
                     max_abs_dq = abs_d;
                 }
@@ -507,13 +557,13 @@ impl<const N: usize> CuKinematicChain<N> {
 
             let mut idx = 0;
             while idx < N {
-                let next_rad = out_q[idx].get::<radian>() + dq[idx] * scale;
-                out_q[idx] = Angle64::new::<radian>(next_rad);
+                let next_rad = out_q[idx].si_value() + dq[idx] * scale;
+                out_q[idx] = out_q[idx].with_si_value(next_rad);
                 idx += 1;
             }
 
             if cfg.enforce_joint_limits {
-                self.clamp_to_limits(out_q);
+                self.clamp_to_limits(out_q)?;
             }
 
             iter += 1;

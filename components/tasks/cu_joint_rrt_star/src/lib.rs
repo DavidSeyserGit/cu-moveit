@@ -18,7 +18,10 @@ use bincode::error::DecodeError;
 use bincode::error::EncodeError;
 use cu_collision::CuCollisionWorld;
 use cu_collision::CuRobotCollisionModel;
+use cu_kinematics::CuJointMetric;
+use cu_kinematics::CuJointPosition;
 use cu_kinematics::CuJointPositionsPayload;
+use cu_kinematics::CuJointResolution;
 use cu_kinematics::CuKinematicChain;
 use cu_rng::prelude::*;
 use cu29::cutask_anytime::AnytimeStatus;
@@ -27,8 +30,6 @@ use cu29::cutask_anytime::Quality;
 use cu29::cutask_anytime::quality_from_f32;
 use cu29::prelude::*;
 use cu29::resources;
-use cu29::units::si::angle::radian;
-use cu29::units::si::f64::Angle as Angle64;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -48,29 +49,32 @@ fn is_converged_quality(q: Quality) -> bool {
 /// Configuration parameters for joint-space RRT* planning.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode, Reflect)]
 pub struct CuJointRrtParams {
-    /// Maximum joint-space $L_2$ step size per tree extension.
-    pub step_size: Angle64,
+    /// Maximum dimensionless joint-space L2 step per extension, using `metric`.
+    pub step_size: f64,
     /// Probability in `[0.0, 1.0]` of sampling the exact goal configuration.
     pub goal_bias: f64,
     /// Joint-space $L_2$ distance within which a node can connect directly to the goal.
-    pub goal_threshold: Angle64,
+    pub goal_threshold: f64,
     /// RRT* neighborhood rewiring radius in joint space.
-    pub rewire_radius: Angle64,
-    /// Maximum per-joint interpolation step for continuous edge collision checking.
-    pub collision_check_step: Angle64,
+    pub rewire_radius: f64,
+    /// Angular/linear resolution for discrete edge collision sampling.
+    pub collision_check_step: CuJointResolution,
     /// Maximum active tree nodes (`<= MAX_NODES`).
     pub max_nodes: u32,
+    /// Scaling for dimensionless joint-space distances and costs.
+    pub metric: CuJointMetric,
 }
 
 impl Default for CuJointRrtParams {
     fn default() -> Self {
         Self {
-            step_size: Angle64::new::<radian>(0.35),
+            step_size: 0.35,
             goal_bias: 0.15,
-            goal_threshold: Angle64::new::<radian>(0.40),
-            rewire_radius: Angle64::new::<radian>(0.75),
-            collision_check_step: Angle64::new::<radian>(0.08),
+            goal_threshold: 0.40,
+            rewire_radius: 0.75,
+            collision_check_step: CuJointResolution::default(),
             max_nodes: MAX_NODES as u32,
+            metric: CuJointMetric::default(),
         }
     }
 }
@@ -80,18 +84,18 @@ impl Default for CuJointRrtParams {
 #[reflect(no_field_bounds, from_reflect = false, type_path = false)]
 pub struct CuJointPlanRequest<const N: usize> {
     pub world: CuCollisionWorld<MAX_OBSTACLES>,
-    #[serde(with = "cu_kinematics::serde_arrays::angle_array")]
-    pub start: [Angle64; N],
-    #[serde(with = "cu_kinematics::serde_arrays::angle_array")]
-    pub goal: [Angle64; N],
+    #[serde(with = "cu_kinematics::serde_arrays::position_array")]
+    pub start: [CuJointPosition; N],
+    #[serde(with = "cu_kinematics::serde_arrays::position_array")]
+    pub goal: [CuJointPosition; N],
 }
 
 impl<const N: usize> Default for CuJointPlanRequest<N> {
     fn default() -> Self {
         Self {
             world: CuCollisionWorld::new(),
-            start: [Angle64::default(); N],
-            goal: [Angle64::default(); N],
+            start: [CuJointPosition::default(); N],
+            goal: [CuJointPosition::default(); N],
         }
     }
 }
@@ -103,8 +107,8 @@ pub struct CuJointPlanPath<const N: usize> {
     pub waypoints: [CuJointPositionsPayload<N>; MAX_WAYPOINTS],
     /// Number of valid waypoints in `waypoints[..len]`.
     pub len: u32,
-    /// Joint-space $L_2$ cost of the RRT* tree solution.
-    pub cost: Angle64,
+    /// Dimensionless joint-space L2 cost using the configured metric.
+    pub cost: f64,
     /// Total RRT* iterations executed on this job.
     pub iterations: u32,
 }
@@ -114,7 +118,7 @@ impl<const N: usize> Default for CuJointPlanPath<N> {
         Self {
             waypoints: core::array::from_fn(|_| CuJointPositionsPayload::default()),
             len: 0,
-            cost: Angle64::new::<radian>(f64::INFINITY),
+            cost: f64::INFINITY,
             iterations: 0,
         }
     }
@@ -125,55 +129,55 @@ impl<const N: usize> Default for CuJointPlanPath<N> {
 pub struct CuJointPlannerDebugState {
     pub iterations: u32,
     pub tree_size: u32,
-    pub best_cost: Angle64,
-    pub published_cost: Angle64,
+    pub best_cost: f64,
+    pub published_cost: f64,
     pub published_quality: Quality,
 }
 
 #[derive(Clone, Copy)]
 struct RrtNode<const N: usize> {
-    q: [Angle64; N],
+    q: [CuJointPosition; N],
     parent: u16,
-    cost_rad: f64,
+    cost: f64,
 }
 
 impl<const N: usize> Default for RrtNode<N> {
     fn default() -> Self {
         Self {
-            q: [Angle64::default(); N],
+            q: [CuJointPosition::default(); N],
             parent: u16::MAX,
-            cost_rad: 0.0,
+            cost: 0.0,
         }
     }
 }
 
 /// Allocation-free fixed-capacity joint-space RRT* solver.
-pub struct CuJointRrtStar<const N: usize> {
+pub struct CuJointRrtStar<const N: usize, const M: usize = N> {
     chain: CuKinematicChain<N>,
-    collision_model: CuRobotCollisionModel<N>,
+    collision_model: CuRobotCollisionModel<N, M>,
     params: CuJointRrtParams,
     world: CuCollisionWorld<MAX_OBSTACLES>,
-    start: [Angle64; N],
-    goal: [Angle64; N],
-    straight_line_cost_rad: f64,
+    start: [CuJointPosition; N],
+    goal: [CuJointPosition; N],
+    straight_line_cost: f64,
     nodes: [RrtNode<N>; MAX_NODES],
     node_count: usize,
     goal_node_idx: Option<usize>,
-    best_cost_rad: f64,
+    best_cost: f64,
     iterations: u32,
     rng: CuRng,
     valid_endpoints: bool,
 }
 
-impl<const N: usize> CuJointRrtStar<N> {
+impl<const N: usize, const M: usize> CuJointRrtStar<N, M> {
     /// Creates and initializes a new joint-space RRT* solver for `(start, goal)`.
     pub fn new(
         chain: CuKinematicChain<N>,
-        collision_model: CuRobotCollisionModel<N>,
+        collision_model: CuRobotCollisionModel<N, M>,
         params: CuJointRrtParams,
         world: CuCollisionWorld<MAX_OBSTACLES>,
-        start: [Angle64; N],
-        goal: [Angle64; N],
+        start: [CuJointPosition; N],
+        goal: [CuJointPosition; N],
         seed: u64,
     ) -> Self {
         let mut solver = Self {
@@ -183,11 +187,11 @@ impl<const N: usize> CuJointRrtStar<N> {
             world: CuCollisionWorld::new(),
             start,
             goal,
-            straight_line_cost_rad: 0.0,
+            straight_line_cost: 0.0,
             nodes: [RrtNode::default(); MAX_NODES],
             node_count: 0,
             goal_node_idx: None,
-            best_cost_rad: f64::INFINITY,
+            best_cost: f64::INFINITY,
             iterations: 0,
             rng: CuRng::from_seed(seed),
             valid_endpoints: false,
@@ -200,17 +204,17 @@ impl<const N: usize> CuJointRrtStar<N> {
     pub fn reset(
         &mut self,
         world: CuCollisionWorld<MAX_OBSTACLES>,
-        start: [Angle64; N],
-        goal: [Angle64; N],
+        start: [CuJointPosition; N],
+        goal: [CuJointPosition; N],
         seed: u64,
     ) {
         self.world = world;
         self.start = start;
         self.goal = goal;
-        self.straight_line_cost_rad = joint_distance_rad(&start, &goal);
+        self.straight_line_cost = joint_distance(&start, &goal, self.params.metric);
         self.node_count = 0;
         self.goal_node_idx = None;
-        self.best_cost_rad = f64::INFINITY;
+        self.best_cost = f64::INFINITY;
         self.iterations = 0;
         self.rng.reseed(seed);
 
@@ -222,19 +226,31 @@ impl<const N: usize> CuJointRrtStar<N> {
             .collision_model
             .is_configuration_collision_free(&self.chain, &self.goal, Some(&self.world))
             .unwrap_or(false);
-        self.valid_endpoints = start_ok && goal_ok;
+        self.valid_endpoints = start_ok
+            && goal_ok
+            && self.params.metric.validate().is_ok()
+            && self.params.step_size.is_finite()
+            && self.params.step_size > 0.0
+            && self.params.rewire_radius.is_finite()
+            && self.params.rewire_radius > 0.0
+            && self.params.goal_threshold.is_finite()
+            && self.params.goal_threshold > 0.0
+            && self.params.goal_bias.is_finite()
+            && (0.0..=1.0).contains(&self.params.goal_bias)
+            && self.params.max_nodes >= 2
+            && self.params.collision_check_step.metric().validate().is_ok();
 
         if self.valid_endpoints {
             self.nodes[0] = RrtNode {
                 q: self.start,
                 parent: u16::MAX,
-                cost_rad: 0.0,
+                cost: 0.0,
             };
             self.node_count = 1;
 
-            if self.straight_line_cost_rad <= 1e-9 {
+            if self.straight_line_cost <= 1e-9 {
                 self.goal_node_idx = Some(0);
-                self.best_cost_rad = 0.0;
+                self.best_cost = 0.0;
             } else if self
                 .collision_model
                 .is_segment_collision_free(
@@ -250,11 +266,11 @@ impl<const N: usize> CuJointRrtStar<N> {
                 self.nodes[1] = RrtNode {
                     q: self.goal,
                     parent: 0,
-                    cost_rad: self.straight_line_cost_rad,
+                    cost: self.straight_line_cost,
                 };
                 self.node_count = 2;
                 self.goal_node_idx = Some(1);
-                self.best_cost_rad = self.straight_line_cost_rad;
+                self.best_cost = self.straight_line_cost;
             }
         }
     }
@@ -265,9 +281,9 @@ impl<const N: usize> CuJointRrtStar<N> {
             return;
         }
         let cap = (self.params.max_nodes as usize).min(MAX_NODES);
-        let step_rad = self.params.step_size.get::<radian>();
-        let goal_thresh_rad = self.params.goal_threshold.get::<radian>();
-        let rewire_rad = self.params.rewire_radius.get::<radian>();
+        let step = self.params.step_size;
+        let goal_threshold = self.params.goal_threshold;
+        let rewire_radius = self.params.rewire_radius;
 
         let mut it = 0;
         while it < budget {
@@ -279,12 +295,17 @@ impl<const N: usize> CuJointRrtStar<N> {
 
             let q_sample = self.sample_config();
             let nearest_idx = self.nearest_node(&q_sample);
-            let q_new = steer(&self.nodes[nearest_idx].q, &q_sample, step_rad);
+            let q_new = steer(
+                &self.nodes[nearest_idx].q,
+                &q_sample,
+                step,
+                self.params.metric,
+            );
 
-            // Informed pruning: skip configurations that cannot possibly improve best_cost_rad
-            let min_possible =
-                joint_distance_rad(&self.start, &q_new) + joint_distance_rad(&q_new, &self.goal);
-            if min_possible >= self.best_cost_rad {
+            // Informed pruning: skip configurations that cannot possibly improve best_cost
+            let min_possible = joint_distance(&self.start, &q_new, self.params.metric)
+                + joint_distance(&q_new, &self.goal, self.params.metric);
+            if min_possible >= self.best_cost {
                 continue;
             }
 
@@ -296,10 +317,10 @@ impl<const N: usize> CuJointRrtStar<N> {
                 continue;
             }
 
-            // Choose best parent inside `rewire_rad` neighborhood
+            // Choose best parent inside `rewire_radius` neighborhood
             let mut best_parent = nearest_idx;
-            let mut best_new_cost = self.nodes[nearest_idx].cost_rad
-                + joint_distance_rad(&self.nodes[nearest_idx].q, &q_new);
+            let mut best_new_cost = self.nodes[nearest_idx].cost
+                + joint_distance(&self.nodes[nearest_idx].q, &q_new, self.params.metric);
 
             if !self
                 .collision_model
@@ -318,9 +339,9 @@ impl<const N: usize> CuJointRrtStar<N> {
             let mut idx = 0;
             while idx < self.node_count {
                 if idx != nearest_idx {
-                    let d = joint_distance_rad(&self.nodes[idx].q, &q_new);
-                    if d <= rewire_rad {
-                        let cand_cost = self.nodes[idx].cost_rad + d;
+                    let d = joint_distance(&self.nodes[idx].q, &q_new, self.params.metric);
+                    if d <= rewire_radius {
+                        let cand_cost = self.nodes[idx].cost + d;
                         if cand_cost < best_new_cost
                             && self
                                 .collision_model
@@ -345,7 +366,7 @@ impl<const N: usize> CuJointRrtStar<N> {
             self.nodes[new_idx] = RrtNode {
                 q: q_new,
                 parent: best_parent as u16,
-                cost_rad: best_new_cost,
+                cost: best_new_cost,
             };
             self.node_count += 1;
 
@@ -353,9 +374,9 @@ impl<const N: usize> CuJointRrtStar<N> {
             let mut nbr = 0;
             while nbr < new_idx {
                 if nbr != best_parent {
-                    let d = joint_distance_rad(&q_new, &self.nodes[nbr].q);
-                    if d <= rewire_rad
-                        && best_new_cost + d < self.nodes[nbr].cost_rad
+                    let d = joint_distance(&q_new, &self.nodes[nbr].q, self.params.metric);
+                    if d <= rewire_radius
+                        && best_new_cost + d < self.nodes[nbr].cost
                         && self
                             .collision_model
                             .is_segment_collision_free(
@@ -368,16 +389,16 @@ impl<const N: usize> CuJointRrtStar<N> {
                             .unwrap_or(false)
                     {
                         self.nodes[nbr].parent = new_idx as u16;
-                        self.nodes[nbr].cost_rad = best_new_cost + d;
+                        self.nodes[nbr].cost = best_new_cost + d;
                     }
                 }
                 nbr += 1;
             }
 
             // Try connecting `new_idx` to `goal` if within `goal_threshold` and capacity allows
-            let dist_to_goal = joint_distance_rad(&q_new, &self.goal);
-            if dist_to_goal <= goal_thresh_rad
-                && best_new_cost + dist_to_goal < self.best_cost_rad
+            let dist_to_goal = joint_distance(&q_new, &self.goal, self.params.metric);
+            if dist_to_goal <= goal_threshold
+                && best_new_cost + dist_to_goal < self.best_cost
                 && self
                     .collision_model
                     .is_segment_collision_free(
@@ -391,18 +412,18 @@ impl<const N: usize> CuJointRrtStar<N> {
             {
                 if let Some(g_idx) = self.goal_node_idx {
                     self.nodes[g_idx].parent = new_idx as u16;
-                    self.nodes[g_idx].cost_rad = best_new_cost + dist_to_goal;
-                    self.best_cost_rad = best_new_cost + dist_to_goal;
+                    self.nodes[g_idx].cost = best_new_cost + dist_to_goal;
+                    self.best_cost = best_new_cost + dist_to_goal;
                 } else if self.node_count < cap {
                     let g_idx = self.node_count;
                     self.nodes[g_idx] = RrtNode {
                         q: self.goal,
                         parent: new_idx as u16,
-                        cost_rad: best_new_cost + dist_to_goal,
+                        cost: best_new_cost + dist_to_goal,
                     };
                     self.node_count += 1;
                     self.goal_node_idx = Some(g_idx);
-                    self.best_cost_rad = best_new_cost + dist_to_goal;
+                    self.best_cost = best_new_cost + dist_to_goal;
                 }
             }
         }
@@ -420,8 +441,8 @@ impl<const N: usize> CuJointRrtStar<N> {
     }
 
     /// Returns the best joint-space path cost found so far.
-    pub fn best_cost(&self) -> Angle64 {
-        Angle64::new::<radian>(self.best_cost_rad)
+    pub fn best_cost(&self) -> f64 {
+        self.best_cost
     }
 
     /// Returns the number of RRT* iterations executed for the current job.
@@ -436,13 +457,13 @@ impl<const N: usize> CuJointRrtStar<N> {
 
     /// Computes the normalized quality in `[0.0, 1.0]` (`straight_line_cost / best_cost`).
     pub fn quality(&self) -> Quality {
-        if !self.has_solution() || !self.best_cost_rad.is_finite() {
+        if !self.has_solution() || !self.best_cost.is_finite() {
             return quality_from_f32(0.0);
         }
-        if self.straight_line_cost_rad <= 1e-9 || self.best_cost_rad <= 1e-9 {
+        if self.straight_line_cost <= 1e-9 || self.best_cost <= 1e-9 {
             return quality_from_f32(1.0);
         }
-        let ratio = (self.straight_line_cost_rad / self.best_cost_rad).clamp(0.0, 1.0);
+        let ratio = (self.straight_line_cost / self.best_cost).clamp(0.0, 1.0);
         quality_from_f32(ratio as f32)
     }
 
@@ -453,7 +474,7 @@ impl<const N: usize> CuJointRrtStar<N> {
         out_waypoints: &mut [CuJointPositionsPayload<N>; MAX_WAYPOINTS],
     ) -> Option<u32> {
         let mut curr = self.goal_node_idx?;
-        let mut raw_chain = [[Angle64::default(); N]; MAX_WAYPOINTS];
+        let mut raw_chain = [[CuJointPosition::default(); N]; MAX_WAYPOINTS];
         let mut count = 0usize;
 
         while curr != u16::MAX as usize {
@@ -470,7 +491,7 @@ impl<const N: usize> CuJointRrtStar<N> {
         }
 
         // Reverse `raw_chain[..count]` so index 0 is `start` and `count - 1` is `goal`
-        let mut ordered = [[Angle64::default(); N]; MAX_WAYPOINTS];
+        let mut ordered = [[CuJointPosition::default(); N]; MAX_WAYPOINTS];
         let mut i = 0;
         while i < count {
             ordered[i] = raw_chain[count - 1 - i];
@@ -513,32 +534,32 @@ impl<const N: usize> CuJointRrtStar<N> {
         Some(out_len as u32)
     }
 
-    fn sample_config(&mut self) -> [Angle64; N] {
+    fn sample_config(&mut self) -> [CuJointPosition; N] {
         let coin: f64 = self.rng.random();
         if coin < self.params.goal_bias {
             return self.goal;
         }
         let joints = self.chain.joints();
-        let mut q = [Angle64::default(); N];
+        let mut q = [CuJointPosition::default(); N];
         let mut j = 0;
         while j < N {
-            let lo = joints[j].limits.lower.get::<radian>();
-            let hi = joints[j].limits.upper.get::<radian>();
+            let lo = joints[j].limits.lower().si_value();
+            let hi = joints[j].limits.upper().si_value();
             let u: f64 = self.rng.random();
-            q[j] = Angle64::new::<radian>(lo + u * (hi - lo));
+            q[j] = joints[j].limits.lower().with_si_value(lo + u * (hi - lo));
             j += 1;
         }
         q
     }
 
-    fn nearest_node(&self, q_target: &[Angle64; N]) -> usize {
+    fn nearest_node(&self, q_target: &[CuJointPosition; N]) -> usize {
         let mut best_idx = 0;
         let mut best_dist = f64::INFINITY;
         let mut i = 0;
         while i < self.node_count {
             // Do not expand out of the goal node itself
             if Some(i) != self.goal_node_idx {
-                let d = joint_distance_rad(&self.nodes[i].q, q_target);
+                let d = joint_distance(&self.nodes[i].q, q_target, self.params.metric);
                 if d < best_dist {
                     best_dist = d;
                     best_idx = i;
@@ -550,11 +571,15 @@ impl<const N: usize> CuJointRrtStar<N> {
     }
 }
 
-fn joint_distance_rad<const N: usize>(a: &[Angle64; N], b: &[Angle64; N]) -> f64 {
+fn joint_distance<const N: usize>(
+    a: &[CuJointPosition; N],
+    b: &[CuJointPosition; N],
+    metric: CuJointMetric,
+) -> f64 {
     let mut sum_sq = 0.0_f64;
     let mut i = 0;
     while i < N {
-        let d = b[i].get::<radian>() - a[i].get::<radian>();
+        let d = metric.normalized(b[i]) - metric.normalized(a[i]);
         sum_sq += d * d;
         i += 1;
     }
@@ -562,21 +587,22 @@ fn joint_distance_rad<const N: usize>(a: &[Angle64; N], b: &[Angle64; N]) -> f64
 }
 
 fn steer<const N: usize>(
-    from: &[Angle64; N],
-    to: &[Angle64; N],
-    max_step_rad: f64,
-) -> [Angle64; N] {
-    let dist = joint_distance_rad(from, to);
-    if dist <= max_step_rad || dist <= 1e-12 {
+    from: &[CuJointPosition; N],
+    to: &[CuJointPosition; N],
+    max_step: f64,
+    metric: CuJointMetric,
+) -> [CuJointPosition; N] {
+    let dist = joint_distance(from, to, metric);
+    if dist <= max_step || dist <= 1e-12 {
         return *to;
     }
-    let scale = max_step_rad / dist;
-    let mut out = [Angle64::default(); N];
+    let scale = max_step / dist;
+    let mut out = [CuJointPosition::default(); N];
     let mut i = 0;
     while i < N {
-        let a = from[i].get::<radian>();
-        let b = to[i].get::<radian>();
-        out[i] = Angle64::new::<radian>(a + scale * (b - a));
+        let a = from[i].si_value();
+        let b = to[i].si_value();
+        out[i] = from[i].with_si_value(a + scale * (b - a));
         i += 1;
     }
     out
@@ -590,23 +616,23 @@ pub mod planner_resources {
 /// Anytime joint-space RRT* motion planner task (`CuAnytimeTask`).
 #[derive(Reflect)]
 #[reflect(no_field_bounds, from_reflect = false, type_path = false)]
-pub struct CuJointRrtStarTask<const N: usize> {
+pub struct CuJointRrtStarTask<const N: usize, const M: usize = N> {
     #[reflect(ignore)]
     chain: CuKinematicChain<N>,
     #[reflect(ignore)]
-    collision_model: CuRobotCollisionModel<N>,
+    collision_model: CuRobotCollisionModel<N, M>,
     params: CuJointRrtParams,
     base_iterations: u32,
     block_iterations: u32,
     base_seed: u64,
     job_counter: u64,
     #[reflect(ignore)]
-    planner: Option<CuJointRrtStar<N>>,
-    published_cost: Angle64,
+    planner: Option<CuJointRrtStar<N, M>>,
+    published_cost: f64,
     published_quality: Quality,
 }
 
-impl<const N: usize> Freezable for CuJointRrtStarTask<N> {
+impl<const N: usize, const M: usize> Freezable for CuJointRrtStarTask<N, M> {
     fn freeze<E: Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {
         Encode::encode(&self.base_seed, encoder)?;
         Encode::encode(&self.job_counter, encoder)
@@ -619,11 +645,11 @@ impl<const N: usize> Freezable for CuJointRrtStarTask<N> {
     }
 }
 
-impl<const N: usize> CuJointRrtStarTask<N> {
+impl<const N: usize, const M: usize> CuJointRrtStarTask<N, M> {
     /// Creates a joint-space RRT* anytime task with explicit kinematic chain, collision model, and seed.
     pub fn new_with_model(
         chain: CuKinematicChain<N>,
-        collision_model: CuRobotCollisionModel<N>,
+        collision_model: CuRobotCollisionModel<N, M>,
         params: CuJointRrtParams,
         base_iterations: u32,
         block_iterations: u32,
@@ -638,7 +664,7 @@ impl<const N: usize> CuJointRrtStarTask<N> {
             base_seed,
             job_counter: 0,
             planner: None,
-            published_cost: Angle64::new::<radian>(f64::INFINITY),
+            published_cost: f64::INFINITY,
             published_quality: quality_from_f32(0.0),
         }
     }
@@ -649,10 +675,7 @@ impl<const N: usize> CuJointRrtStarTask<N> {
         CuJointPlannerDebugState {
             iterations: p.map_or(0, CuJointRrtStar::iterations),
             tree_size: p.map_or(0, CuJointRrtStar::tree_size),
-            best_cost: p.map_or(
-                Angle64::new::<radian>(f64::INFINITY),
-                CuJointRrtStar::best_cost,
-            ),
+            best_cost: p.map_or(f64::INFINITY, CuJointRrtStar::best_cost),
             published_cost: self.published_cost,
             published_quality: self.published_quality,
         }
@@ -661,7 +684,7 @@ impl<const N: usize> CuJointRrtStarTask<N> {
     fn publish(&mut self, output: &mut CuMsg<CuJointPlanPath<N>>) -> Quality {
         if let Some(planner) = self.planner.as_ref()
             && planner.has_solution()
-            && planner.best_cost().get::<radian>() < self.published_cost.get::<radian>()
+            && planner.best_cost() < self.published_cost
         {
             let mut waypoints = core::array::from_fn(|_| CuJointPositionsPayload::default());
             if let Some(len) = planner.write_path(&mut waypoints) {
@@ -679,7 +702,7 @@ impl<const N: usize> CuJointRrtStarTask<N> {
     }
 }
 
-impl<const N: usize> CuAnytimeTask for CuJointRrtStarTask<N> {
+impl<const N: usize, const M: usize> CuAnytimeTask for CuJointRrtStarTask<N, M> {
     type Input<'m> = input_msg!(CuJointPlanRequest<N>);
     type Output<'m> = output_msg!(CuJointPlanPath<N>);
     type Resources<'r> = planner_resources::Resources;
@@ -705,17 +728,23 @@ impl<const N: usize> CuAnytimeTask for CuJointRrtStarTask<N> {
         let mut block_iterations = 32u32;
 
         if let Some(cfg) = config {
-            if let Some(v) = cfg.get::<f64>("step_size_rad")? {
-                params.step_size = Angle64::new::<radian>(v);
+            if let Some(v) = cfg.get_value::<CuJointMetric>("metric")? {
+                params.metric = v;
+            }
+            if let Some(v) = cfg.get_value::<CuJointResolution>("collision_check_step")? {
+                params.collision_check_step = v;
+            }
+            if let Some(v) = cfg.get::<f64>("step_size")? {
+                params.step_size = v;
             }
             if let Some(v) = cfg.get::<f64>("goal_bias")? {
                 params.goal_bias = v;
             }
-            if let Some(v) = cfg.get::<f64>("goal_threshold_rad")? {
-                params.goal_threshold = Angle64::new::<radian>(v);
+            if let Some(v) = cfg.get::<f64>("goal_threshold")? {
+                params.goal_threshold = v;
             }
-            if let Some(v) = cfg.get::<f64>("rewire_radius_rad")? {
-                params.rewire_radius = Angle64::new::<radian>(v);
+            if let Some(v) = cfg.get::<f64>("rewire_radius")? {
+                params.rewire_radius = v;
             }
             if let Some(v) = cfg.get::<u32>("base_iterations")? {
                 base_iterations = v;
@@ -745,7 +774,7 @@ impl<const N: usize> CuAnytimeTask for CuJointRrtStarTask<N> {
         output.tov = input.tov;
         let Some(request) = input.payload() else {
             output.clear_payload();
-            self.published_cost = Angle64::new::<radian>(f64::INFINITY);
+            self.published_cost = f64::INFINITY;
             self.published_quality = quality_from_f32(0.0);
             return Ok(AnytimeStatus::Aborted);
         };
@@ -771,7 +800,7 @@ impl<const N: usize> CuAnytimeTask for CuJointRrtStarTask<N> {
 
         if !planner.valid_endpoints {
             output.clear_payload();
-            self.published_cost = Angle64::new::<radian>(f64::INFINITY);
+            self.published_cost = f64::INFINITY;
             self.published_quality = quality_from_f32(0.0);
             return Ok(AnytimeStatus::Aborted);
         }
@@ -780,7 +809,7 @@ impl<const N: usize> CuAnytimeTask for CuJointRrtStarTask<N> {
             planner.grow(self.base_iterations);
         }
 
-        self.published_cost = Angle64::new::<radian>(f64::INFINITY);
+        self.published_cost = f64::INFINITY;
         self.published_quality = quality_from_f32(0.0);
         output.clear_payload();
 
@@ -822,6 +851,8 @@ mod tests {
     use cu_collision::igus_rebel_collision_model;
     use cu_kinematics::igus_rebel_chain;
     use cu_spatial_payloads::Transform3D;
+    use cu29::units::si::angle::radian;
+    use cu29::units::si::f64::Angle as Angle64;
 
     #[test]
     fn planner_initialization_requires_explicit_serial_models() {
@@ -830,13 +861,13 @@ mod tests {
         };
         assert!(CuJointRrtStarTask::<1>::new(None, resources()).is_err());
         let cfg: ComponentConfig = ron::from_str(r#"#![enable(unwrap_newtypes)]
-{"chain": {"joints": [{"joint_type": "revolute", "origin_translation": [0.0, 0.0, 0.0], "origin_rpy": [0.0, 0.0, 0.0], "axis": "pos_z", "limits": {"lower": -3.0, "upper": 3.0, "max_velocity": 1.0}}]},"collision_model": {"link_shapes": [{"sphere": {"center": [0.0, 0.0, 0.0], "radius": 0.1}}], "safety_margin": 0.01}}"#).unwrap();
+{"chain": {"joints": [{"joint_type": "revolute", "origin_translation": [0.0, 0.0, 0.0], "origin_rpy": [0.0, 0.0, 0.0], "axis": "pos_z", "limits": {"revolute": {"lower": -3.0, "upper": 3.0, "max_velocity": 1.0}}}]},"collision_model": {"link_shapes": [{"sphere": {"center": [0.0, 0.0, 0.0], "radius": 0.1}}], "safety_margin": 0.01}}"#).unwrap();
         let mut task = CuJointRrtStarTask::<1>::new(Some(&cfg), resources()).unwrap();
         let (ctx, _) = CuContext::new_mock_clock();
         let request = CuMsg::new(Some(CuJointPlanRequest {
             world: CuCollisionWorld::new(),
-            start: [Angle64::new::<radian>(0.0)],
-            goal: [Angle64::new::<radian>(0.5)],
+            start: [Angle64::new::<radian>(0.0).into()],
+            goal: [Angle64::new::<radian>(0.5).into()],
         }));
         let mut output = CuMsg::new(None);
         task.base(&ctx, &request, &mut output).unwrap();
@@ -859,14 +890,14 @@ mod tests {
         let (ctx, _mock) = CuContext::new_mock_clock();
         let mut task = test_task(42);
 
-        let start = [Angle64::new::<radian>(0.0); 6];
+        let start = [Angle64::new::<radian>(0.0).into(); 6];
         let goal = [
-            Angle64::new::<radian>(0.5),
-            Angle64::new::<radian>(0.3),
-            Angle64::new::<radian>(-0.3),
-            Angle64::new::<radian>(0.2),
-            Angle64::new::<radian>(-0.2),
-            Angle64::new::<radian>(0.4),
+            Angle64::new::<radian>(0.5).into(),
+            Angle64::new::<radian>(0.3).into(),
+            Angle64::new::<radian>(-0.3).into(),
+            Angle64::new::<radian>(0.2).into(),
+            Angle64::new::<radian>(-0.2).into(),
+            Angle64::new::<radian>(0.4).into(),
         ];
 
         let req = CuMsg::new(Some(CuJointPlanRequest {
@@ -890,31 +921,31 @@ mod tests {
         let mut task = test_task(7);
 
         let start = [
-            Angle64::new::<radian>(-0.6),
-            Angle64::new::<radian>(0.7),
-            Angle64::new::<radian>(-0.2),
-            Angle64::new::<radian>(0.0),
-            Angle64::new::<radian>(0.0),
-            Angle64::new::<radian>(0.0),
+            Angle64::new::<radian>(-0.6).into(),
+            Angle64::new::<radian>(0.7).into(),
+            Angle64::new::<radian>(-0.2).into(),
+            Angle64::new::<radian>(0.0).into(),
+            Angle64::new::<radian>(0.0).into(),
+            Angle64::new::<radian>(0.0).into(),
         ];
         let goal = [
-            Angle64::new::<radian>(0.6),
-            Angle64::new::<radian>(0.7),
-            Angle64::new::<radian>(-0.2),
-            Angle64::new::<radian>(0.0),
-            Angle64::new::<radian>(0.0),
-            Angle64::new::<radian>(0.0),
+            Angle64::new::<radian>(0.6).into(),
+            Angle64::new::<radian>(0.7).into(),
+            Angle64::new::<radian>(-0.2).into(),
+            Angle64::new::<radian>(0.0).into(),
+            Angle64::new::<radian>(0.0).into(),
+            Angle64::new::<radian>(0.0).into(),
         ];
 
         // Midpoint q_mid = [0.0, 0.7, -0.2, 0, 0, 0]: compute its end-effector position and place
         // an obstacle sphere there so the straight-line joint path collides, forcing RRT* to route around!
         let q_mid = [
-            Angle64::new::<radian>(0.0),
-            Angle64::new::<radian>(0.7),
-            Angle64::new::<radian>(-0.2),
-            Angle64::new::<radian>(0.0),
-            Angle64::new::<radian>(0.0),
-            Angle64::new::<radian>(0.0),
+            Angle64::new::<radian>(0.0).into(),
+            Angle64::new::<radian>(0.7).into(),
+            Angle64::new::<radian>(-0.2).into(),
+            Angle64::new::<radian>(0.0).into(),
+            Angle64::new::<radian>(0.0).into(),
+            Angle64::new::<radian>(0.0).into(),
         ];
         let mut mid_ee = Transform3D::<f64>::identity();
         igus_rebel_chain()
@@ -941,7 +972,7 @@ mod tests {
             let st = task.refine(&ctx, &mut out).unwrap();
             assert!(!matches!(st, AnytimeStatus::Aborted));
             if let Some(p) = out.payload() {
-                let c = p.cost.get::<radian>();
+                let c = p.cost;
                 assert!(c <= best_cost + 1e-9);
                 best_cost = c;
             }

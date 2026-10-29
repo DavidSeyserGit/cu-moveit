@@ -56,6 +56,9 @@ macro_rules! impl_const_array_serde {
                                 .ok_or_else(|| DeError::invalid_length(i, &self))?;
                             i += 1;
                         }
+                        if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                            return Err(DeError::invalid_length(M + 1, &self));
+                        }
                         Ok(out)
                     }
                 }
@@ -72,4 +75,15 @@ impl_const_array_serde!(
     angular_velocity_array,
     cu29::units::si::f64::AngularVelocity,
     "AngularVelocity64"
+);
+
+impl_const_array_serde!(
+    position_array,
+    crate::joint::CuJointPosition,
+    "joint coordinate"
+);
+impl_const_array_serde!(
+    velocity_array,
+    crate::joint::CuJointVelocity,
+    "joint velocity"
 );

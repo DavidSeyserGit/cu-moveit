@@ -9,7 +9,7 @@
 //!
 //! let chain = igus_rebel_chain();
 //! let model = igus_rebel_collision_model();
-//! let q_home = [Angle::new::<radian>(0.0); 6];
+//! let q_home = [Angle::new::<radian>(0.0).into(); 6];
 //! let mut report = CuCollisionReport::<8>::default();
 //! model.check_configuration::<8, 8>(&chain, &q_home, None, &mut report).unwrap();
 //! assert!(report.is_collision_free());
@@ -53,6 +53,7 @@ mod tests {
     use crate::CuCollisionShape;
     use crate::CuCollisionWorld;
     use crate::CuContactKind;
+    use crate::CuRobotCollisionModel;
     use crate::CuSphere;
     use crate::capsule_capsule_signed_distance;
     use crate::capsule_sphere_signed_distance;
@@ -63,7 +64,28 @@ mod tests {
     use cu29::prelude::*;
     use cu29::units::si::angle::radian;
     use cu29::units::si::f64::Angle as Angle64;
+    use cu29::units::si::f64::Length as Length64;
     use cu29::units::si::length::meter;
+
+    #[test]
+    fn attached_collision_model_snapshot_preserves_geometry_and_pairs() {
+        let shape = CuCollisionShape::Sphere(CuSphere::from_meters([0.0; 3], 0.1));
+        let mut model = CuRobotCollisionModel::<2, 3>::new_attached(
+            [shape; 3],
+            [None, Some(0), Some(1)],
+            3,
+            Length64::new::<meter>(0.005),
+        )
+        .unwrap();
+        model.set_pair_enabled(0, 2, false).unwrap();
+        let mut buffer = [0_u8; 2048];
+        let len =
+            bincode::encode_into_slice(model, &mut buffer, bincode::config::standard()).unwrap();
+        let (restored, consumed): (CuRobotCollisionModel<2, 3>, usize) =
+            bincode::decode_from_slice(&buffer[..len], bincode::config::standard()).unwrap();
+        assert_eq!(consumed, len);
+        assert_eq!(restored, model);
+    }
 
     #[test]
     fn test_sphere_and_capsule_signed_distances() {
@@ -89,7 +111,7 @@ mod tests {
         let chain = igus_rebel_chain();
         let model = igus_rebel_collision_model();
 
-        let q_home = [Angle64::new::<radian>(0.0); 6];
+        let q_home = [Angle64::new::<radian>(0.0).into(); 6];
         let mut report = CuCollisionReport::<16>::default();
         model
             .check_configuration::<8, 16>(&chain, &q_home, None, &mut report)
@@ -99,12 +121,12 @@ mod tests {
 
         // Fold upper arm and forearm sharply back into the shoulder/base column
         let q_folded = [
-            Angle64::new::<radian>(0.0),
-            Angle64::new::<radian>(1.25),
-            Angle64::new::<radian>(2.35),
-            Angle64::new::<radian>(0.0),
-            Angle64::new::<radian>(1.4),
-            Angle64::new::<radian>(0.0),
+            Angle64::new::<radian>(0.0).into(),
+            Angle64::new::<radian>(1.25).into(),
+            Angle64::new::<radian>(2.35).into(),
+            Angle64::new::<radian>(0.0).into(),
+            Angle64::new::<radian>(1.4).into(),
+            Angle64::new::<radian>(0.0).into(),
         ];
         model
             .check_configuration::<8, 16>(&chain, &q_folded, None, &mut report)
@@ -118,14 +140,14 @@ mod tests {
         let chain = igus_rebel_chain();
         let model = igus_rebel_collision_model();
 
-        let q_start = [Angle64::new::<radian>(0.0); 6];
+        let q_start = [Angle64::new::<radian>(0.0).into(); 6];
         let q_end = [
-            Angle64::new::<radian>(0.8),
-            Angle64::new::<radian>(0.5),
-            Angle64::new::<radian>(-0.4),
-            Angle64::new::<radian>(0.0),
-            Angle64::new::<radian>(0.0),
-            Angle64::new::<radian>(0.0),
+            Angle64::new::<radian>(0.8).into(),
+            Angle64::new::<radian>(0.5).into(),
+            Angle64::new::<radian>(-0.4).into(),
+            Angle64::new::<radian>(0.0).into(),
+            Angle64::new::<radian>(0.0).into(),
+            Angle64::new::<radian>(0.0).into(),
         ];
 
         let mut world = CuCollisionWorld::<8>::new();
@@ -176,7 +198,7 @@ mod tests {
         );
 
         let joints_msg = CuMsg::new(Some(CuJointPositionsPayload {
-            positions: [Angle64::new::<radian>(0.0); 6],
+            positions: [Angle64::new::<radian>(0.0).into(); 6],
         }));
         let world_msg = CuMsg::new(Some(CuCollisionWorld::<8>::new()));
         let mut out_msg = CuMsg::new(None);

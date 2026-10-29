@@ -21,20 +21,21 @@ pub struct CuCollisionCheckTask<
     const N: usize,
     const MAX_OBS: usize = DEFAULT_MAX_OBSTACLES,
     const MAX_CONTACTS: usize = DEFAULT_MAX_CONTACTS,
+    const M: usize = N,
 > {
     #[reflect(ignore)]
     chain: CuKinematicChain<N>,
     #[reflect(ignore)]
-    model: CuRobotCollisionModel<N>,
+    model: CuRobotCollisionModel<N, M>,
 }
 
-impl<const N: usize, const MAX_OBS: usize, const MAX_CONTACTS: usize>
-    CuCollisionCheckTask<N, MAX_OBS, MAX_CONTACTS>
+impl<const N: usize, const MAX_OBS: usize, const MAX_CONTACTS: usize, const M: usize>
+    CuCollisionCheckTask<N, MAX_OBS, MAX_CONTACTS, M>
 {
     /// Creates a collision check task from an explicit kinematic chain and robot collision model.
     pub const fn new_with_model(
         chain: CuKinematicChain<N>,
-        model: CuRobotCollisionModel<N>,
+        model: CuRobotCollisionModel<N, M>,
     ) -> Self {
         Self { chain, model }
     }
@@ -45,18 +46,18 @@ impl<const N: usize, const MAX_OBS: usize, const MAX_CONTACTS: usize>
     }
 
     /// Borrows the robot collision model.
-    pub const fn model(&self) -> &CuRobotCollisionModel<N> {
+    pub const fn model(&self) -> &CuRobotCollisionModel<N, M> {
         &self.model
     }
 }
 
-impl<const N: usize, const MAX_OBS: usize, const MAX_CONTACTS: usize> Freezable
-    for CuCollisionCheckTask<N, MAX_OBS, MAX_CONTACTS>
+impl<const N: usize, const MAX_OBS: usize, const MAX_CONTACTS: usize, const M: usize> Freezable
+    for CuCollisionCheckTask<N, MAX_OBS, MAX_CONTACTS, M>
 {
 }
 
-impl<const N: usize, const MAX_OBS: usize, const MAX_CONTACTS: usize> CuTask
-    for CuCollisionCheckTask<N, MAX_OBS, MAX_CONTACTS>
+impl<const N: usize, const MAX_OBS: usize, const MAX_CONTACTS: usize, const M: usize> CuTask
+    for CuCollisionCheckTask<N, MAX_OBS, MAX_CONTACTS, M>
 {
     type Resources<'r> = ();
     type Input<'m> = input_msg!('m, CuJointPositionsPayload<N>, CuCollisionWorld<MAX_OBS>);
@@ -110,10 +111,10 @@ mod tests {
     fn serial_collision_task_requires_matching_explicit_models() {
         assert!(CuCollisionCheckTask::<1>::new(None, ()).is_err());
         let chain_only: ComponentConfig = ron::from_str(r#"#![enable(unwrap_newtypes)]
-{"chain": {"joints": [{"joint_type": "revolute", "origin_translation": [0.0, 0.0, 0.0], "origin_rpy": [0.0, 0.0, 0.0], "axis": "pos_z", "limits": {"lower": -3.0, "upper": 3.0, "max_velocity": 1.0}}]}}"#).unwrap();
+{"chain": {"joints": [{"joint_type": "revolute", "origin_translation": [0.0, 0.0, 0.0], "origin_rpy": [0.0, 0.0, 0.0], "axis": "pos_z", "limits": {"revolute": {"lower": -3.0, "upper": 3.0, "max_velocity": 1.0}}}]}}"#).unwrap();
         assert!(CuCollisionCheckTask::<1>::new(Some(&chain_only), ()).is_err());
         let cfg: ComponentConfig = ron::from_str(r#"#![enable(unwrap_newtypes)]
-{"chain": {"joints": [{"joint_type": "revolute", "origin_translation": [0.0, 0.0, 0.0], "origin_rpy": [0.0, 0.0, 0.0], "axis": "pos_z", "limits": {"lower": -3.0, "upper": 3.0, "max_velocity": 1.0}}]},"collision_model": {"link_shapes": [{"sphere": {"center": [0.0, 0.0, 0.0], "radius": 0.1}}], "safety_margin": 0.01}}"#).unwrap();
+{"chain": {"joints": [{"joint_type": "revolute", "origin_translation": [0.0, 0.0, 0.0], "origin_rpy": [0.0, 0.0, 0.0], "axis": "pos_z", "limits": {"revolute": {"lower": -3.0, "upper": 3.0, "max_velocity": 1.0}}}]},"collision_model": {"link_shapes": [{"sphere": {"center": [0.0, 0.0, 0.0], "radius": 0.1}}], "safety_margin": 0.01}}"#).unwrap();
         let task = CuCollisionCheckTask::<1>::new(Some(&cfg), ()).unwrap();
         assert_eq!(task.model().link_shapes().len(), 1);
         assert_eq!(task.model().safety_margin().get::<meter>(), 0.01);

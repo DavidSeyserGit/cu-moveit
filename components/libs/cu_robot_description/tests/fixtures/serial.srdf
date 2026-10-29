@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<robot name="serial_demo">
+  <group name="manipulator"><chain base_link="base" tip_link="tool"/></group>
+  <group_state name="home" group="manipulator">
+    <joint name="swing" value="0"/><joint name="extension" value="0.1"/>
+  </group_state>
+  <group_state name="reach" group="manipulator">
+    <joint name="swing" value="0.5"/><joint name="extension" value="0.2"/>
+  </group_state>
+  <disable_collisions link1="arm" link2="slide" reason="Adjacent"/>
+</robot>

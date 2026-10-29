@@ -6,12 +6,12 @@ use crate::ik::CuDiffIkStatus;
 use crate::ik::CuIkConfig;
 use crate::ik::CuIkStatus;
 use crate::ik::CuTwist6D;
+use crate::joint::CuJointPosition;
+use crate::joint::CuJointVelocity;
 use bincode::Decode;
 use bincode::Encode;
 use cu_spatial_payloads::Transform3D;
 use cu29::prelude::*;
-use cu29::units::si::f64::Angle as Angle64;
-use cu29::units::si::f64::AngularVelocity as AngularVelocity64;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -19,14 +19,14 @@ use serde::Serialize;
 #[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect)]
 #[reflect(no_field_bounds, from_reflect = false, type_path = false)]
 pub struct CuJointPositionsPayload<const N: usize> {
-    #[serde(with = "crate::serde_arrays::angle_array")]
-    pub positions: [Angle64; N],
+    #[serde(with = "crate::serde_arrays::position_array")]
+    pub positions: [CuJointPosition; N],
 }
 
 impl<const N: usize> Default for CuJointPositionsPayload<N> {
     fn default() -> Self {
         Self {
-            positions: [Angle64::default(); N],
+            positions: [CuJointPosition::default(); N],
         }
     }
 }
@@ -35,15 +35,15 @@ impl<const N: usize> Default for CuJointPositionsPayload<N> {
 #[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect)]
 #[reflect(no_field_bounds, from_reflect = false, type_path = false)]
 pub struct CuJointVelocitiesPayload<const N: usize> {
-    #[serde(with = "crate::serde_arrays::angular_velocity_array")]
-    pub velocities: [AngularVelocity64; N],
+    #[serde(with = "crate::serde_arrays::velocity_array")]
+    pub velocities: [CuJointVelocity; N],
     pub status: CuDiffIkStatus,
 }
 
 impl<const N: usize> Default for CuJointVelocitiesPayload<N> {
     fn default() -> Self {
         Self {
-            velocities: [AngularVelocity64::default(); N],
+            velocities: [CuJointVelocity::default(); N],
             status: CuDiffIkStatus::default(),
         }
     }
@@ -53,15 +53,15 @@ impl<const N: usize> Default for CuJointVelocitiesPayload<N> {
 #[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect)]
 #[reflect(no_field_bounds, from_reflect = false, type_path = false)]
 pub struct CuIkSolutionPayload<const N: usize> {
-    #[serde(with = "crate::serde_arrays::angle_array")]
-    pub positions: [Angle64; N],
+    #[serde(with = "crate::serde_arrays::position_array")]
+    pub positions: [CuJointPosition; N],
     pub status: CuIkStatus,
 }
 
 impl<const N: usize> Default for CuIkSolutionPayload<N> {
     fn default() -> Self {
         Self {
-            positions: [Angle64::default(); N],
+            positions: [CuJointPosition::default(); N],
             status: CuIkStatus::default(),
         }
     }
@@ -181,7 +181,7 @@ impl<const N: usize> CuTask for CuInverseKinematicsTask<N> {
             return Ok(());
         };
 
-        let mut positions = [Angle64::default(); N];
+        let mut positions = [CuJointPosition::default(); N];
         let status = self.chain.inverse_kinematics_dls(
             target_pose,
             &seed_joints.positions,
@@ -253,7 +253,7 @@ impl<const N: usize> CuTask for CuServoTask<N> {
             return Ok(());
         };
 
-        let mut velocities = [AngularVelocity64::default(); N];
+        let mut velocities = [CuJointVelocity::default(); N];
         let status =
             self.chain
                 .differential_ik(&joints.positions, twist, &self.cfg, &mut velocities)?;
@@ -273,7 +273,7 @@ mod tests {
         assert!(CuInverseKinematicsTask::<1>::new(None, ()).is_err());
         assert!(CuServoTask::<1>::new(None, ()).is_err());
         let cfg: ComponentConfig = ron::from_str(r#"#![enable(unwrap_newtypes)]
-{"chain": {"joints": [{"joint_type": "revolute", "origin_translation": [0.0, 0.0, 0.0], "origin_rpy": [0.0, 0.0, 0.0], "axis": "pos_z", "limits": {"lower": -3.0, "upper": 3.0, "max_velocity": 1.0}}]}}"#).unwrap();
+{"chain": {"joints": [{"joint_type": "revolute", "origin_translation": [0.0, 0.0, 0.0], "origin_rpy": [0.0, 0.0, 0.0], "axis": "pos_z", "limits": {"revolute": {"lower": -3.0, "upper": 3.0, "max_velocity": 1.0}}}]}}"#).unwrap();
         let mut task = CuForwardKinematicsTask::<1>::new(Some(&cfg), ()).unwrap();
         assert!(CuForwardKinematicsTask::<2>::new(Some(&cfg), ()).is_err());
         assert!(CuInverseKinematicsTask::<1>::new(Some(&cfg), ()).is_ok());

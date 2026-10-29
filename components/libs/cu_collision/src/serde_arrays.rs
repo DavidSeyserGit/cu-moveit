@@ -56,6 +56,9 @@ macro_rules! impl_const_array_serde {
                                 .ok_or_else(|| DeError::invalid_length(i, &self))?;
                             i += 1;
                         }
+                        if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                            return Err(DeError::invalid_length(M + 1, &self));
+                        }
                         Ok(out)
                     }
                 }
@@ -82,3 +85,5 @@ impl_const_array_serde!(
     crate::shapes::CuCollisionShape,
     "collision shape"
 );
+
+impl_const_array_serde!(frame_index_array, Option<usize>, "frame index");

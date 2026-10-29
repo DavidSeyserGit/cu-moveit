@@ -7,6 +7,11 @@ extern crate alloc;
 
 pub mod chain;
 pub mod ik;
+pub mod joint;
+pub use joint::CuJointMetric;
+pub use joint::CuJointPosition;
+pub use joint::CuJointResolution;
+pub use joint::CuJointVelocity;
 pub mod robots;
 pub mod serde_arrays;
 pub mod task;
@@ -38,8 +43,10 @@ mod tests {
     use crate::CuInverseKinematicsTask;
     use crate::CuJointAxis;
     use crate::CuJointLimits;
+    use crate::CuJointPosition;
     use crate::CuJointPositionsPayload;
     use crate::CuJointSpec;
+    use crate::CuJointVelocity;
     use crate::CuKinematicChain;
     use crate::CuServoTask;
     use crate::CuTwist6D;
@@ -47,14 +54,50 @@ mod tests {
     use cu_spatial_payloads::Transform3D;
     use cu29::prelude::*;
     use cu29::units::si::angle::radian;
-    use cu29::units::si::angular_velocity::radian_per_second;
     use cu29::units::si::f64::Angle as Angle64;
-    use cu29::units::si::f64::AngularVelocity as AngularVelocity64;
+
+    #[test]
+    fn mixed_joint_units_fixed_slots_and_metric_are_preserved() {
+        let chain = CuKinematicChain::new([
+            CuJointSpec::revolute(
+                [0.0; 3],
+                [0.0; 3],
+                CuJointAxis::PosZ,
+                CuJointLimits::from_radians(-3.0, 3.0, 1.0),
+            ),
+            CuJointSpec {
+                joint_type: crate::CuJointType::Fixed,
+                ..Default::default()
+            },
+            CuJointSpec::prismatic(
+                [0.0; 3],
+                [0.0; 3],
+                CuJointAxis::Arbitrary([2.0, 0.0, 0.0]),
+                CuJointLimits::from_meters(0.0, 1.0, 0.2),
+            ),
+        ]);
+        let q = [
+            Angle64::new::<radian>(0.0).into(),
+            CuJointPosition::Fixed,
+            cu29::units::si::f64::Length::new::<cu29::units::si::length::meter>(0.2).into(),
+        ];
+        let mut pose = Transform3D::<f64>::identity();
+        chain.forward_kinematics(&q, &mut pose).unwrap();
+        assert!((pose.to_matrix()[0][3] - 0.2).abs() < 1e-12);
+        let mut jac = [[0.0; 3]; 6];
+        chain.geometric_jacobian(&q, &mut jac).unwrap();
+        assert_eq!(jac[0][2], 1.0);
+        assert!(jac.iter().all(|row| row[1] == 0.0));
+        assert_eq!(crate::CuJointMetric::default().normalized(q[2]), 0.2);
+        let wrong = [q[0], q[1], q[0]];
+        assert!(!chain.is_within_limits(&wrong));
+        assert!(chain.forward_kinematics(&wrong, &mut pose).is_err());
+    }
 
     #[test]
     fn test_igus_rebel_zero_pose_fk() {
         let chain = igus_rebel_chain();
-        let q_zero = [Angle64::new::<radian>(0.0); 6];
+        let q_zero = [Angle64::new::<radian>(0.0).into(); 6];
         let mut ee = Transform3D::<f64>::identity();
         chain.forward_kinematics(&q_zero, &mut ee).unwrap();
 
@@ -71,12 +114,12 @@ mod tests {
     fn test_geometric_jacobian_matches_finite_differences() {
         let chain = igus_rebel_chain();
         let q = [
-            Angle64::new::<radian>(0.25),
-            Angle64::new::<radian>(-0.4),
-            Angle64::new::<radian>(0.55),
-            Angle64::new::<radian>(-0.3),
-            Angle64::new::<radian>(0.45),
-            Angle64::new::<radian>(0.15),
+            Angle64::new::<radian>(0.25).into(),
+            Angle64::new::<radian>(-0.4).into(),
+            Angle64::new::<radian>(0.55).into(),
+            Angle64::new::<radian>(-0.3).into(),
+            Angle64::new::<radian>(0.45).into(),
+            Angle64::new::<radian>(0.15).into(),
         ];
 
         let mut jac = [[0.0_f64; 6]; 6];
@@ -86,8 +129,8 @@ mod tests {
         for col in 0..6 {
             let mut q_plus = q;
             let mut q_minus = q;
-            q_plus[col] = Angle64::new::<radian>(q[col].get::<radian>() + eps);
-            q_minus[col] = Angle64::new::<radian>(q[col].get::<radian>() - eps);
+            q_plus[col] = Angle64::new::<radian>(q[col].si_value() + eps).into();
+            q_minus[col] = Angle64::new::<radian>(q[col].si_value() - eps).into();
 
             let mut pose_plus = Transform3D::<f64>::identity();
             let mut pose_minus = Transform3D::<f64>::identity();
@@ -111,12 +154,12 @@ mod tests {
     fn test_body_jacobian_matches_finite_differences() {
         let chain = igus_rebel_chain();
         let q = [
-            Angle64::new::<radian>(0.25),
-            Angle64::new::<radian>(-0.4),
-            Angle64::new::<radian>(0.55),
-            Angle64::new::<radian>(-0.3),
-            Angle64::new::<radian>(0.45),
-            Angle64::new::<radian>(0.15),
+            Angle64::new::<radian>(0.25).into(),
+            Angle64::new::<radian>(-0.4).into(),
+            Angle64::new::<radian>(0.55).into(),
+            Angle64::new::<radian>(-0.3).into(),
+            Angle64::new::<radian>(0.45).into(),
+            Angle64::new::<radian>(0.15).into(),
         ];
 
         let mut ee = Transform3D::<f64>::identity();
@@ -130,8 +173,8 @@ mod tests {
         for col in 0..6 {
             let mut q_plus = q;
             let mut q_minus = q;
-            q_plus[col] = Angle64::new::<radian>(q[col].get::<radian>() + eps);
-            q_minus[col] = Angle64::new::<radian>(q[col].get::<radian>() - eps);
+            q_plus[col] = Angle64::new::<radian>(q[col].si_value() + eps).into();
+            q_minus[col] = Angle64::new::<radian>(q[col].si_value() - eps).into();
 
             let mut pose_plus = Transform3D::<f64>::identity();
             let mut pose_minus = Transform3D::<f64>::identity();
@@ -169,12 +212,12 @@ mod tests {
     fn test_differential_ik_tracks_base_and_body_twists() {
         let chain = igus_rebel_chain();
         let q = [
-            Angle64::new::<radian>(0.2),
-            Angle64::new::<radian>(0.45),
-            Angle64::new::<radian>(-0.6),
-            Angle64::new::<radian>(0.3),
-            Angle64::new::<radian>(-0.5),
-            Angle64::new::<radian>(0.2),
+            Angle64::new::<radian>(0.2).into(),
+            Angle64::new::<radian>(0.45).into(),
+            Angle64::new::<radian>(-0.6).into(),
+            Angle64::new::<radian>(0.3).into(),
+            Angle64::new::<radian>(-0.5).into(),
+            Angle64::new::<radian>(0.2).into(),
         ];
 
         let cfg = CuDiffIkConfig {
@@ -182,11 +225,12 @@ mod tests {
             max_singularity_damping: 0.0,
             singularity_threshold_sq: 0.0,
             limit_margin: Angle64::new::<radian>(0.0),
+            linear_limit_margin: Default::default(),
             enforce_velocity_limits: true,
         };
 
         let twist_base = CuTwist6D::from_base_mps_radps([0.05, -0.03, 0.04], [0.1, -0.05, 0.08]);
-        let mut qd = [AngularVelocity64::default(); 6];
+        let mut qd = [CuJointVelocity::default(); 6];
         let status = chain
             .differential_ik(&q, &twist_base, &cfg, &mut qd)
             .unwrap();
@@ -199,14 +243,14 @@ mod tests {
         for (r, exp_r) in expected.iter().enumerate() {
             let mut achieved = 0.0;
             for (c, qd_c) in qd.iter().enumerate() {
-                achieved += jac[r][c] * qd_c.get::<radian_per_second>();
+                achieved += jac[r][c] * qd_c.si_value();
             }
             assert!((achieved - exp_r).abs() < 1e-3);
         }
 
         // Verify body-frame twist tracking
         let twist_body = CuTwist6D::from_body_mps_radps([0.04, 0.02, -0.03], [-0.05, 0.06, 0.04]);
-        let mut qd_body = [AngularVelocity64::default(); 6];
+        let mut qd_body = [CuJointVelocity::default(); 6];
         chain
             .differential_ik(&q, &twist_body, &cfg, &mut qd_body)
             .unwrap();
@@ -217,7 +261,7 @@ mod tests {
         for (r, exp_r) in expected_body.iter().enumerate() {
             let mut achieved = 0.0;
             for (c, qd_c) in qd_body.iter().enumerate() {
-                achieved += bjac[r][c] * qd_c.get::<radian_per_second>();
+                achieved += bjac[r][c] * qd_c.si_value();
             }
             assert!((achieved - exp_r).abs() < 1e-3);
         }
@@ -227,13 +271,13 @@ mod tests {
     fn test_differential_ik_singularity_and_velocity_scaling() {
         let chain = igus_rebel_chain();
         // Zero pose has wrist joint 5 = 0 (wrist singularity!)
-        let q_singular = [Angle64::new::<radian>(0.0); 6];
+        let q_singular = [Angle64::new::<radian>(0.0).into(); 6];
         let w_sq = chain.manipulability_squared(&q_singular).unwrap();
         assert!(w_sq < 1e-6);
 
         let cfg = CuDiffIkConfig::default();
         let twist = CuTwist6D::from_base_mps_radps([0.05, 0.0, 0.0], [0.0, 0.0, 0.0]);
-        let mut qd = [AngularVelocity64::default(); 6];
+        let mut qd = [CuJointVelocity::default(); 6];
         let status = chain
             .differential_ik(&q_singular, &twist, &cfg, &mut qd)
             .unwrap();
@@ -249,11 +293,8 @@ mod tests {
             CuDiffIkStatus::VelocityScaled { .. }
         ));
         for (j, qd_j) in qd.iter().enumerate() {
-            let v = qd_j.get::<radian_per_second>().abs();
-            let max_v = chain.joints()[j]
-                .limits
-                .max_velocity
-                .get::<radian_per_second>();
+            let v = qd_j.si_value().abs();
+            let max_v = chain.joints()[j].limits.max_velocity().si_value();
             assert!(v <= max_v + 1e-9);
         }
     }
@@ -262,28 +303,28 @@ mod tests {
     fn test_dls_ik_roundtrip_on_igus_rebel() {
         let chain = igus_rebel_chain();
         let q_goal = [
-            Angle64::new::<radian>(0.3),
-            Angle64::new::<radian>(0.45),
-            Angle64::new::<radian>(-0.35),
-            Angle64::new::<radian>(0.25),
-            Angle64::new::<radian>(-0.4),
-            Angle64::new::<radian>(0.5),
+            Angle64::new::<radian>(0.3).into(),
+            Angle64::new::<radian>(0.45).into(),
+            Angle64::new::<radian>(-0.35).into(),
+            Angle64::new::<radian>(0.25).into(),
+            Angle64::new::<radian>(-0.4).into(),
+            Angle64::new::<radian>(0.5).into(),
         ];
 
         let mut target_pose = Transform3D::<f64>::identity();
         chain.forward_kinematics(&q_goal, &mut target_pose).unwrap();
 
         let q_seed = [
-            Angle64::new::<radian>(0.1),
-            Angle64::new::<radian>(0.2),
-            Angle64::new::<radian>(-0.1),
-            Angle64::new::<radian>(0.0),
-            Angle64::new::<radian>(-0.1),
-            Angle64::new::<radian>(0.1),
+            Angle64::new::<radian>(0.1).into(),
+            Angle64::new::<radian>(0.2).into(),
+            Angle64::new::<radian>(-0.1).into(),
+            Angle64::new::<radian>(0.0).into(),
+            Angle64::new::<radian>(-0.1).into(),
+            Angle64::new::<radian>(0.1).into(),
         ];
 
         let cfg = CuIkConfig::default();
-        let mut q_sol = [Angle64::default(); 6];
+        let mut q_sol = [CuJointPosition::default(); 6];
         let status = chain
             .inverse_kinematics_dls(&target_pose, &q_seed, &cfg, &mut q_sol)
             .unwrap();
@@ -310,12 +351,12 @@ mod tests {
             CuServoTask::<6>::new_with_chain(igus_rebel_chain(), CuDiffIkConfig::default());
 
         let q_goal = [
-            Angle64::new::<radian>(0.2),
-            Angle64::new::<radian>(0.35),
-            Angle64::new::<radian>(-0.3),
-            Angle64::new::<radian>(0.15),
-            Angle64::new::<radian>(-0.35),
-            Angle64::new::<radian>(0.25),
+            Angle64::new::<radian>(0.2).into(),
+            Angle64::new::<radian>(0.35).into(),
+            Angle64::new::<radian>(-0.3).into(),
+            Angle64::new::<radian>(0.15).into(),
+            Angle64::new::<radian>(-0.35).into(),
+            Angle64::new::<radian>(0.25).into(),
         ];
         let mut target_pose = Transform3D::<f64>::identity();
         ik_task
@@ -324,7 +365,7 @@ mod tests {
             .unwrap();
 
         let seed_msg = CuMsg::new(Some(CuJointPositionsPayload {
-            positions: [Angle64::new::<radian>(0.05); 6],
+            positions: [Angle64::new::<radian>(0.05).into(); 6],
         }));
         let pose_msg = CuMsg::new(Some(target_pose));
         let mut ik_out = CuMsg::new(None);
@@ -367,8 +408,8 @@ mod tests {
         chain
             .forward_kinematics(
                 &[
-                    Angle64::new::<radian>(core::f64::consts::FRAC_PI_2),
-                    Angle64::new::<radian>(0.0),
+                    Angle64::new::<radian>(core::f64::consts::FRAC_PI_2).into(),
+                    Angle64::new::<radian>(0.0).into(),
                 ],
                 &mut ee,
             )
