@@ -11,6 +11,22 @@ Deterministic, zero-allocation robot manipulation, kinematics, collision checkin
 | `cu-robot-description` | `components/libs/cu_robot_description` | `startup lib` | URDF serial-chain extraction, primitive collision conversion, and SRDF serial groups, collision exclusions, and named states |
 | `cu-joint-rrt-star` | `components/tasks/cu_joint_rrt_star` | `task` | Joint-space $N$-DOF RRT* anytime motion planner (`CuAnytimeTask`) with deterministic `CuRng` seeding, informed pruning, rewiring, and path shortcutting |
 
+See [ROADMAP.md](ROADMAP.md) for where this is going and what is explicitly out
+of scope.
+
+## Consuming (pre-1.0)
+
+Nothing is published to crates.io yet (`publish = false` workspace-wide; the API
+is 0.1 and breaking). Depend on the git repository instead:
+
+```toml
+cu-kinematics = { git = "https://github.com/DavidSeyserGit/cu-moveit", tag = "v0.1.0" }
+```
+
+The workspace is versioned and tagged as a whole (`vX.Y.Z`), never per crate.
+At 1.0 the crates will be published to crates.io in lockstep behind a single
+`cu-moveit` facade crate; see the publishing step in [ROADMAP.md](ROADMAP.md).
+
 ## Quick Start
 
 ```bash

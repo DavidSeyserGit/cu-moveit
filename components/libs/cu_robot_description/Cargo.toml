@@ -2,6 +2,7 @@
 name = "cu-robot-description"
 description = "Startup URDF and SRDF import into fixed-capacity Copper serial robot models"
 version.workspace = true
+publish.workspace = true
 authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,8 +14,8 @@ domains = ["algorithm/manipulation"]
 environments = ["host"]
 
 [dependencies]
-cu-kinematics = { path = "../cu_kinematics", default-features = false }
-cu-collision = { path = "../cu_collision", default-features = false }
+cu-kinematics = { version = "0.1.0", path = "../cu_kinematics", default-features = false }
+cu-collision = { version = "0.1.0", path = "../cu_collision", default-features = false }
 cu-spatial-payloads = { workspace = true }
 cu29 = { workspace = true }
 roxmltree = { version = "0.21", optional = true }

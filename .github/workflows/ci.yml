@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pr-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: Run PR gate
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --features std -- --deny warnings
+          cargo clippy --workspace --lib --no-default-features -- --deny warnings
+          cargo nextest run --workspace --features std
+          cargo nextest run --workspace --no-default-features
+          cargo test --workspace --doc --features std

@@ -20,6 +20,21 @@ test:
     cargo nextest run --workspace --no-default-features
     cargo test --workspace --doc --features std
 
+# Print the current public API for review (needs cargo-public-api + pinned nightly; see copper-workflow).
+# Pre-1.0 this is advisory; at 1.0, diff its output against the previous release before tagging.
+api-check:
+    cargo public-api -p cu-kinematics
+    cargo public-api -p cu-collision
+    cargo public-api -p cu-robot-description
+    cargo public-api -p cu-joint-rrt-star
+
+# Dry-run packaging for every crate without publishing (publish = false must be flipped first at 1.0).
+release-dry-run:
+    cargo publish --dry-run -p cu-kinematics
+    cargo publish --dry-run -p cu-collision
+    cargo publish --dry-run -p cu-robot-description
+    cargo publish --dry-run -p cu-joint-rrt-star
+
 # Verify strict no_std compatibility across shared crates.
 nostd-ci:
     cargo check --workspace --no-default-features

@@ -2,6 +2,7 @@
 name = "cu-kinematics"
 description = "Deterministic, allocation-free serial robot kinematics (FK, Jacobian, IK) for copper-rs"
 version.workspace = true
+publish.workspace = true
 authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true

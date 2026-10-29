@@ -2,6 +2,7 @@
 name = "cu-joint-rrt-star"
 description = "Deterministic, allocation-free N-DOF joint-space RRT* anytime motion planner for copper-rs"
 version.workspace = true
+publish.workspace = true
 authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -17,8 +18,8 @@ environments = ["host", "embedded"]
 
 [dependencies]
 bincode = { workspace = true }
-cu-collision = { path = "../../libs/cu_collision", default-features = false }
-cu-kinematics = { path = "../../libs/cu_kinematics", default-features = false }
+cu-collision = { version = "0.1.0", path = "../../libs/cu_collision", default-features = false }
+cu-kinematics = { version = "0.1.0", path = "../../libs/cu_kinematics", default-features = false }
 cu-rng = { workspace = true }
 cu-spatial-payloads = { workspace = true }
 cu29 = { workspace = true }
