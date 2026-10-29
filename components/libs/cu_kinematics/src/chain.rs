@@ -128,6 +128,30 @@ impl CuJointSpec {
         }
     }
 
+    /// Creates a prismatic joint from SI base arrays (`meters` and `radians`).
+    pub fn prismatic(
+        xyz_m: [f64; 3],
+        rpy_rad: [f64; 3],
+        axis: CuJointAxis,
+        limits: CuJointLimits,
+    ) -> Self {
+        Self {
+            joint_type: CuJointType::Prismatic,
+            origin_translation: [
+                Length64::new::<meter>(xyz_m[0]),
+                Length64::new::<meter>(xyz_m[1]),
+                Length64::new::<meter>(xyz_m[2]),
+            ],
+            origin_rpy: [
+                Angle64::new::<radian>(rpy_rad[0]),
+                Angle64::new::<radian>(rpy_rad[1]),
+                Angle64::new::<radian>(rpy_rad[2]),
+            ],
+            axis,
+            limits,
+        }
+    }
+
     /// Computes the static parent-to-joint origin transform.
     pub fn origin_transform(&self) -> Transform3D<f64> {
         Transform3D::<f64>::from_translation_euler_xyz(self.origin_translation, self.origin_rpy)
@@ -171,10 +195,19 @@ impl CuJointSpec {
 /// chain.forward_kinematics(&[Angle::new::<radian>(0.0)], &mut ee).unwrap();
 /// assert!((ee.to_matrix()[2][3] - 0.1).abs() < 1e-12);
 /// ```
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Reflect)]
+#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
 pub struct CuKinematicChain<const N: usize> {
+    #[serde(with = "crate::serde_arrays::joint_spec_array")]
     joints: [CuJointSpec; N],
+    #[serde(default = "Transform3D::<f64>::identity")]
     tool_offset: Transform3D<f64>,
+}
+
+impl<const N: usize> PartialEq for CuKinematicChain<N> {
+    fn eq(&self, other: &Self) -> bool {
+        self.joints == other.joints && self.tool_offset.to_matrix() == other.tool_offset.to_matrix()
+    }
 }
 
 impl<const N: usize> CuKinematicChain<N> {
@@ -194,6 +227,19 @@ impl<const N: usize> CuKinematicChain<N> {
         }
     }
 
+    /// Loads an explicitly configured serial chain. Missing `chain` configuration is an error.
+    /// The number of configured joints must match the compile-time joint count `N`.
+    pub fn from_config(cfg: Option<&ComponentConfig>) -> CuResult<Self> {
+        let cfg = cfg.ok_or_else(|| CuError::from("Missing serial chain configuration"))?;
+        let mut chain = cfg
+            .get_value::<Self>("chain")?
+            .ok_or_else(|| CuError::from("Missing required chain configuration"))?;
+        if let Some(tool_offset) = cfg.get_value::<Transform3D<f64>>("tool_offset")? {
+            chain.tool_offset = tool_offset;
+        }
+        Ok(chain)
+    }
+
     /// Borrows the static joint specifications.
     pub const fn joints(&self) -> &[CuJointSpec; N] {
         &self.joints
@@ -202,6 +248,11 @@ impl<const N: usize> CuKinematicChain<N> {
     /// Borrows the flange-to-tool transform.
     pub const fn tool_offset(&self) -> &Transform3D<f64> {
         &self.tool_offset
+    }
+
+    /// Sets the flange-to-tool transform.
+    pub fn set_tool_offset(&mut self, tool_offset: Transform3D<f64>) {
+        self.tool_offset = tool_offset;
     }
 
     /// Returns `true` if every joint angle in `q` satisfies its joint limits.
@@ -270,11 +321,59 @@ impl<const N: usize> CuKinematicChain<N> {
     /// Computes the $6 \times N$ geometric space Jacobian in the base frame in place.
     ///
     /// Rows `0..3` correspond to linear velocity $[v_x, v_y, v_z]^T$ in $\text{m/s}$ and
-    /// rows `3..6` correspond to angular velocity $[\omega_x, \omega_y, \omega_z]^T$ in $\text{rad/s}$.
+    /// rows `3..6` correspond to angular velocity $[\omega_x, \omega_y, \omega_z]^T$ in $\text{rad/s}$,
+    /// both measured at the tool origin and expressed in the base frame.
     pub fn geometric_jacobian(
         &self,
         q: &[Angle64; N],
         out_jacobian: &mut [[f64; N]; 6],
+    ) -> CuResult<()> {
+        let mut ee = Transform3D::<f64>::identity();
+        self.geometric_jacobian_and_pose(q, out_jacobian, &mut ee)
+    }
+
+    /// Computes the $6 \times N$ geometric body Jacobian in the end-effector (tool) frame in place.
+    ///
+    /// Rows `0..3` correspond to linear velocity $[v_x, v_y, v_z]^T$ in $\text{m/s}$ and
+    /// rows `3..6` correspond to angular velocity $[\omega_x, \omega_y, \omega_z]^T$ in $\text{rad/s}$,
+    /// both measured at the tool origin and expressed in the end-effector frame.
+    pub fn body_jacobian(
+        &self,
+        q: &[Angle64; N],
+        out_jacobian: &mut [[f64; N]; 6],
+    ) -> CuResult<()> {
+        let mut space_jac = [[0.0_f64; N]; 6];
+        let mut ee = Transform3D::<f64>::identity();
+        self.geometric_jacobian_and_pose(q, &mut space_jac, &mut ee)?;
+
+        let ee_mat = ee.to_matrix();
+        let mut col = 0;
+        while col < N {
+            let vx = space_jac[0][col];
+            let vy = space_jac[1][col];
+            let vz = space_jac[2][col];
+            let wx = space_jac[3][col];
+            let wy = space_jac[4][col];
+            let wz = space_jac[5][col];
+
+            // Multiply by R_ee^T (columns of R_ee become rows of R_ee^T)
+            out_jacobian[0][col] = ee_mat[0][0] * vx + ee_mat[1][0] * vy + ee_mat[2][0] * vz;
+            out_jacobian[1][col] = ee_mat[0][1] * vx + ee_mat[1][1] * vy + ee_mat[2][1] * vz;
+            out_jacobian[2][col] = ee_mat[0][2] * vx + ee_mat[1][2] * vy + ee_mat[2][2] * vz;
+
+            out_jacobian[3][col] = ee_mat[0][0] * wx + ee_mat[1][0] * wy + ee_mat[2][0] * wz;
+            out_jacobian[4][col] = ee_mat[0][1] * wx + ee_mat[1][1] * wy + ee_mat[2][1] * wz;
+            out_jacobian[5][col] = ee_mat[0][2] * wx + ee_mat[1][2] * wy + ee_mat[2][2] * wz;
+            col += 1;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn geometric_jacobian_and_pose(
+        &self,
+        q: &[Angle64; N],
+        out_jacobian: &mut [[f64; N]; 6],
+        out_ee: &mut Transform3D<f64>,
     ) -> CuResult<()> {
         let mut joint_origins = [[0.0_f64; 3]; N];
         let mut world_axes = [[0.0_f64; 3]; N];
@@ -300,7 +399,8 @@ impl<const N: usize> CuKinematicChain<N> {
             i += 1;
         }
 
-        let ee_mat = acc.compose(self.tool_offset).to_matrix();
+        *out_ee = acc.compose(self.tool_offset);
+        let ee_mat = out_ee.to_matrix();
         let p_ee = [ee_mat[0][3], ee_mat[1][3], ee_mat[2][3]];
 
         let mut col = 0;

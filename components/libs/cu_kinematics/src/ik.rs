@@ -1,4 +1,5 @@
-//! Allocation-free Damped Least-Squares (Levenberg-Marquardt) inverse kinematics solver.
+//! Allocation-free Damped Least-Squares (Levenberg-Marquardt) position/pose inverse kinematics
+//! and velocity/twist differential inverse kinematics with singularity and joint-limit damping.
 
 use crate::chain::CuKinematicChain;
 use bincode::Decode;
@@ -6,9 +7,13 @@ use bincode::Encode;
 use cu_spatial_payloads::Transform3D;
 use cu29::prelude::*;
 use cu29::units::si::angle::radian;
+use cu29::units::si::angular_velocity::radian_per_second;
 use cu29::units::si::f64::Angle as Angle64;
+use cu29::units::si::f64::AngularVelocity as AngularVelocity64;
 use cu29::units::si::f64::Length as Length64;
+use cu29::units::si::f64::Velocity as Velocity64;
 use cu29::units::si::length::meter;
+use cu29::units::si::velocity::meter_per_second;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -42,8 +47,42 @@ impl Default for CuIkConfig {
     }
 }
 
+impl CuIkConfig {
+    /// Extracts solver configuration from an optional RON `ComponentConfig`.
+    pub fn from_config(cfg: Option<&ComponentConfig>) -> CuResult<Self> {
+        let Some(cfg) = cfg else {
+            return Ok(Self::default());
+        };
+        if let Some(full) = cfg.get_value::<Self>("ik_config")? {
+            return Ok(full);
+        }
+        let mut out = Self::default();
+        if let Some(v) = cfg.get::<u32>("max_iterations")? {
+            out.max_iterations = v;
+        }
+        if let Some(v) = cfg.get::<f64>("position_tolerance_m")? {
+            out.position_tolerance = Length64::new::<meter>(v);
+        }
+        if let Some(v) = cfg.get::<f64>("orientation_tolerance_rad")? {
+            out.orientation_tolerance = Angle64::new::<radian>(v);
+        }
+        if let Some(v) = cfg.get::<f64>("damping")? {
+            out.damping = v;
+        }
+        if let Some(v) = cfg.get::<f64>("max_step_rad")? {
+            out.max_step = Angle64::new::<radian>(v);
+        }
+        if let Some(v) = cfg.get::<bool>("enforce_joint_limits")? {
+            out.enforce_joint_limits = v;
+        }
+        Ok(out)
+    }
+}
+
 /// Outcome of a bounded inverse kinematics solve.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode, Reflect)]
+#[derive(
+    Default, Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode, Reflect,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CuIkStatus {
     /// Target pose reached within position and orientation tolerances.
@@ -58,6 +97,9 @@ pub enum CuIkStatus {
         position_error: Length64,
         orientation_error: Angle64,
     },
+    /// Default uninitialized state prior to any solve.
+    #[default]
+    Uninitialized,
 }
 
 impl CuIkStatus {
@@ -67,7 +109,308 @@ impl CuIkStatus {
     }
 }
 
+/// Coordinate frame in which a 6D task-space twist command is expressed.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, Reflect,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CuTwistFrame {
+    /// Twist expressed in the robot base frame (paired with `geometric_jacobian`).
+    #[default]
+    Base,
+    /// Twist expressed in the end-effector tool/body frame (paired with `body_jacobian`).
+    Body,
+}
+
+/// 6D spatial velocity (linear + angular twist) payload with explicit frame semantics.
+#[derive(
+    Default, Debug, Clone, Copy, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect,
+)]
+pub struct CuTwist6D {
+    pub linear: [Velocity64; 3],
+    pub angular: [AngularVelocity64; 3],
+    pub frame: CuTwistFrame,
+}
+
+impl CuTwist6D {
+    /// Creates a twist expressed in the robot base frame from SI base values (`m/s` and `rad/s`).
+    pub fn from_base_mps_radps(linear_mps: [f64; 3], angular_radps: [f64; 3]) -> Self {
+        Self {
+            linear: [
+                Velocity64::new::<meter_per_second>(linear_mps[0]),
+                Velocity64::new::<meter_per_second>(linear_mps[1]),
+                Velocity64::new::<meter_per_second>(linear_mps[2]),
+            ],
+            angular: [
+                AngularVelocity64::new::<radian_per_second>(angular_radps[0]),
+                AngularVelocity64::new::<radian_per_second>(angular_radps[1]),
+                AngularVelocity64::new::<radian_per_second>(angular_radps[2]),
+            ],
+            frame: CuTwistFrame::Base,
+        }
+    }
+
+    /// Creates a twist expressed in the end-effector body frame from SI base values (`m/s` and `rad/s`).
+    pub fn from_body_mps_radps(linear_mps: [f64; 3], angular_radps: [f64; 3]) -> Self {
+        Self {
+            linear: [
+                Velocity64::new::<meter_per_second>(linear_mps[0]),
+                Velocity64::new::<meter_per_second>(linear_mps[1]),
+                Velocity64::new::<meter_per_second>(linear_mps[2]),
+            ],
+            angular: [
+                AngularVelocity64::new::<radian_per_second>(angular_radps[0]),
+                AngularVelocity64::new::<radian_per_second>(angular_radps[1]),
+                AngularVelocity64::new::<radian_per_second>(angular_radps[2]),
+            ],
+            frame: CuTwistFrame::Body,
+        }
+    }
+
+    /// Extracts the raw 6-vector `[vx, vy, vz, wx, wy, wz]` in `m/s` and `rad/s`.
+    pub fn to_raw_array(&self) -> [f64; 6] {
+        [
+            self.linear[0].get::<meter_per_second>(),
+            self.linear[1].get::<meter_per_second>(),
+            self.linear[2].get::<meter_per_second>(),
+            self.angular[0].get::<radian_per_second>(),
+            self.angular[1].get::<radian_per_second>(),
+            self.angular[2].get::<radian_per_second>(),
+        ]
+    }
+}
+
+/// Configuration for velocity/twist differential inverse kinematics (Jacobian servoing).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode, Reflect)]
+pub struct CuDiffIkConfig {
+    /// Baseline damping factor $\lambda_0 > 0$ used far from singularities.
+    pub base_damping: f64,
+    /// Maximum additional damping $\lambda_{\max} \ge 0$ added at exact singularity.
+    pub max_singularity_damping: f64,
+    /// Yoshikawa manipulability squared threshold $w_{\text{thresh}}^2$ below which adaptive
+    /// singularity damping ramps up smoothly.
+    pub singularity_threshold_sq: f64,
+    /// Joint-limit proximity margin within which motion toward a limit is smoothly damped.
+    pub limit_margin: Angle64,
+    /// Whether to uniformly scale output joint velocities when any joint exceeds `max_velocity`.
+    pub enforce_velocity_limits: bool,
+}
+
+impl Default for CuDiffIkConfig {
+    fn default() -> Self {
+        Self {
+            base_damping: 0.02,
+            max_singularity_damping: 0.25,
+            singularity_threshold_sq: 1e-4,
+            limit_margin: Angle64::new::<radian>(0.15),
+            enforce_velocity_limits: true,
+        }
+    }
+}
+
+impl CuDiffIkConfig {
+    /// Extracts differential IK configuration from an optional RON `ComponentConfig`.
+    pub fn from_config(cfg: Option<&ComponentConfig>) -> CuResult<Self> {
+        let Some(cfg) = cfg else {
+            return Ok(Self::default());
+        };
+        if let Some(full) = cfg.get_value::<Self>("diff_ik_config")? {
+            return Ok(full);
+        }
+        let mut out = Self::default();
+        if let Some(v) = cfg.get::<f64>("base_damping")? {
+            out.base_damping = v;
+        }
+        if let Some(v) = cfg.get::<f64>("max_singularity_damping")? {
+            out.max_singularity_damping = v;
+        }
+        if let Some(v) = cfg.get::<f64>("singularity_threshold_sq")? {
+            out.singularity_threshold_sq = v;
+        }
+        if let Some(v) = cfg.get::<f64>("limit_margin_rad")? {
+            out.limit_margin = Angle64::new::<radian>(v);
+        }
+        if let Some(v) = cfg.get::<bool>("enforce_velocity_limits")? {
+            out.enforce_velocity_limits = v;
+        }
+        Ok(out)
+    }
+}
+
+/// Status reported by a single differential IK velocity solve.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode, Reflect)]
+#[serde(rename_all = "snake_case")]
+pub enum CuDiffIkStatus {
+    /// Nominal tracking outside the singularity damping zone and within velocity limits.
+    Nominal { manipulability_sq: f64 },
+    /// Near-singular configuration triggered adaptive manipulability damping.
+    SingularityDamped {
+        manipulability_sq: f64,
+        effective_damping: f64,
+    },
+    /// Joint velocities were uniformly scaled in `(0.0, 1.0]` to respect joint velocity limits.
+    VelocityScaled { manipulability_sq: f64, scale: f64 },
+}
+
+impl Default for CuDiffIkStatus {
+    fn default() -> Self {
+        Self::Nominal {
+            manipulability_sq: 0.0,
+        }
+    }
+}
+
 impl<const N: usize> CuKinematicChain<N> {
+    /// Computes Yoshikawa's manipulability index squared $w^2 = \max(0, \det(J J^T))$ at `q`.
+    pub fn manipulability_squared(&self, q: &[Angle64; N]) -> CuResult<f64> {
+        let mut jac = [[0.0_f64; N]; 6];
+        self.geometric_jacobian(q, &mut jac)?;
+        Ok(manipulability_sq_from_jacobian(&jac))
+    }
+
+    /// Computes joint velocities `out_qd` in place for a desired 6D Cartesian twist using
+    /// singularity-robust and joint-limit-aware damped least squares.
+    pub fn differential_ik(
+        &self,
+        q: &[Angle64; N],
+        twist: &CuTwist6D,
+        cfg: &CuDiffIkConfig,
+        out_qd: &mut [AngularVelocity64; N],
+    ) -> CuResult<CuDiffIkStatus> {
+        if cfg.base_damping <= 0.0
+            || !cfg.base_damping.is_finite()
+            || cfg.max_singularity_damping < 0.0
+            || !cfg.max_singularity_damping.is_finite()
+            || cfg.singularity_threshold_sq < 0.0
+            || !cfg.singularity_threshold_sq.is_finite()
+        {
+            return Err(CuError::from(
+                "cu_kinematics: differential IK damping parameters must be valid finite numbers",
+            ));
+        }
+
+        let v_raw = twist.to_raw_array();
+        let mut idx_v = 0;
+        while idx_v < 6 {
+            if !v_raw[idx_v].is_finite() {
+                return Err(CuError::from(
+                    "cu_kinematics: non-finite twist component in differential_ik",
+                ));
+            }
+            idx_v += 1;
+        }
+
+        let mut jac = [[0.0_f64; N]; 6];
+        match twist.frame {
+            CuTwistFrame::Base => self.geometric_jacobian(q, &mut jac)?,
+            CuTwistFrame::Body => self.body_jacobian(q, &mut jac)?,
+        }
+
+        let w_sq = manipulability_sq_from_jacobian(&jac);
+        let (lambda_sq, singularity_damped, effective_damping) =
+            if cfg.singularity_threshold_sq > 0.0 && w_sq < cfg.singularity_threshold_sq {
+                let ratio = 1.0 - (w_sq / cfg.singularity_threshold_sq);
+                let l_sq = cfg.base_damping * cfg.base_damping
+                    + cfg.max_singularity_damping * cfg.max_singularity_damping * ratio * ratio;
+                (l_sq, true, libm::sqrt(l_sq))
+            } else {
+                (cfg.base_damping * cfg.base_damping, false, cfg.base_damping)
+            };
+
+        // Build 6x6 damped normal matrix A = J * J^T + lambda_eff^2 * I
+        let mut a = [[0.0_f64; 6]; 6];
+        let mut r = 0;
+        while r < 6 {
+            let mut c = 0;
+            while c < 6 {
+                let mut sum = 0.0;
+                let mut k = 0;
+                while k < N {
+                    sum += jac[r][k] * jac[c][k];
+                    k += 1;
+                }
+                a[r][c] = sum;
+                c += 1;
+            }
+            a[r][r] += lambda_sq;
+            r += 1;
+        }
+
+        let y = solve_6x6(&mut a, &v_raw)?;
+
+        // Compute raw joint velocities qd = J^T * y and apply smooth joint-limit margin damping
+        // when moving toward a joint limit.
+        let margin = cfg.limit_margin.get::<radian>();
+        let joints = self.joints();
+        let mut raw_qd = [0.0_f64; N];
+        let mut velocity_scale = 1.0_f64;
+
+        let mut j = 0;
+        while j < N {
+            let mut qd_j = 0.0;
+            let mut row = 0;
+            while row < 6 {
+                qd_j += jac[row][j] * y[row];
+                row += 1;
+            }
+
+            if margin > 0.0 {
+                let q_rad = q[j].get::<radian>();
+                let lower = joints[j].limits.lower.get::<radian>();
+                let upper = joints[j].limits.upper.get::<radian>();
+                if qd_j < 0.0 {
+                    let dist_low = (q_rad - lower).max(0.0);
+                    if dist_low < margin {
+                        let s = dist_low / margin;
+                        qd_j *= s * s;
+                    }
+                } else if qd_j > 0.0 {
+                    let dist_high = (upper - q_rad).max(0.0);
+                    if dist_high < margin {
+                        let s = dist_high / margin;
+                        qd_j *= s * s;
+                    }
+                }
+            }
+
+            raw_qd[j] = qd_j;
+
+            if cfg.enforce_velocity_limits {
+                let max_v = joints[j].limits.max_velocity.get::<radian_per_second>();
+                let abs_v = libm::fabs(qd_j);
+                if max_v > 0.0 && abs_v > max_v {
+                    let candidate_scale = max_v / abs_v;
+                    if candidate_scale < velocity_scale {
+                        velocity_scale = candidate_scale;
+                    }
+                }
+            }
+            j += 1;
+        }
+
+        let mut i = 0;
+        while i < N {
+            out_qd[i] = AngularVelocity64::new::<radian_per_second>(raw_qd[i] * velocity_scale);
+            i += 1;
+        }
+
+        if velocity_scale < 1.0 {
+            Ok(CuDiffIkStatus::VelocityScaled {
+                manipulability_sq: w_sq,
+                scale: velocity_scale,
+            })
+        } else if singularity_damped {
+            Ok(CuDiffIkStatus::SingularityDamped {
+                manipulability_sq: w_sq,
+                effective_damping,
+            })
+        } else {
+            Ok(CuDiffIkStatus::Nominal {
+                manipulability_sq: w_sq,
+            })
+        }
+    }
+
     /// Solves inverse kinematics in place using Damped Least-Squares (DLS).
     ///
     /// Writes the resulting joint configuration into `out_q` without heap allocation.
@@ -192,6 +535,77 @@ impl<const N: usize> CuKinematicChain<N> {
             })
         }
     }
+}
+
+fn manipulability_sq_from_jacobian<const N: usize>(jac: &[[f64; N]; 6]) -> f64 {
+    if N < 6 {
+        return 0.0;
+    }
+    let mut jjt = [[0.0_f64; 6]; 6];
+    let mut r = 0;
+    while r < 6 {
+        let mut c = 0;
+        while c < 6 {
+            let mut sum = 0.0;
+            let mut k = 0;
+            while k < N {
+                sum += jac[r][k] * jac[c][k];
+                k += 1;
+            }
+            jjt[r][c] = sum;
+            c += 1;
+        }
+        r += 1;
+    }
+    det_6x6(&mut jjt).max(0.0)
+}
+
+fn det_6x6(a: &mut [[f64; 6]; 6]) -> f64 {
+    let mut sign = 1.0_f64;
+    let mut k = 0;
+    while k < 6 {
+        let mut pivot_row = k;
+        let mut max_val = libm::fabs(a[k][k]);
+        let mut i = k + 1;
+        while i < 6 {
+            let v = libm::fabs(a[i][k]);
+            if v > max_val {
+                max_val = v;
+                pivot_row = i;
+            }
+            i += 1;
+        }
+
+        if max_val < 1e-18 {
+            return 0.0;
+        }
+
+        if pivot_row != k {
+            a.swap(k, pivot_row);
+            sign = -sign;
+        }
+
+        let pivot = a[k][k];
+        let mut row = k + 1;
+        while row < 6 {
+            let factor = a[row][k] / pivot;
+            let mut col = k + 1;
+            while col < 6 {
+                a[row][col] -= factor * a[k][col];
+                col += 1;
+            }
+            row += 1;
+        }
+        k += 1;
+    }
+
+    let mut det = sign;
+    let mut d = 0;
+    while d < 6 {
+        det *= a[d][d];
+        d += 1;
+    }
+    det
 }
 
 /// Computes the 6D task-space error vector `[dp_x, dp_y, dp_z, dw_x, dw_y, dw_z]` in the base frame.

@@ -1,9 +1,13 @@
 [workspace]
 members = [
   "components/libs/cu_kinematics",
+  "components/libs/cu_collision",
+  "components/tasks/cu_joint_rrt_star",
 ]
 default-members = [
   "components/libs/cu_kinematics",
+  "components/libs/cu_collision",
+  "components/tasks/cu_joint_rrt_star",
 ]
 resolver = "3"
 
@@ -20,6 +24,7 @@ repository = "https://github.com/copper-project/copper-rs"
 [workspace.dependencies]
 cu29 = { version = "1.3.1", default-features = false, features = ["units"] }
 cu-spatial-payloads = { version = "1.3.0", default-features = false }
+cu-rng = { version = "1.3.0", default-features = false }
 bincode = { package = "cu-bincode", version = "2.2.0", default-features = false, features = [
   "derive",
   "alloc",

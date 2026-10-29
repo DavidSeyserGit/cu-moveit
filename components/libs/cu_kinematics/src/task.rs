@@ -1,12 +1,17 @@
-//! Copper `CuTask` wrapper for real-time forward kinematics evaluation.
+//! Copper `CuTask` wrappers for real-time forward kinematics, inverse kinematics, and twist servoing.
 
 use crate::chain::CuKinematicChain;
-use crate::robots::igus_rebel_chain;
+use crate::ik::CuDiffIkConfig;
+use crate::ik::CuDiffIkStatus;
+use crate::ik::CuIkConfig;
+use crate::ik::CuIkStatus;
+use crate::ik::CuTwist6D;
 use bincode::Decode;
 use bincode::Encode;
 use cu_spatial_payloads::Transform3D;
 use cu29::prelude::*;
 use cu29::units::si::f64::Angle as Angle64;
+use cu29::units::si::f64::AngularVelocity as AngularVelocity64;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -14,7 +19,7 @@ use serde::Serialize;
 #[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect)]
 #[reflect(no_field_bounds, from_reflect = false, type_path = false)]
 pub struct CuJointPositionsPayload<const N: usize> {
-    #[serde(with = "joint_array_serde")]
+    #[serde(with = "crate::serde_arrays::angle_array")]
     pub positions: [Angle64; N],
 }
 
@@ -22,6 +27,42 @@ impl<const N: usize> Default for CuJointPositionsPayload<N> {
     fn default() -> Self {
         Self {
             positions: [Angle64::default(); N],
+        }
+    }
+}
+
+/// Fixed-DOF joint velocity command/state payload (`CuMsgPayload`-compliant).
+#[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect)]
+#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+pub struct CuJointVelocitiesPayload<const N: usize> {
+    #[serde(with = "crate::serde_arrays::angular_velocity_array")]
+    pub velocities: [AngularVelocity64; N],
+    pub status: CuDiffIkStatus,
+}
+
+impl<const N: usize> Default for CuJointVelocitiesPayload<N> {
+    fn default() -> Self {
+        Self {
+            velocities: [AngularVelocity64::default(); N],
+            status: CuDiffIkStatus::default(),
+        }
+    }
+}
+
+/// Inverse kinematics solution payload carrying solved joint angles and convergence status.
+#[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect)]
+#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+pub struct CuIkSolutionPayload<const N: usize> {
+    #[serde(with = "crate::serde_arrays::angle_array")]
+    pub positions: [Angle64; N],
+    pub status: CuIkStatus,
+}
+
+impl<const N: usize> Default for CuIkSolutionPayload<N> {
+    fn default() -> Self {
+        Self {
+            positions: [Angle64::default(); N],
+            status: CuIkStatus::default(),
         }
     }
 }
@@ -48,16 +89,17 @@ impl<const N: usize> CuForwardKinematicsTask<N> {
 
 impl<const N: usize> Freezable for CuForwardKinematicsTask<N> {}
 
-impl CuTask for CuForwardKinematicsTask<6> {
+impl<const N: usize> CuTask for CuForwardKinematicsTask<N> {
     type Resources<'r> = ();
-    type Input<'m> = input_msg!(CuJointPositionsPayload<6>);
+    type Input<'m> = input_msg!(CuJointPositionsPayload<N>);
     type Output<'m> = output_msg!(Transform3D<f64>);
 
-    fn new(_cfg: Option<&ComponentConfig>, _res: Self::Resources<'_>) -> CuResult<Self>
+    fn new(cfg: Option<&ComponentConfig>, _res: Self::Resources<'_>) -> CuResult<Self>
     where
         Self: Sized,
     {
-        Ok(Self::new_with_chain(igus_rebel_chain()))
+        let chain = CuKinematicChain::from_config(cfg)?;
+        Ok(Self::new_with_chain(chain))
     }
 
     fn process<'i, 'o>(
@@ -80,60 +122,169 @@ impl CuTask for CuForwardKinematicsTask<6> {
     }
 }
 
-mod joint_array_serde {
-    use cu29::units::si::f64::Angle as Angle64;
-    use serde::Deserializer;
-    use serde::Serializer;
-    use serde::de::Error as DeError;
-    use serde::de::SeqAccess;
-    use serde::de::Visitor;
-    use serde::ser::SerializeTuple;
+/// Stateless `CuTask` solving Damped Least-Squares inverse kinematics from a target pose and seed joints.
+#[derive(Reflect)]
+#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+pub struct CuInverseKinematicsTask<const N: usize> {
+    #[reflect(ignore)]
+    chain: CuKinematicChain<N>,
+    cfg: CuIkConfig,
+}
 
-    pub fn serialize<S, const N: usize>(
-        values: &[Angle64; N],
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut seq = serializer.serialize_tuple(N)?;
-        let mut i = 0;
-        while i < N {
-            seq.serialize_element(&values[i])?;
-            i += 1;
-        }
-        seq.end()
+impl<const N: usize> CuInverseKinematicsTask<N> {
+    /// Creates an inverse kinematics task from an explicit chain and solver configuration.
+    pub const fn new_with_chain(chain: CuKinematicChain<N>, cfg: CuIkConfig) -> Self {
+        Self { chain, cfg }
     }
 
-    pub fn deserialize<'de, D, const N: usize>(deserializer: D) -> Result<[Angle64; N], D::Error>
+    /// Borrows the underlying kinematic chain.
+    pub const fn chain(&self) -> &CuKinematicChain<N> {
+        &self.chain
+    }
+
+    /// Borrows the IK solver configuration.
+    pub const fn config(&self) -> &CuIkConfig {
+        &self.cfg
+    }
+}
+
+impl<const N: usize> Freezable for CuInverseKinematicsTask<N> {}
+
+impl<const N: usize> CuTask for CuInverseKinematicsTask<N> {
+    type Resources<'r> = ();
+    type Input<'m> = input_msg!('m, Transform3D<f64>, CuJointPositionsPayload<N>);
+    type Output<'m> = output_msg!(CuIkSolutionPayload<N>);
+
+    fn new(cfg: Option<&ComponentConfig>, _res: Self::Resources<'_>) -> CuResult<Self>
     where
-        D: Deserializer<'de>,
+        Self: Sized,
     {
-        struct ArrayVisitor<const M: usize>;
+        let chain = CuKinematicChain::from_config(cfg)?;
+        let ik_cfg = CuIkConfig::from_config(cfg)?;
+        Ok(Self::new_with_chain(chain, ik_cfg))
+    }
 
-        impl<'de, const M: usize> Visitor<'de> for ArrayVisitor<M> {
-            type Value = [Angle64; M];
+    fn process<'i, 'o>(
+        &mut self,
+        _ctx: &CuContext,
+        input: &Self::Input<'i>,
+        output: &mut Self::Output<'o>,
+    ) -> CuResult<()> {
+        output.tov = if !matches!(input.0.tov, Tov::None) {
+            input.0.tov
+        } else {
+            input.1.tov
+        };
 
-            fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-                write!(formatter, "an array of {M} Angle64 values")
-            }
+        let (Some(target_pose), Some(seed_joints)) = (input.0.payload(), input.1.payload()) else {
+            output.clear_payload();
+            return Ok(());
+        };
 
-            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-            where
-                A: SeqAccess<'de>,
-            {
-                let mut out = [Angle64::default(); M];
-                let mut i = 0;
-                while i < M {
-                    out[i] = seq
-                        .next_element()?
-                        .ok_or_else(|| DeError::invalid_length(i, &self))?;
-                    i += 1;
-                }
-                Ok(out)
-            }
-        }
+        let mut positions = [Angle64::default(); N];
+        let status = self.chain.inverse_kinematics_dls(
+            target_pose,
+            &seed_joints.positions,
+            &self.cfg,
+            &mut positions,
+        )?;
 
-        deserializer.deserialize_tuple(N, ArrayVisitor::<N>)
+        output.set_payload(CuIkSolutionPayload { positions, status });
+        Ok(())
+    }
+}
+
+/// Real-time Jacobian velocity/twist servoing `CuTask` with singularity and joint-limit damping.
+#[derive(Reflect)]
+#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+pub struct CuServoTask<const N: usize> {
+    #[reflect(ignore)]
+    chain: CuKinematicChain<N>,
+    cfg: CuDiffIkConfig,
+}
+
+impl<const N: usize> CuServoTask<N> {
+    /// Creates a twist servo task from an explicit chain and differential IK configuration.
+    pub const fn new_with_chain(chain: CuKinematicChain<N>, cfg: CuDiffIkConfig) -> Self {
+        Self { chain, cfg }
+    }
+
+    /// Borrows the underlying kinematic chain.
+    pub const fn chain(&self) -> &CuKinematicChain<N> {
+        &self.chain
+    }
+
+    /// Borrows the differential IK configuration.
+    pub const fn config(&self) -> &CuDiffIkConfig {
+        &self.cfg
+    }
+}
+
+impl<const N: usize> Freezable for CuServoTask<N> {}
+
+impl<const N: usize> CuTask for CuServoTask<N> {
+    type Resources<'r> = ();
+    type Input<'m> = input_msg!('m, CuTwist6D, CuJointPositionsPayload<N>);
+    type Output<'m> = output_msg!(CuJointVelocitiesPayload<N>);
+
+    fn new(cfg: Option<&ComponentConfig>, _res: Self::Resources<'_>) -> CuResult<Self>
+    where
+        Self: Sized,
+    {
+        let chain = CuKinematicChain::from_config(cfg)?;
+        let diff_cfg = CuDiffIkConfig::from_config(cfg)?;
+        Ok(Self::new_with_chain(chain, diff_cfg))
+    }
+
+    fn process<'i, 'o>(
+        &mut self,
+        _ctx: &CuContext,
+        input: &Self::Input<'i>,
+        output: &mut Self::Output<'o>,
+    ) -> CuResult<()> {
+        output.tov = if !matches!(input.0.tov, Tov::None) {
+            input.0.tov
+        } else {
+            input.1.tov
+        };
+
+        let (Some(twist), Some(joints)) = (input.0.payload(), input.1.payload()) else {
+            output.clear_payload();
+            return Ok(());
+        };
+
+        let mut velocities = [AngularVelocity64::default(); N];
+        let status =
+            self.chain
+                .differential_ik(&joints.positions, twist, &self.cfg, &mut velocities)?;
+
+        output.set_payload(CuJointVelocitiesPayload { velocities, status });
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serial_task_configuration_is_required_and_dof_checked() {
+        assert!(CuForwardKinematicsTask::<1>::new(None, ()).is_err());
+        assert!(CuInverseKinematicsTask::<1>::new(None, ()).is_err());
+        assert!(CuServoTask::<1>::new(None, ()).is_err());
+        let cfg: ComponentConfig = ron::from_str(r#"#![enable(unwrap_newtypes)]
+{"chain": {"joints": [{"joint_type": "revolute", "origin_translation": [0.0, 0.0, 0.0], "origin_rpy": [0.0, 0.0, 0.0], "axis": "pos_z", "limits": {"lower": -3.0, "upper": 3.0, "max_velocity": 1.0}}]}}"#).unwrap();
+        let mut task = CuForwardKinematicsTask::<1>::new(Some(&cfg), ()).unwrap();
+        assert!(CuForwardKinematicsTask::<2>::new(Some(&cfg), ()).is_err());
+        assert!(CuInverseKinematicsTask::<1>::new(Some(&cfg), ()).is_ok());
+        assert!(CuServoTask::<1>::new(Some(&cfg), ()).is_ok());
+        let (ctx, _) = CuContext::new_mock_clock();
+        let input = CuMsg::new(Some(CuJointPositionsPayload::<1>::default()));
+        let mut output = CuMsg::new(None);
+        task.process(&ctx, &input, &mut output).unwrap();
+        assert_eq!(
+            output.payload().unwrap().to_matrix(),
+            Transform3D::<f64>::identity().to_matrix()
+        );
     }
 }

@@ -25,3 +25,6 @@ serde = { workspace = true }
 [features]
 default = ["std"]
 std = ["cu29/std", "bincode/std", "serde/std"]
+
+[dev-dependencies]
+ron = "0.12"
