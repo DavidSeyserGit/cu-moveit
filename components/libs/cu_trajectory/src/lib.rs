@@ -11,6 +11,11 @@ extern crate alloc;
 
 pub mod parameterize;
 pub mod serde_arrays;
+pub mod task;
+
+pub use task::CuFollowStatus;
+pub use task::CuFollowTrajectoryTask;
+pub use task::CuTrajectoryFollowOutput;
 
 pub use parameterize::CuJointTrajectoryLimits;
 pub use parameterize::CuParameterizeStatus;
