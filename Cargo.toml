@@ -3,12 +3,14 @@ members = [
   "components/libs/cu_kinematics",
   "components/libs/cu_collision",
   "components/libs/cu_robot_description",
+  "components/libs/cu_trajectory",
   "components/tasks/cu_joint_rrt_star",
 ]
 default-members = [
   "components/libs/cu_kinematics",
   "components/libs/cu_collision",
   "components/libs/cu_robot_description",
+  "components/libs/cu_trajectory",
   "components/tasks/cu_joint_rrt_star",
 ]
 resolver = "3"
