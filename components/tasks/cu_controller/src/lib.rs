@@ -112,10 +112,29 @@ pub enum CuControllerStatus {
     Fault,
 }
 
+/// Health reported by the robot or simulator bridge.
+#[derive(
+    Default, Debug, Clone, Copy, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CuRobotStatus {
+    /// The bridge has not confirmed readiness.
+    #[default]
+    NotReady,
+    /// The robot is ready to accept commands.
+    Ready,
+    /// The robot reports a device-specific fault code.
+    Fault(u32),
+    /// An emergency stop is active.
+    EmergencyStop,
+}
+
 /// Measured joint state: the only state payload a bridge has to produce.
 #[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect)]
 #[reflect(no_field_bounds, from_reflect = false, type_path = false)]
 pub struct CuJointStatePayload<const N: usize> {
+    /// Current health reported by the bridge.
+    pub status: CuRobotStatus,
     #[serde(with = "cu_kinematics::serde_arrays::position_array")]
     pub positions: [CuJointPosition; N],
     #[serde(with = "cu_kinematics::serde_arrays::velocity_array")]
@@ -127,6 +146,7 @@ impl<const N: usize> Default for CuJointStatePayload<N> {
         Self {
             positions: [CuJointPosition::default(); N],
             velocities: [CuJointVelocity::default(); N],
+            status: CuRobotStatus::NotReady,
         }
     }
 }
@@ -191,6 +211,12 @@ pub struct CuControllerTask<const N: usize> {
     #[reflect(ignore)]
     last_status: CuControllerStatus,
     has_command: bool,
+    state_timeout_ns: Option<u64>,
+    max_speed: Option<f64>,
+    max_acceleration: Option<f64>,
+    last_time: Option<CuTime>,
+    #[reflect(ignore)]
+    last_velocity: [CuJointVelocity; N],
 }
 
 impl<const N: usize> CuControllerTask<N> {
@@ -204,6 +230,11 @@ impl<const N: usize> CuControllerTask<N> {
             last_command: [CuJointPosition::default(); N],
             last_status: CuControllerStatus::Idle,
             has_command: false,
+            state_timeout_ns: None,
+            max_speed: None,
+            max_acceleration: None,
+            last_time: None,
+            last_velocity: [CuJointVelocity::default(); N],
         }
     }
 
@@ -242,7 +273,12 @@ impl<const N: usize> Freezable for CuControllerTask<N> {
         Encode::encode(&self.effort_kv, encoder)?;
         Encode::encode(&self.last_command, encoder)?;
         Encode::encode(&self.last_status, encoder)?;
-        Encode::encode(&self.has_command, encoder)
+        Encode::encode(&self.has_command, encoder)?;
+        Encode::encode(&self.state_timeout_ns, encoder)?;
+        Encode::encode(&self.max_speed, encoder)?;
+        Encode::encode(&self.max_acceleration, encoder)?;
+        Encode::encode(&self.last_time, encoder)?;
+        Encode::encode(&self.last_velocity, encoder)
     }
 
     fn thaw<D: Decoder>(&mut self, decoder: &mut D) -> Result<(), DecodeError> {
@@ -253,6 +289,11 @@ impl<const N: usize> Freezable for CuControllerTask<N> {
         self.last_command = Decode::decode(decoder)?;
         self.last_status = Decode::decode(decoder)?;
         self.has_command = Decode::decode(decoder)?;
+        self.state_timeout_ns = Decode::decode(decoder)?;
+        self.max_speed = Decode::decode(decoder)?;
+        self.max_acceleration = Decode::decode(decoder)?;
+        self.last_time = Decode::decode(decoder)?;
+        self.last_velocity = Decode::decode(decoder)?;
         Ok(())
     }
 }
@@ -277,6 +318,21 @@ impl<const N: usize> CuTask for CuControllerTask<N> {
         }
         let mut task = Self::new_with_limit(limit);
         if let Some(cfg) = cfg {
+            let timeout = cfg.get::<u64>("state_timeout_ns")?;
+            let speed = cfg.get::<f64>("max_joint_speed_si")?;
+            let acceleration = cfg.get::<f64>("max_joint_acceleration_si")?;
+            if timeout == Some(0)
+                || speed.is_some_and(|v| !v.is_finite() || v <= 0.0)
+                || acceleration.is_some_and(|v| !v.is_finite() || v <= 0.0)
+                || speed.is_some() != acceleration.is_some()
+            {
+                return Err(CuError::from(
+                    "cu-controller: invalid watchdog or rate limits",
+                ));
+            }
+            task.state_timeout_ns = timeout;
+            task.max_speed = speed;
+            task.max_acceleration = acceleration;
             let kp = cfg.get::<f64>("effort_kp")?;
             let kv = cfg.get::<f64>("effort_kv")?;
             if kp.is_some_and(|v| !v.is_finite() || v < 0.0)
@@ -289,6 +345,11 @@ impl<const N: usize> CuTask for CuControllerTask<N> {
             task.mode = cfg
                 .get_value::<CuControllerMode>("mode")?
                 .unwrap_or_default();
+            if task.max_speed.is_some() && task.mode != CuControllerMode::Position {
+                return Err(CuError::from(
+                    "cu-controller: rate limits require 'mode: position'",
+                ));
+            }
             if let Some(kp) = kp {
                 task.effort_kp = kp;
             }
@@ -301,7 +362,7 @@ impl<const N: usize> CuTask for CuControllerTask<N> {
 
     fn process<'i, 'o>(
         &mut self,
-        _ctx: &CuContext,
+        ctx: &CuContext,
         input: &Self::Input<'i>,
         output: &mut Self::Output<'o>,
     ) -> CuResult<()> {
@@ -313,7 +374,24 @@ impl<const N: usize> CuTask for CuControllerTask<N> {
             mode: self.mode,
             ..Default::default()
         };
+        let now = ctx.now();
+        let stale = self
+            .state_timeout_ns
+            .is_some_and(|timeout| match input.1.tov {
+                Tov::Time(t) => {
+                    t.as_nanos() > now.as_nanos() || now.as_nanos() - t.as_nanos() > timeout
+                }
+                _ => true,
+            });
         match (setpoint, state) {
+            (_, _) if stale => {
+                command.positions = self.last_command;
+                command.status = CuControllerStatus::Fault;
+            }
+            (_, Some(state)) if state.status != CuRobotStatus::Ready => {
+                command.positions = state.positions;
+                command.status = CuControllerStatus::Fault;
+            }
             (None, None) => {
                 command.positions = self.last_command;
                 command.status = if self.has_command {
@@ -389,6 +467,62 @@ impl<const N: usize> CuTask for CuControllerTask<N> {
             }
         }
 
+        // Rate limiting applies while a setpoint is followed (running or
+        // holding its end). It starts from the measured state after idle or
+        // fault, so no stale command or velocity carries over.
+        if let (Some(max_speed), Some(max_acceleration)) = (self.max_speed, self.max_acceleration)
+            && matches!(
+                command.status,
+                CuControllerStatus::Running | CuControllerStatus::Holding
+            )
+            && let Some(measured) = state
+        {
+            let following = matches!(
+                self.last_status,
+                CuControllerStatus::Running | CuControllerStatus::Holding
+            );
+            if !following {
+                self.last_command = measured.positions;
+                self.last_velocity = measured
+                    .positions
+                    .map(|q| CuJointVelocity::from_coordinate(q, 0.0));
+            }
+            let nanos = match self.last_time {
+                Some(previous) if following => now.as_nanos().saturating_sub(previous.as_nanos()),
+                _ => 0,
+            };
+            if nanos == 0 {
+                // No elapsed time (first cycle or a repeated tick): repeat the
+                // last limited command.
+                command.positions = self.last_command;
+                command.velocities = self.last_velocity;
+            } else {
+                let dt = nanos as f64 * 1e-9;
+                let mut settled = true;
+                for j in 0..N {
+                    let current = self.last_command[j].si_value();
+                    let old_v = self.last_velocity[j].si_value();
+                    let desired = ((command.positions[j].si_value() - current) / dt)
+                        .clamp(-max_speed, max_speed);
+                    let v = desired
+                        .clamp(old_v - max_acceleration * dt, old_v + max_acceleration * dt)
+                        .clamp(-max_speed, max_speed);
+                    let target = command.positions[j].si_value();
+                    command.positions[j] = self.last_command[j].with_si_value(current + v * dt);
+                    command.velocities[j] =
+                        CuJointVelocity::from_coordinate(command.positions[j], v);
+                    settled &=
+                        (command.positions[j].si_value() - target).abs() <= 1e-9 && v.abs() <= 1e-9;
+                }
+                // Holding is only reported once the limited command has
+                // actually reached the held setpoint.
+                if command.status == CuControllerStatus::Holding && !settled {
+                    command.status = CuControllerStatus::Running;
+                }
+            }
+        }
+        self.last_time = Some(now);
+        self.last_velocity = command.velocities;
         self.last_command = command.positions;
         self.last_status = command.status;
         self.has_command = true;
@@ -415,6 +549,7 @@ mod tests {
 
     fn state(pos: f64) -> CuJointStatePayload<2> {
         CuJointStatePayload {
+            status: CuRobotStatus::Ready,
             positions: [CuJointPosition::Revolute(Angle::new::<radian>(pos)); 2],
             velocities: [CuJointVelocity::default(); 2],
         }

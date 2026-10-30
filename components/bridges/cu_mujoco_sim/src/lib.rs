@@ -87,6 +87,7 @@ use bincode::error::EncodeError;
 use cu_controller::CuJointCommandPayload;
 use cu_controller::CuJointEffort;
 use cu_controller::CuJointStatePayload;
+use cu_controller::CuRobotStatus;
 use cu_kinematics::CuJointPosition;
 use cu_kinematics::CuJointVelocity;
 use cu29::prelude::*;
@@ -253,6 +254,7 @@ pub fn decode_state_line(line: &str, out: &mut CuJointStatePayload<MUJOCO_DOF>) 
     }
     out.positions = positions;
     out.velocities = velocities;
+    out.status = CuRobotStatus::Ready;
     Ok(())
 }
 
@@ -344,7 +346,7 @@ impl CuBridge for CuMujocoSimBridge {
 
     fn receive<'a, Payload>(
         &mut self,
-        _ctx: &CuContext,
+        ctx: &CuContext,
         channel: &'static BridgeChannel<<Self::Rx as BridgeChannelSet>::Id, Payload>,
         msg: &mut CuMsg<Payload>,
     ) -> CuResult<()>
@@ -386,6 +388,7 @@ impl CuBridge for CuMujocoSimBridge {
         let line = core::str::from_utf8(&buf[..len])
             .map_err(|e| CuError::new_with_cause("cu-mujoco-sim: state line is not UTF-8", e))?;
         let state = msg.downcast_mut::<CuJointStatePayload<MUJOCO_DOF>>()?;
+        state.tov = Tov::Time(ctx.now());
         let Some(payload) = state.payload_mut() else {
             let mut fresh = CuJointStatePayload::<MUJOCO_DOF>::default();
             decode_state_line(line, &mut fresh)?;
