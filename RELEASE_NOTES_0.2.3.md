@@ -1,4 +1,4 @@
-# cu-moveit 0.3.0
+# cu-moveit 0.2.3
 
 Velocity and effort control for the unified robot-agnostic controller.
 
@@ -31,5 +31,5 @@ Velocity and effort control for the unified robot-agnostic controller.
 Gripper and digital IO, robot-side status/fault reporting, and controller
 rate limiting + watchdog remain open.
 
-Workspace version 0.3.0, one shared version as usual; consume via git
-dependency on the `v0.3.0` tag.
+Workspace version 0.2.3, one shared version as usual; consume via git
+dependency on the `v0.2.3` tag.
