@@ -74,7 +74,7 @@ tasks, deterministic replay-compatible behaviour.
      hardware bridge in Step 4. (Implemented: `cu-mujoco-sim` `CuBridge` over
      `CuJointPositionsPayload<6>`, released in `v0.2.1`; the local playground
      closes the loop and the Trajectory Studio executes in the sim.)
-   - **Unified robot controller (next).** Upstream `cu29` has no robot
+   - **Unified robot controller (implemented in `v0.2.2`).** Upstream `cu29` has no robot
      controller abstraction — only the generic `CuBridge` trait and task
      roles — so this contract is defined here, robot-agnostically:
      a `CuControllerTask<N>` between the trajectory follower and a `CuBridge`,
