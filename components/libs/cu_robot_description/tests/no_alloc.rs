@@ -71,10 +71,12 @@ fn imported_models_execute_without_heap_allocation() {
     let mut goal = start;
     robot.write_named_state("home", &mut start).unwrap();
     robot.write_named_state("reach", &mut goal).unwrap();
-    let mut planner = CuJointRrtStarTask::new_with_model(
-        robot.chain,
-        robot.collision_model,
-        CuJointRrtParams::default(),
+    let mut planner = CuJointRrtStarTask::new_with_planner(
+        cu_joint_rrt_star::CuJointRrtStar::new(
+            robot.chain,
+            robot.collision_model,
+            CuJointRrtParams::default(),
+        ),
         64,
         32,
         7,

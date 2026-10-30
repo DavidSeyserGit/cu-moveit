@@ -55,10 +55,12 @@ fn main() -> CuResult<()> {
         return Err(CuError::from("Example IK solution is in collision"));
     }
 
-    let mut planner = CuJointRrtStarTask::new_with_model(
-        robot.chain,
-        robot.collision_model,
-        CuJointRrtParams::default(),
+    let mut planner = CuJointRrtStarTask::new_with_planner(
+        cu_joint_rrt_star::CuJointRrtStar::new(
+            robot.chain,
+            robot.collision_model,
+            CuJointRrtParams::default(),
+        ),
         64,
         32,
         7,

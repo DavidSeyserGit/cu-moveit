@@ -1,9 +1,12 @@
-//! Deterministic, allocation-free $N$-DOF joint-space RRT* anytime motion planner for `copper-rs`.
+//! Deterministic, allocation-free $N$-DOF joint-space RRT* for `copper-rs`.
 //!
-//! [`CuJointRrtStarTask`] consumes a [`CuJointPlanRequest`] and publishes a [`CuJointPlanPath`].
-//! `base()` runs the initial iteration budget and commits the first valid collision-free path;
-//! each `refine()` runs one bounded quantum of RRT* iterations and updates the output only when
-//! the joint-space path cost strictly improves.
+//! [`CuJointRrtStar`] is the sampling-based implementation of
+//! [`cu_motion_planning::CuJointPlanner`]: `begin` validates the request and
+//! seeds the tree (connecting start and goal directly when the line is free),
+//! and each `step` runs a bounded number of RRT* iterations with informed
+//! pruning, neighbourhood rewiring, and line-of-sight shortcutting on output.
+//! All randomness comes from the job seed, so replay reproduces every plan.
+//! [`CuJointRrtStarTask`] is the generic planner task running RRT*.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -12,45 +15,42 @@ extern crate alloc;
 
 use bincode::Decode;
 use bincode::Encode;
-use bincode::de::Decoder;
-use bincode::enc::Encoder;
-use bincode::error::DecodeError;
-use bincode::error::EncodeError;
-use cu_collision::CuCollisionReport;
-use cu_collision::CuCollisionShape;
-use cu_collision::CuCollisionWorld;
-use cu_collision::CuPlanningScene;
 use cu_collision::CuRobotCollisionModel;
 use cu_collision::CuSceneExclusions;
 use cu_collision::CuSceneRevision;
-use cu_collision::scene_query::CuSceneQueryExclusions;
-use cu_collision::scene_query::check_attached_configuration;
 use cu_kinematics::CuJointMetric;
 use cu_kinematics::CuJointPosition;
 use cu_kinematics::CuJointPositionsPayload;
 use cu_kinematics::CuJointResolution;
 use cu_kinematics::CuKinematicChain;
+use cu_motion_planning::CuJointPlanner;
+use cu_motion_planning::CuJointPlannerTask;
+use cu_motion_planning::CuPlannerKind;
+use cu_motion_planning::CuSceneValidity;
+use cu_motion_planning::joint_distance;
 use cu_rng::prelude::*;
-use cu29::cutask_anytime::AnytimeStatus;
-use cu29::cutask_anytime::CuAnytimeTask;
 use cu29::cutask_anytime::Quality;
 use cu29::cutask_anytime::quality_from_f32;
 use cu29::prelude::*;
-use cu29::resources;
 use serde::Deserialize;
 use serde::Serialize;
 
+pub use cu_motion_planning::CuJointPlanPath;
+pub use cu_motion_planning::CuJointPlanRequest;
+pub use cu_motion_planning::CuJointPlanner as _;
+pub use cu_motion_planning::CuPlanStatus;
+pub use cu_motion_planning::MAX_ATTACHED_SHAPES;
+pub use cu_motion_planning::MAX_EXCLUSIONS;
+pub use cu_motion_planning::MAX_OBSTACLES;
+pub use cu_motion_planning::MAX_WAYPOINTS;
+pub use cu_motion_planning::task::planner_resources;
+
+/// The generic planner task running RRT*.
+pub type CuJointRrtStarTask<const N: usize, const M: usize = N> =
+    CuJointPlannerTask<CuJointRrtStar<N, M>, N>;
+
 /// Fixed capacity of tree nodes in `CuJointRrtStar`.
 pub const MAX_NODES: usize = 256;
-/// Fixed capacity of waypoints in a published `CuJointPlanPath`.
-pub const MAX_WAYPOINTS: usize = 32;
-/// Fixed capacity of scene obstacles in `CuJointPlanRequest`.
-pub const MAX_OBSTACLES: usize = 16;
-/// Fixed capacity of attached shapes in `CuJointPlanRequest`.
-pub const MAX_ATTACHED_SHAPES: usize = 8;
-/// Fixed capacity of stable-ID exclusions in `CuJointPlanRequest`.
-pub const MAX_EXCLUSIONS: usize = 16;
-
 const CONVERGED_QUALITY: f32 = 0.999;
 
 fn is_converged_quality(q: Quality) -> bool {
@@ -90,70 +90,6 @@ impl Default for CuJointRrtParams {
     }
 }
 
-/// Joint-space motion planning request payload (`CuMsgPayload`-compliant).
-#[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
-pub struct CuJointPlanRequest<const N: usize> {
-    pub scene: CuPlanningScene<MAX_OBSTACLES, MAX_ATTACHED_SHAPES>,
-    pub exclusions: CuSceneExclusions<MAX_EXCLUSIONS>,
-    #[serde(with = "cu_kinematics::serde_arrays::position_array")]
-    pub start: [CuJointPosition; N],
-    #[serde(with = "cu_kinematics::serde_arrays::position_array")]
-    pub goal: [CuJointPosition; N],
-}
-
-impl<const N: usize> Default for CuJointPlanRequest<N> {
-    fn default() -> Self {
-        Self {
-            scene: CuPlanningScene::new(),
-            exclusions: CuSceneExclusions::new(),
-            start: [CuJointPosition::default(); N],
-            goal: [CuJointPosition::default(); N],
-        }
-    }
-}
-
-/// Planned collision-free joint-space trajectory payload (`CuMsgPayload`-compliant).
-#[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
-pub struct CuJointPlanPath<const N: usize> {
-    pub waypoints: [CuJointPositionsPayload<N>; MAX_WAYPOINTS],
-    /// Number of valid waypoints in `waypoints[..len]`.
-    pub len: u32,
-    /// Dimensionless joint-space L2 cost using the configured metric.
-    pub cost: f64,
-    /// Total RRT* iterations executed on this job.
-    pub iterations: u32,
-    /// Scene revision the published path was planned against.
-    pub scene_revision: CuSceneRevision,
-    /// Collision exclusions captured for this plan; compare with the current set.
-    pub exclusions: CuSceneExclusions<MAX_EXCLUSIONS>,
-}
-
-impl<const N: usize> Default for CuJointPlanPath<N> {
-    fn default() -> Self {
-        Self {
-            waypoints: core::array::from_fn(|_| CuJointPositionsPayload::default()),
-            len: 0,
-            cost: f64::INFINITY,
-            iterations: 0,
-            scene_revision: CuSceneRevision::INITIAL,
-            exclusions: CuSceneExclusions::new(),
-        }
-    }
-}
-
-/// Compact debug state exposed by `CuJointRrtStarTask` for remote inspection without serializing the full tree.
-#[derive(Default, Debug, Reflect)]
-pub struct CuJointPlannerDebugState {
-    pub iterations: u32,
-    pub tree_size: u32,
-    pub best_cost: f64,
-    pub published_cost: f64,
-    pub published_quality: Quality,
-    pub scene_revision: CuSceneRevision,
-}
-
 #[derive(Clone, Copy)]
 struct RrtNode<const N: usize> {
     q: [CuJointPosition; N],
@@ -173,16 +109,8 @@ impl<const N: usize> Default for RrtNode<N> {
 
 /// Allocation-free fixed-capacity joint-space RRT* solver.
 pub struct CuJointRrtStar<const N: usize, const M: usize = N> {
-    chain: CuKinematicChain<N>,
-    collision_model: CuRobotCollisionModel<N, M>,
+    validity: CuSceneValidity<N, M>,
     params: CuJointRrtParams,
-    scene: CuPlanningScene<MAX_OBSTACLES, MAX_ATTACHED_SHAPES>,
-    world: CuCollisionWorld<MAX_OBSTACLES>,
-    attached_shapes: [CuCollisionShape; MAX_ATTACHED_SHAPES],
-    attached_frames: [Option<usize>; MAX_ATTACHED_SHAPES],
-    attached_len: usize,
-    query_exclusions: CuSceneQueryExclusions<MAX_EXCLUSIONS>,
-    exclusions: CuSceneExclusions<MAX_EXCLUSIONS>,
     start: [CuJointPosition; N],
     goal: [CuJointPosition; N],
     straight_line_cost: f64,
@@ -192,114 +120,65 @@ pub struct CuJointRrtStar<const N: usize, const M: usize = N> {
     best_cost: f64,
     iterations: u32,
     rng: CuRng,
-    valid_endpoints: bool,
+    status: CuPlanStatus,
 }
 
 impl<const N: usize, const M: usize> CuJointRrtStar<N, M> {
-    /// Creates and initializes a new joint-space RRT* solver for `(start, goal)`.
-    #[allow(clippy::too_many_arguments)]
+    /// Creates an idle RRT* solver for explicit robot models; start a job
+    /// with [`CuJointPlanner::begin`].
     pub fn new(
         chain: CuKinematicChain<N>,
         collision_model: CuRobotCollisionModel<N, M>,
         params: CuJointRrtParams,
-        scene: CuPlanningScene<MAX_OBSTACLES, MAX_ATTACHED_SHAPES>,
-        exclusions: &CuSceneExclusions<MAX_EXCLUSIONS>,
-        start: [CuJointPosition; N],
-        goal: [CuJointPosition; N],
-        seed: u64,
     ) -> Self {
-        let mut solver = Self {
-            chain,
-            collision_model,
+        Self {
+            validity: CuSceneValidity::new(chain, collision_model, params.collision_check_step),
             params,
-            scene: CuPlanningScene::new(),
-            world: CuCollisionWorld::new(),
-            attached_shapes: [CuCollisionShape::default(); MAX_ATTACHED_SHAPES],
-            attached_frames: [None; MAX_ATTACHED_SHAPES],
-            attached_len: 0,
-            query_exclusions: CuSceneQueryExclusions::new(),
-            exclusions: CuSceneExclusions::new(),
-            start,
-            goal,
+            start: [CuJointPosition::default(); N],
+            goal: [CuJointPosition::default(); N],
             straight_line_cost: 0.0,
             nodes: [RrtNode::default(); MAX_NODES],
             node_count: 0,
             goal_node_idx: None,
             best_cost: f64::INFINITY,
             iterations: 0,
-            rng: CuRng::from_seed(seed),
-            valid_endpoints: false,
-        };
-        solver.reset(scene, exclusions, start, goal, seed);
-        solver
+            rng: CuRng::from_seed(0),
+            status: CuPlanStatus::InvalidRequest,
+        }
     }
 
-    /// Resets the solver in place for a new job without allocating.
-    pub fn reset(
-        &mut self,
-        scene: CuPlanningScene<MAX_OBSTACLES, MAX_ATTACHED_SHAPES>,
-        exclusions: &CuSceneExclusions<MAX_EXCLUSIONS>,
-        start: [CuJointPosition; N],
-        goal: [CuJointPosition; N],
-        seed: u64,
-    ) {
-        self.scene = scene;
-        self.exclusions = exclusions.clone();
-        self.start = start;
-        self.goal = goal;
-        self.straight_line_cost = joint_distance(&start, &goal, self.params.metric);
-        self.node_count = 0;
-        self.goal_node_idx = None;
-        self.best_cost = f64::INFINITY;
-        self.iterations = 0;
-        self.rng.reseed(seed);
+    fn params_valid(&self) -> bool {
+        let p = &self.params;
+        p.metric.validate().is_ok()
+            && p.step_size.is_finite()
+            && p.step_size > 0.0
+            && p.rewire_radius.is_finite()
+            && p.rewire_radius > 0.0
+            && p.goal_threshold.is_finite()
+            && p.goal_threshold > 0.0
+            && p.goal_bias.is_finite()
+            && (0.0..=1.0).contains(&p.goal_bias)
+            && p.max_nodes >= 2
+    }
 
-        let scene_ok = self.capture_scene(exclusions);
-        let start_ok = scene_ok && self.is_scene_configuration_free(&self.start);
-        let goal_ok = scene_ok && self.is_scene_configuration_free(&self.goal);
-        self.valid_endpoints = scene_ok
-            && start_ok
-            && goal_ok
-            && self.params.metric.validate().is_ok()
-            && self.params.step_size.is_finite()
-            && self.params.step_size > 0.0
-            && self.params.rewire_radius.is_finite()
-            && self.params.rewire_radius > 0.0
-            && self.params.goal_threshold.is_finite()
-            && self.params.goal_threshold > 0.0
-            && self.params.goal_bias.is_finite()
-            && (0.0..=1.0).contains(&self.params.goal_bias)
-            && self.params.max_nodes >= 2
-            && self.params.collision_check_step.metric().validate().is_ok();
-
-        if self.valid_endpoints {
-            self.nodes[0] = RrtNode {
-                q: self.start,
-                parent: u16::MAX,
-                cost: 0.0,
-            };
-            self.node_count = 1;
-
-            if self.straight_line_cost <= 1e-9 {
-                self.goal_node_idx = Some(0);
-                self.best_cost = 0.0;
-            } else if self.is_scene_segment_free(&self.start, &self.goal) {
-                // Direct line-of-sight connection from start to goal!
-                self.nodes[1] = RrtNode {
-                    q: self.goal,
-                    parent: 0,
-                    cost: self.straight_line_cost,
-                };
-                self.node_count = 2;
-                self.goal_node_idx = Some(1);
-                self.best_cost = self.straight_line_cost;
-            }
+    /// Updates the job status after tree changes.
+    fn refresh_status(&mut self) {
+        if self.status.is_final() && !self.status.has_path() {
+            return;
         }
+        let cap = (self.params.max_nodes as usize).min(MAX_NODES);
+        let done = self.node_count >= cap || is_converged_quality(self.quality());
+        self.status = match (self.has_solution(), done) {
+            (true, true) => CuPlanStatus::Converged,
+            (true, false) => CuPlanStatus::Improving,
+            (false, true) => CuPlanStatus::Exhausted,
+            (false, false) => CuPlanStatus::Searching,
+        };
     }
 
     /// Runs `budget` bounded RRT* iterations in place.
     pub fn grow(&mut self, budget: u32) {
-        if !self.valid_endpoints {
+        if self.status.is_final() {
             return;
         }
         let cap = (self.params.max_nodes as usize).min(MAX_NODES);
@@ -331,7 +210,7 @@ impl<const N: usize, const M: usize> CuJointRrtStar<N, M> {
                 continue;
             }
 
-            if !self.is_scene_configuration_free(&q_new) {
+            if !self.validity.is_configuration_free(&q_new) {
                 continue;
             }
 
@@ -340,7 +219,10 @@ impl<const N: usize, const M: usize> CuJointRrtStar<N, M> {
             let mut best_new_cost = self.nodes[nearest_idx].cost
                 + joint_distance(&self.nodes[nearest_idx].q, &q_new, self.params.metric);
 
-            if !self.is_scene_segment_free(&self.nodes[nearest_idx].q, &q_new) {
+            if !self
+                .validity
+                .is_segment_free(&self.nodes[nearest_idx].q, &q_new)
+            {
                 continue;
             }
 
@@ -351,7 +233,7 @@ impl<const N: usize, const M: usize> CuJointRrtStar<N, M> {
                     if d <= rewire_radius {
                         let cand_cost = self.nodes[idx].cost + d;
                         if cand_cost < best_new_cost
-                            && self.is_scene_segment_free(&self.nodes[idx].q, &q_new)
+                            && self.validity.is_segment_free(&self.nodes[idx].q, &q_new)
                         {
                             best_parent = idx;
                             best_new_cost = cand_cost;
@@ -379,7 +261,7 @@ impl<const N: usize, const M: usize> CuJointRrtStar<N, M> {
                     if d <= rewire_radius
                         && best_new_cost + d < self.nodes[nbr].cost
                         && !self.is_ancestor_of(nbr, new_idx)
-                        && self.is_scene_segment_free(&q_new, &self.nodes[nbr].q)
+                        && self.validity.is_segment_free(&q_new, &self.nodes[nbr].q)
                     {
                         self.nodes[nbr].parent = new_idx as u16;
                         self.nodes[nbr].cost = best_new_cost + d;
@@ -428,7 +310,7 @@ impl<const N: usize, const M: usize> CuJointRrtStar<N, M> {
             let dist_to_goal = joint_distance(&q_new, &self.goal, self.params.metric);
             if dist_to_goal <= goal_threshold
                 && best_new_cost + dist_to_goal < self.best_cost
-                && self.is_scene_segment_free(&q_new, &self.goal)
+                && self.validity.is_segment_free(&q_new, &self.goal)
             {
                 if let Some(g_idx) = self.goal_node_idx {
                     self.nodes[g_idx].parent = new_idx as u16;
@@ -447,6 +329,7 @@ impl<const N: usize, const M: usize> CuJointRrtStar<N, M> {
                 }
             }
         }
+        self.refresh_status();
     }
 
     /// Returns `true` if a collision-free path from `start` to `goal` has been found.
@@ -457,7 +340,7 @@ impl<const N: usize, const M: usize> CuJointRrtStar<N, M> {
     /// Returns `true` if the node buffer is full or the path is already straight-line optimal.
     pub fn is_exhausted(&self) -> bool {
         let cap = (self.params.max_nodes as usize).min(MAX_NODES);
-        !self.valid_endpoints || self.node_count >= cap || is_converged_quality(self.quality())
+        self.status.is_final() || self.node_count >= cap || is_converged_quality(self.quality())
     }
 
     /// Returns the best joint-space path cost found so far.
@@ -477,131 +360,12 @@ impl<const N: usize, const M: usize> CuJointRrtStar<N, M> {
 
     /// Returns the scene revision captured for the current job.
     pub const fn scene_revision(&self) -> CuSceneRevision {
-        self.scene.revision()
+        self.validity.scene_revision()
     }
 
-    /// Captures the scene snapshot into query caches, returning `false` when invalid.
-    ///
-    /// Stable-ID `exclusions` resolve against the captured snapshot; invalid
-    /// references invalidate the whole job.
-    fn capture_scene(&mut self, exclusions: &CuSceneExclusions<MAX_EXCLUSIONS>) -> bool {
-        if self.scene.write_collision_world(&mut self.world).is_err() {
-            self.attached_len = 0;
-            return false;
-        }
-        let attached = self.scene.attached_shapes();
-        if attached.len() > MAX_ATTACHED_SHAPES {
-            self.attached_len = 0;
-            return false;
-        }
-        let mut i = 0;
-        while i < attached.len() {
-            if attached[i].link_index >= N {
-                self.attached_len = 0;
-                return false;
-            }
-            self.attached_shapes[i] = attached[i].shape;
-            self.attached_frames[i] = Some(attached[i].link_index);
-            i += 1;
-        }
-        while i < MAX_ATTACHED_SHAPES {
-            self.attached_shapes[i] = CuCollisionShape::default();
-            self.attached_frames[i] = None;
-            i += 1;
-        }
-        self.attached_len = attached.len();
-        let mut resolved = CuSceneQueryExclusions::new();
-        if exclusions
-            .resolve(
-                &self.scene,
-                self.collision_model.shape_count(),
-                &mut resolved,
-            )
-            .is_err()
-        {
-            self.attached_len = 0;
-            return false;
-        }
-        self.query_exclusions = resolved;
-        true
-    }
-
-    /// Returns `true` when `q` is within limits and free of self, environment,
-    /// and attached-shape collisions against the captured scene snapshot.
-    fn is_scene_configuration_free(&self, q: &[CuJointPosition; N]) -> bool {
-        if !self
-            .collision_model
-            .is_configuration_collision_free(&self.chain, q, Some(&self.world))
-            .unwrap_or(false)
-        {
-            return false;
-        }
-        if self.attached_len == 0 {
-            return true;
-        }
-        let mut attached_world_shapes = [CuCollisionShape::default(); MAX_ATTACHED_SHAPES];
-        let mut robot_world_shapes = [CuCollisionShape::default(); M];
-        let mut report = CuCollisionReport::<0>::default();
-        check_attached_configuration(
-            &self.collision_model,
-            &self.chain,
-            q,
-            &self.attached_shapes,
-            &self.attached_frames,
-            self.attached_len,
-            Some(&self.world),
-            &self.query_exclusions,
-            &mut attached_world_shapes,
-            &mut robot_world_shapes,
-            &mut report,
-        )
-        .is_ok()
-            && report.is_collision_free()
-    }
-
-    /// Returns `true` when the interpolated segment from `a` to `b` is collision-free
-    /// against the captured scene snapshot at the configured resolution.
-    fn is_scene_segment_free(&self, a: &[CuJointPosition; N], b: &[CuJointPosition; N]) -> bool {
-        let metric = self.params.collision_check_step.metric();
-        if metric.validate().is_err() {
-            return false;
-        }
-        let mut max_delta = 0.0_f64;
-        let mut j = 0;
-        while j < N {
-            if self.chain.joints()[j].validate_coordinate(a[j]).is_err()
-                || self.chain.joints()[j].validate_coordinate(b[j]).is_err()
-            {
-                return false;
-            }
-            let delta = (metric.normalized(b[j]) - metric.normalized(a[j])).abs();
-            if delta > max_delta {
-                max_delta = delta;
-            }
-            j += 1;
-        }
-        if max_delta > 1_000_000.0 {
-            return false;
-        }
-        let steps = (libm::ceil(max_delta) as usize).max(1);
-        let mut s = 0;
-        while s <= steps {
-            let alpha = (s as f64) / (steps as f64);
-            let mut q_interp = [CuJointPosition::default(); N];
-            let mut k = 0;
-            while k < N {
-                match a[k].interpolate(b[k], alpha) {
-                    Ok(q) => q_interp[k] = q,
-                    Err(_) => return false,
-                }
-                k += 1;
-            }
-            if !self.is_scene_configuration_free(&q_interp) {
-                return false;
-            }
-            s += 1;
-        }
-        true
+    /// Exclusions captured for the current job.
+    pub const fn exclusions(&self) -> &CuSceneExclusions<MAX_EXCLUSIONS> {
+        self.validity.exclusions()
     }
 
     /// Computes the normalized quality in `[0.0, 1.0]` (`straight_line_cost / best_cost`).
@@ -679,7 +443,10 @@ impl<const N: usize, const M: usize> CuJointRrtStar<N, M> {
                 if up == u16::MAX {
                     break;
                 }
-                if self.is_scene_segment_free(&self.nodes[anchor].q, &self.nodes[up as usize].q) {
+                if self
+                    .validity
+                    .is_segment_free(&self.nodes[anchor].q, &self.nodes[up as usize].q)
+                {
                     chosen = up as usize;
                 }
                 curr = up as usize;
@@ -708,7 +475,7 @@ impl<const N: usize, const M: usize> CuJointRrtStar<N, M> {
         if coin < self.params.goal_bias {
             return self.goal;
         }
-        let joints = self.chain.joints();
+        let joints = self.validity.chain().joints();
         let mut q = [CuJointPosition::default(); N];
         let mut j = 0;
         while j < N {
@@ -754,21 +521,6 @@ impl<const N: usize, const M: usize> CuJointRrtStar<N, M> {
     }
 }
 
-fn joint_distance<const N: usize>(
-    a: &[CuJointPosition; N],
-    b: &[CuJointPosition; N],
-    metric: CuJointMetric,
-) -> f64 {
-    let mut sum_sq = 0.0_f64;
-    let mut i = 0;
-    while i < N {
-        let d = metric.normalized(b[i]) - metric.normalized(a[i]);
-        sum_sq += d * d;
-        i += 1;
-    }
-    libm::sqrt(sum_sq)
-}
-
 fn steer<const N: usize>(
     from: &[CuJointPosition; N],
     to: &[CuJointPosition; N],
@@ -791,138 +543,16 @@ fn steer<const N: usize>(
     out
 }
 
-pub mod planner_resources {
-    use super::*;
-    resources!({ rng => Owned<CuRng> });
-}
+impl<const N: usize, const M: usize> CuJointPlanner<N> for CuJointRrtStar<N, M> {
+    const KIND: CuPlannerKind = CuPlannerKind::Sampling;
 
-/// Anytime joint-space RRT* motion planner task (`CuAnytimeTask`).
-#[derive(Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
-pub struct CuJointRrtStarTask<const N: usize, const M: usize = N> {
-    #[reflect(ignore)]
-    chain: CuKinematicChain<N>,
-    #[reflect(ignore)]
-    collision_model: CuRobotCollisionModel<N, M>,
-    params: CuJointRrtParams,
-    base_iterations: u32,
-    block_iterations: u32,
-    base_seed: u64,
-    job_counter: u64,
-    #[reflect(ignore)]
-    planner: Option<CuJointRrtStar<N, M>>,
-    published_cost: f64,
-    published_quality: Quality,
-}
-
-impl<const N: usize, const M: usize> Freezable for CuJointRrtStarTask<N, M> {
-    fn freeze<E: Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {
-        Encode::encode(&self.base_seed, encoder)?;
-        Encode::encode(&self.job_counter, encoder)
-    }
-
-    fn thaw<D: Decoder>(&mut self, decoder: &mut D) -> Result<(), DecodeError> {
-        self.base_seed = Decode::decode(decoder)?;
-        self.job_counter = Decode::decode(decoder)?;
-        Ok(())
-    }
-}
-
-impl<const N: usize, const M: usize> CuJointRrtStarTask<N, M> {
-    /// Creates a joint-space RRT* anytime task with explicit kinematic chain, collision model, and seed.
-    pub fn new_with_model(
-        chain: CuKinematicChain<N>,
-        collision_model: CuRobotCollisionModel<N, M>,
-        params: CuJointRrtParams,
-        base_iterations: u32,
-        block_iterations: u32,
-        base_seed: u64,
-    ) -> Self {
-        Self {
-            chain,
-            collision_model,
-            params,
-            base_iterations,
-            block_iterations,
-            base_seed,
-            job_counter: 0,
-            planner: None,
-            published_cost: f64::INFINITY,
-            published_quality: quality_from_f32(0.0),
-        }
-    }
-
-    /// Returns a compact snapshot of the current job's progress.
-    pub fn debug_state(&self) -> CuJointPlannerDebugState {
-        let p = self.planner.as_ref();
-        CuJointPlannerDebugState {
-            iterations: p.map_or(0, CuJointRrtStar::iterations),
-            tree_size: p.map_or(0, CuJointRrtStar::tree_size),
-            best_cost: p.map_or(f64::INFINITY, CuJointRrtStar::best_cost),
-            published_cost: self.published_cost,
-            published_quality: self.published_quality,
-            scene_revision: p.map_or(CuSceneRevision::INITIAL, CuJointRrtStar::scene_revision),
-        }
-    }
-
-    fn publish(&mut self, output: &mut CuMsg<CuJointPlanPath<N>>) -> Quality {
-        let Some(planner) = self.planner.as_ref() else {
-            return self.published_quality;
-        };
-        if !planner.has_solution() {
-            return self.published_quality;
-        }
-        let mut waypoints = core::array::from_fn(|_| CuJointPositionsPayload::default());
-        let Some(len) = planner.write_path(&mut waypoints) else {
-            // The best path does not fit the waypoint capacity even after shortcutting:
-            // signal that no accurate path can be published.
-            output.clear_payload();
-            self.published_quality = quality_from_f32(0.0);
-            return self.published_quality;
-        };
-        // Publish the cost and quality of the actually emitted (shortcut) path.
-        let cost = planner.path_cost(&waypoints, len);
-        if cost < self.published_cost || self.published_quality.raw() <= 0.0 {
-            output.set_payload(CuJointPlanPath {
-                waypoints,
-                len,
-                cost,
-                iterations: planner.iterations(),
-                scene_revision: planner.scene_revision(),
-                exclusions: planner.exclusions.clone(),
-            });
-            self.published_cost = cost;
-            self.published_quality = planner.quality_of_cost(cost);
-        }
-        self.published_quality
-    }
-}
-
-impl<const N: usize, const M: usize> CuAnytimeTask for CuJointRrtStarTask<N, M> {
-    type Input<'m> = input_msg!(CuJointPlanRequest<N>);
-    type Output<'m> = output_msg!(CuJointPlanPath<N>);
-    type Resources<'r> = planner_resources::Resources;
-    type Quality = Quality;
-
-    fn register_debug_state_types(registry: &mut TypeRegistry) {
-        registry.register::<CuJointPlannerDebugState>();
-    }
-
-    fn debug_state_type_path() -> &'static str {
-        CuJointPlannerDebugState::type_path()
-    }
-
-    fn with_debug_state<R>(&self, f: impl FnOnce(&dyn bevy_reflect::Reflect) -> R) -> R {
-        f(&self.debug_state())
-    }
-
-    fn new(config: Option<&ComponentConfig>, resources: Self::Resources<'_>) -> CuResult<Self> {
+    /// Config keys: `chain`, `collision_model`, and optional `metric`,
+    /// `collision_check_step`, `step_size`, `goal_bias`, `goal_threshold`,
+    /// `rewire_radius`, `max_nodes`.
+    fn from_config(config: Option<&ComponentConfig>) -> CuResult<Self> {
         let chain = CuKinematicChain::from_config(config)?;
         let collision_model = CuRobotCollisionModel::from_config(config)?;
         let mut params = CuJointRrtParams::default();
-        let mut base_iterations = 64u32;
-        let mut block_iterations = 32u32;
-
         if let Some(cfg) = config {
             if let Some(v) = cfg.get_value::<CuJointMetric>("metric")? {
                 params.metric = v;
@@ -942,107 +572,87 @@ impl<const N: usize, const M: usize> CuAnytimeTask for CuJointRrtStarTask<N, M> 
             if let Some(v) = cfg.get::<f64>("rewire_radius")? {
                 params.rewire_radius = v;
             }
-            if let Some(v) = cfg.get::<u32>("base_iterations")? {
-                base_iterations = v;
-            }
-            if let Some(v) = cfg.get::<u32>("block_iterations")? {
-                block_iterations = v;
+            if let Some(v) = cfg.get::<u32>("max_nodes")? {
+                params.max_nodes = v;
             }
         }
-
-        let Owned(mut rng) = resources.rng;
-        Ok(Self::new_with_model(
-            chain,
-            collision_model,
-            params,
-            base_iterations,
-            block_iterations,
-            rng.random::<u64>(),
-        ))
+        Ok(Self::new(chain, collision_model, params))
     }
 
-    fn base<'i, 'o>(
-        &mut self,
-        _ctx: &CuContext,
-        input: &Self::Input<'i>,
-        output: &mut Self::Output<'o>,
-    ) -> CuResult<AnytimeStatus<Quality>> {
-        output.tov = input.tov;
-        let Some(request) = input.payload() else {
-            output.clear_payload();
-            self.published_cost = f64::INFINITY;
-            self.published_quality = quality_from_f32(0.0);
-            return Ok(AnytimeStatus::Aborted);
+    fn begin(&mut self, request: &CuJointPlanRequest<N>, seed: u64) -> CuResult<CuPlanStatus> {
+        self.start = request.start;
+        self.goal = request.goal;
+        self.straight_line_cost = joint_distance(&self.start, &self.goal, self.params.metric);
+        self.node_count = 0;
+        self.goal_node_idx = None;
+        self.best_cost = f64::INFINITY;
+        self.iterations = 0;
+        self.rng.reseed(seed);
+        self.status = if !self.params_valid()
+            || !self.validity.capture(&request.scene, &request.exclusions)
+        {
+            CuPlanStatus::InvalidRequest
+        } else if !self.validity.is_configuration_free(&self.start) {
+            CuPlanStatus::InvalidStart
+        } else if !self.validity.is_configuration_free(&self.goal) {
+            CuPlanStatus::InvalidGoal
+        } else {
+            CuPlanStatus::Searching
         };
-
-        self.job_counter = self.job_counter.wrapping_add(1);
-        let seed = self.base_seed.wrapping_add(self.job_counter);
-
-        let planner = match self.planner.as_mut() {
-            Some(planner) => {
-                planner.reset(
-                    request.scene.clone(),
-                    &request.exclusions,
-                    request.start,
-                    request.goal,
-                    seed,
-                );
-                planner
-            }
-            None => self.planner.insert(CuJointRrtStar::new(
-                self.chain,
-                self.collision_model,
-                self.params,
-                request.scene.clone(),
-                &request.exclusions,
-                request.start,
-                request.goal,
-                seed,
-            )),
+        if self.status != CuPlanStatus::Searching {
+            return Ok(self.status);
+        }
+        self.nodes[0] = RrtNode {
+            q: self.start,
+            parent: u16::MAX,
+            cost: 0.0,
         };
-
-        if !planner.valid_endpoints {
-            output.clear_payload();
-            self.published_cost = f64::INFINITY;
-            self.published_quality = quality_from_f32(0.0);
-            return Ok(AnytimeStatus::Aborted);
+        self.node_count = 1;
+        if self.straight_line_cost <= 1e-9 {
+            self.goal_node_idx = Some(0);
+            self.best_cost = 0.0;
+        } else if self.validity.is_segment_free(&self.start, &self.goal) {
+            // Direct line of sight: the straight line is optimal.
+            self.nodes[1] = RrtNode {
+                q: self.goal,
+                parent: 0,
+                cost: self.straight_line_cost,
+            };
+            self.node_count = 2;
+            self.goal_node_idx = Some(1);
+            self.best_cost = self.straight_line_cost;
         }
-
-        if !planner.has_solution() {
-            planner.grow(self.base_iterations);
-        }
-
-        self.published_cost = f64::INFINITY;
-        self.published_quality = quality_from_f32(0.0);
-        output.clear_payload();
-
-        let quality = self.publish(output);
-        if is_converged_quality(self.published_quality) {
-            return Ok(AnytimeStatus::Converged(quality));
-        }
-        Ok(AnytimeStatus::Improved(quality))
+        self.refresh_status();
+        Ok(self.status)
     }
 
-    fn refine<'o>(
-        &mut self,
-        _ctx: &CuContext,
-        output: &mut Self::Output<'o>,
-    ) -> CuResult<AnytimeStatus<Quality>> {
-        let planner = self
-            .planner
-            .as_mut()
-            .ok_or_else(|| CuError::from("cu_joint_rrt_star: refine() called before base()"))?;
+    fn step(&mut self, budget: u32) -> CuResult<CuPlanStatus> {
+        self.grow(budget);
+        Ok(self.status)
+    }
 
-        if planner.is_exhausted() {
-            return Ok(AnytimeStatus::Converged(self.published_quality));
+    fn write_best(&self, out: &mut CuJointPlanPath<N>) -> CuPlanStatus {
+        out.len = 0;
+        out.cost = f64::INFINITY;
+        out.effort = self.iterations;
+        out.status = self.status;
+        out.scene_revision = self.scene_revision();
+        out.exclusions = self.exclusions().clone();
+        if !self.status.has_path() {
+            return self.status;
         }
+        match self.write_path(&mut out.waypoints) {
+            Some(len) => {
+                out.len = len;
+                out.cost = self.path_cost(&out.waypoints, len);
+            }
+            None => out.status = CuPlanStatus::CapacityExceeded,
+        }
+        out.status
+    }
 
-        planner.grow(self.block_iterations);
-        let quality = self.publish(output);
-        if is_converged_quality(self.published_quality) {
-            return Ok(AnytimeStatus::Converged(quality));
-        }
-        Ok(AnytimeStatus::Improved(quality))
+    fn quality(&self) -> Quality {
+        CuJointRrtStar::quality(self)
     }
 }
 
@@ -1050,10 +660,14 @@ impl<const N: usize, const M: usize> CuAnytimeTask for CuJointRrtStarTask<N, M> 
 mod tests {
     use super::*;
     use cu_collision::CuCollisionShape;
+    use cu_collision::CuCollisionWorld;
+    use cu_collision::CuPlanningScene;
     use cu_collision::CuSphere;
     use cu_collision::igus_rebel_collision_model;
     use cu_kinematics::igus_rebel_chain;
     use cu_spatial_payloads::Transform3D;
+    use cu29::cutask_anytime::AnytimeStatus;
+    use cu29::cutask_anytime::CuAnytimeTask;
     use cu29::units::si::angle::radian;
     use cu29::units::si::f64::Angle as Angle64;
 
@@ -1079,10 +693,12 @@ mod tests {
     }
 
     fn test_task(seed: u64) -> CuJointRrtStarTask<6> {
-        CuJointRrtStarTask::new_with_model(
-            igus_rebel_chain(),
-            igus_rebel_collision_model(),
-            CuJointRrtParams::default(),
+        CuJointRrtStarTask::new_with_planner(
+            CuJointRrtStar::new(
+                igus_rebel_chain(),
+                igus_rebel_collision_model(),
+                CuJointRrtParams::default(),
+            ),
             64,
             32,
             seed,

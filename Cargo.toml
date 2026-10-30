@@ -8,6 +8,7 @@ members = [
   "components/tasks/cu_joint_rrt_star",
   "components/tasks/cu_controller",
   "components/tasks/cu_io",
+  "components/tasks/cu_motion_planning",
 ]
 default-members = [
   "components/bridges/cu_mujoco_sim",
@@ -18,6 +19,7 @@ default-members = [
   "components/tasks/cu_joint_rrt_star",
   "components/tasks/cu_controller",
   "components/tasks/cu_io",
+  "components/tasks/cu_motion_planning",
 ]
 resolver = "3"
 

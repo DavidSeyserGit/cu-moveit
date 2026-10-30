@@ -26,14 +26,24 @@ api-check:
     cargo public-api -p cu-kinematics
     cargo public-api -p cu-collision
     cargo public-api -p cu-robot-description
+    cargo public-api -p cu-trajectory
+    cargo public-api -p cu-controller
+    cargo public-api -p cu-io
+    cargo public-api -p cu-motion-planning
     cargo public-api -p cu-joint-rrt-star
+    cargo public-api -p cu-mujoco-sim
 
 # Dry-run packaging for every crate without publishing (publish = false must be flipped first at 1.0).
 release-dry-run:
     cargo publish --dry-run -p cu-kinematics
     cargo publish --dry-run -p cu-collision
     cargo publish --dry-run -p cu-robot-description
+    cargo publish --dry-run -p cu-trajectory
+    cargo publish --dry-run -p cu-controller
+    cargo publish --dry-run -p cu-io
+    cargo publish --dry-run -p cu-motion-planning
     cargo publish --dry-run -p cu-joint-rrt-star
+    cargo publish --dry-run -p cu-mujoco-sim
 
 # Verify strict no_std compatibility across shared crates.
 nostd-ci:

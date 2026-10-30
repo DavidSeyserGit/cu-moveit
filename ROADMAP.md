@@ -26,8 +26,12 @@ in that order.
   self/environment checking, `CuCollisionCheckTask<N>`.
 - `cu-robot-description`: startup URDF serial-chain and SRDF group/exclusion/
   state import into fixed-size kinematic and collision models.
-- `cu-joint-rrt-star`: joint-space `CuAnytimeTask` RRT* with deterministic
-  `CuRng` seeding, informed pruning, rewiring, and shortcutting.
+- `cu-motion-planning`: planner-agnostic `CuJointPlanner` trait, request/path
+  payloads with explicit `CuPlanStatus`, shared scene validity checks, the
+  generic anytime `CuJointPlannerTask<P, N>`, and non-sampling planners
+  (direct joint line, deterministic path optimizer).
+- `cu-joint-rrt-star`: sampling-based RRT* implementing `CuJointPlanner`, with
+  deterministic `CuRng` seeding, informed pruning, rewiring, and shortcutting.
 - `cu-trajectory`: fixed-capacity trajectory payloads, profile timing, per-waypoint
   Cartesian TCP zones, C² spline geometry, quintic interpolation, and S-curve
   joint jerk bounds; follower preemption and empty-trajectory cancellation.

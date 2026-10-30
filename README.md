@@ -10,7 +10,10 @@ Deterministic, zero-allocation robot manipulation, kinematics, collision checkin
 | `cu-collision` | `components/libs/cu_collision` | `lib` / `task` | Fixed-capacity sphere/capsule primitives, exact signed-distance queries, `CuRobotCollisionModel<N>`, `CuCollisionWorld<MAX_OBSTACLES>`, `CuCollisionCheckTask<N>`, and igus ReBeL collision geometry |
 | `cu-robot-description` | `components/libs/cu_robot_description` | `startup lib` | URDF serial-chain extraction, primitive collision conversion, and SRDF serial groups, collision exclusions, and named states |
 | `cu-trajectory` | `components/libs/cu_trajectory` | `lib` / `task` | Fixed-capacity joint trajectories, interpolation, timing profiles, and sampled Cartesian TCP-zone blending |
-| `cu-joint-rrt-star` | `components/tasks/cu_joint_rrt_star` | `task` | Joint-space $N$-DOF RRT* anytime motion planner (`CuAnytimeTask`) with deterministic `CuRng` seeding, informed pruning, rewiring, and path shortcutting |
+| `cu-motion-planning` | `components/tasks/cu_motion_planning` | `lib` / `task` | Planner-agnostic contract: `CuJointPlanner` trait, `CuJointPlanRequest<N>` / `CuJointPlanPath<N>` with explicit `CuPlanStatus`, shared scene validity checks, the generic anytime `CuJointPlannerTask<P, N>`, and two non-sampling planners (direct joint line, deterministic path optimizer) |
+| `cu-joint-rrt-star` | `components/tasks/cu_joint_rrt_star` | `task` | Sampling-based RRT* implementing `CuJointPlanner`, with deterministic `CuRng` seeding, informed pruning, rewiring, and path shortcutting; `CuJointRrtStarTask` is the generic planner task running it |
+| `cu-controller` | `components/tasks/cu_controller` | `task` | Robot-agnostic joint controller with position/velocity/effort modes, robot status, state watchdog, and command rate limiting |
+| `cu-io` | `components/tasks/cu_io` | `task` | Robot-agnostic digital IO payloads and an IO-driven gripper task |
 
 See [ROADMAP.md](ROADMAP.md) for where this is going and what is explicitly out
 of scope.
@@ -153,12 +156,33 @@ resolution; they are not swept-volume collision guarantees. The zone radius is a
 TCP-position tolerance, not a separate orientation tolerance or an exact
 reproduction of a vendor controller's zone algorithm.
 
+## Motion planners
+
+All planners implement `cu_motion_planning::CuJointPlanner` and run in one
+Copper task, `CuJointPlannerTask<P, N>`: `begin` starts a job from a
+`CuJointPlanRequest<N>`, `step(budget)` does a bounded quantum of work, and
+`write_best` fills a `CuJointPlanPath<N>` in place. The task owns the anytime
+contract (base and refine budgets, monotone publishing, seeding, replay
+state). Failures are published, not dropped: the path then carries no
+waypoints and its `status` names the reason (`invalid_start`,
+`invalid_goal`, `invalid_request`, `exhausted`, `capacity_exceeded`).
+
+| Planner | Kind | Behaviour |
+|---|---|---|
+| `CuJointDirectPlanner` | direct | The straight joint line or a definite `exhausted`; a cheap first attempt. |
+| `CuJointPathOptimizer` | optimization | Deterministic gradient optimization of a fixed waypoint path for smoothness and clearance; improves each quantum. |
+| `CuJointRrtStar` | sampling | Seeded RRT* with rewiring and shortcutting; improves each quantum. |
+
+Sampling planners derive all randomness from the job seed; deterministic
+planners ignore it. New planners only implement the trait and share
+`CuSceneValidity` for collision and clearance queries.
+
 ## Planning scene snapshots
 
 `CuPlanningScene<O, A>` stores fixed-capacity obstacle and attached-shape
 geometry with stable object IDs and a scene revision. The collision-check task
 accepts joint positions, a scene snapshot, and stable-ID collision exclusions.
-RRT* captures the scene and resolved exclusions once per planning job, checks
+Every planner captures the scene and resolved exclusions once per planning job (`CuSceneValidity`), checks
 obstacles and attached shapes throughout planning, and returns `scene_revision` and the captured exclusion set
 with the path. Consumers must compare both with their current inputs before
 accepting a plan. Refinement uses the captured snapshot until the next

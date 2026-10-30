@@ -34,5 +34,5 @@ Before writing or reviewing code, read the applicable `SKILL.md` under `.agents/
 1. `components/libs/cu_kinematics` (`cu-kinematics`): Serial chain kinematics (`CuKinematicChain<N>`), Forward Kinematics, Geometric Jacobians, Damped Least-Squares Inverse Kinematics, `CuForwardKinematicsTask<N>`, and 6-DOF igus ReBeL preset.
 2. `components/libs/cu_collision` (`cu-collision`): Fixed-capacity capsule/sphere self-collision and environment collision checking (`no_std`).
 3. `components/tasks/cu_servo` (`cu-servo`): Real-time Jacobian velocity/twist servoing (`CuTask`) with joint-limit and singularity damping.
-4. `components/tasks/cu_joint_rrt_star` (`cu-joint-rrt-star`): Joint-space $N$-DOF anytime motion planning (`CuAnytimeTask`) with deterministic `CuRng`.
+4. `components/tasks/cu_motion_planning` (`cu-motion-planning`): planner-agnostic `CuJointPlanner` contract and generic anytime planner task, with non-sampling planners (direct, path optimizer); `components/tasks/cu_joint_rrt_star` (`cu-joint-rrt-star`) is the sampling-based RRT* implementation with deterministic `CuRng`.
 5. `components/bridges/cu_igus_cri` (`cu-igus-cri`): Native `CuBridge` for the igus ReBeL CRI Ethernet protocol (`192.168.3.11:3920`).
