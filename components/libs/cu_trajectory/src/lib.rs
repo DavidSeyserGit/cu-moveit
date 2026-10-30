@@ -19,7 +19,10 @@ pub use task::CuTrajectoryFollowOutput;
 
 pub use parameterize::CuJointTrajectoryLimits;
 pub use parameterize::CuParameterizeStatus;
+pub use parameterize::CuTrajectoryProfile;
+pub use parameterize::CuTrajectoryTiming;
 pub use parameterize::parameterize_trajectory;
+pub use parameterize::parameterize_with_profile;
 
 use bincode::Decode;
 use bincode::Encode;
