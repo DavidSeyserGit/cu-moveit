@@ -123,24 +123,30 @@ seeded from the previous solution. Input/output capacity is fixed at compile
 time; invalid geometry, IK failure, collision, or capacity exhaustion clears the
 output and returns a status.
 
-`continuous::parameterize_cartesian_blend` times that path with any
-`CuTrajectoryProfile` from `CuContinuousConfig::profile`. Cubic and
-minimum-jerk honor the shared harmonic-mean knot velocities and fly through
-zones; trapezoidal and S-curve are rest-to-rest families, so a positive zone
-rejects the job with `NoContinuousMotion` naming the waypoint, while an
-all-stop path is timed with the same rest-to-rest primitives as
-`parameterize_with_profile`. It checks full-segment velocity and acceleration
-extrema (exact for cubic, analytic for minimum-jerk), repeats sampled
-collision and zone checks on the timed interpolation, and rejects unintended
-stops. Read a cubic or minimum-jerk result with
-`CuTrajectoryPayload::sample_cubic`, or configure a `CuFollowTrajectoryTask`
-with `config: {"interpolation": "cubic"}`. Match the follower's `MAX_POINTS`
+Geometry and timing are separate: the zone is a property of each waypoint,
+the profile a property of the motion. `path_timing::parameterize_cartesian_path`
+times the path with any `CuTrajectoryProfile` from `CuPathTimingConfig::profile`.
+Every profile flies through every positive zone and stops exactly at zero
+zones. The knots are joined by a C² natural cubic spline over a speed-weighted
+joint-space arc length; exact stops split the path into rest-to-rest pieces,
+each zone is crossed at a constant corner speed bounded by its curvature, and
+the moves between stops and corners follow the profile from one boundary speed
+to the next. Joint velocity and acceleration stay within the configured limits;
+S-curve joint jerk is checked on the quintic reconstruction, including curvature
+contributions; uniform time stretching brings its peaks within the limits. The geometric spline is
+rechecked for joint limits, collisions, and zone containment, and a path that
+reverses inside a zone is rejected with `NoContinuousMotion` naming the
+waypoint. Read the result with
+`CuTrajectoryPayload::sample_quintic` for S-curve motion, or configure a
+`CuFollowTrajectoryTask` with `config: {"interpolation": "quintic"}`. Other
+profiles use `sample_cubic` and the `cubic` follower mode. Match the follower's `MAX_POINTS`
 type parameter to the generated payload capacity. The default follower
 interpolation remains linear. Interpolation mode is included in newly frozen follower state;
 earlier frozen snapshots need migration.
 
-This initial implementation uses conservative automatic timing and does not
-bound jerk. Collision and zone checks are discrete and depend on their configured
+Timing is conservative and automatic. Finite joint jerk bounds apply to the
+S-curve profile with quintic execution. Collision and zone checks apply to the geometric spline; the reconstructed
+execution curve still needs a separate collision and zone recheck. Checks are discrete and depend on their configured
 resolution; they are not swept-volume collision guarantees. The zone radius is a
 TCP-position tolerance, not a separate orientation tolerance or an exact
 reproduction of a vendor controller's zone algorithm.

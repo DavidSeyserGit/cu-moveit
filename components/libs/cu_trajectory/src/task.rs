@@ -72,6 +72,9 @@ pub enum CuTrajectoryInterpolation {
     Linear,
     /// Position and velocity are reconstructed using cubic Hermite interpolation.
     Cubic,
+    /// Position and velocity are reconstructed with the quintic Hermite motion
+    /// through the stored positions, velocities and accelerations.
+    Quintic,
 }
 
 /// `CuTask` sampling a stored joint trajectory against the message `Tov` clock.
@@ -197,6 +200,11 @@ impl<const N: usize, const MAX_POINTS: usize> CuTask for CuFollowTrajectoryTask<
                 &mut positions,
                 &mut velocities,
             )?,
+            CuTrajectoryInterpolation::Quintic => stored.sample_quintic(
+                Time::new::<second>(elapsed_s),
+                &mut positions,
+                &mut velocities,
+            )?,
         }
         let status = if elapsed_s >= stored.duration().get::<second>() {
             CuFollowStatus::Finished
@@ -228,6 +236,7 @@ mod tests {
             velocities: [CuJointVelocity::Revolute(AngularVelocity::new::<
                 radian_per_second,
             >(v))],
+            ..Default::default()
         }
     }
 

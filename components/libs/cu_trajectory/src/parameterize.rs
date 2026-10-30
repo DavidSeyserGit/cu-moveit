@@ -363,6 +363,7 @@ pub fn parameterize_with_profile<const N: usize, const MAX_POINTS: usize>(
             time_from_start: Time::default(),
             positions: waypoints[0],
             velocities: waypoint_velocity(timing, 0, waypoints[0]),
+            accelerations: [0.0; N],
         },
     ) {
         return Ok(CuParameterizeStatus::CapacityExceeded);
@@ -389,6 +390,7 @@ pub fn parameterize_with_profile<const N: usize, const MAX_POINTS: usize>(
                 time_from_start: Time::new::<second>(t),
                 positions,
                 velocities,
+                accelerations: [0.0; N],
             },
         ) {
             return Ok(CuParameterizeStatus::CapacityExceeded);
@@ -401,6 +403,7 @@ pub fn parameterize_with_profile<const N: usize, const MAX_POINTS: usize>(
             time_from_start: Time::new::<second>(total),
             positions: waypoints[last],
             velocities: waypoint_velocity(timing, last, waypoints[last]),
+            accelerations: [0.0; N],
         },
     ) {
         return Ok(CuParameterizeStatus::CapacityExceeded);
@@ -544,10 +547,7 @@ fn coordinate_velocity_kind(q: CuJointPosition) -> CuJointVelocity {
 }
 
 /// Trapezoidal (or triangular) traversal time for one joint displacement.
-///
-/// Shared with the Cartesian blend timing so rest-to-rest segments reuse the
-/// exact same primitive.
-pub(crate) fn joint_profile_duration(distance: f64, max_vel: f64, max_acc: f64) -> f64 {
+fn joint_profile_duration(distance: f64, max_vel: f64, max_acc: f64) -> f64 {
     if distance <= 0.0 {
         return 0.0;
     }
@@ -562,14 +562,8 @@ pub(crate) fn joint_profile_duration(distance: f64, max_vel: f64, max_acc: f64) 
 /// Jerk-limited S-curve traversal time for one joint displacement.
 ///
 /// With infinite jerk this is exactly the trapezoidal time; with finite jerk
-/// it is the symmetric 7-segment duration from [`scurve_shape`]. Shared with
-/// the Cartesian blend timing.
-pub(crate) fn scurve_joint_duration(
-    distance: f64,
-    max_vel: f64,
-    max_acc: f64,
-    max_jerk: f64,
-) -> f64 {
+/// it is the symmetric 7-segment duration from [`scurve_shape`].
+fn scurve_joint_duration(distance: f64, max_vel: f64, max_acc: f64, max_jerk: f64) -> f64 {
     if distance <= 0.0 {
         return 0.0;
     }
@@ -706,13 +700,11 @@ fn scurve_eval(
 }
 
 /// Single-joint displacement with its SI limit bounds for profile evaluation.
-///
-/// Shared with the Cartesian blend timing.
-pub(crate) struct JointPrimitive {
-    pub(crate) distance: f64,
-    pub(crate) max_vel: f64,
-    pub(crate) max_acc: f64,
-    pub(crate) max_jerk: f64,
+struct JointPrimitive {
+    distance: f64,
+    max_vel: f64,
+    max_acc: f64,
+    max_jerk: f64,
 }
 
 /// Evaluates a rest-to-rest primitive stretched onto a longer segment.
@@ -721,9 +713,7 @@ pub(crate) struct JointPrimitive {
 /// (or fixed) segment duration. Time-scaling by `scale = own / effective`
 /// lowers peak velocity by `scale`, acceleration by `scale^2`, and jerk by
 /// `scale^3`, so every bound the primitive satisfies still holds.
-///
-/// Shared with the Cartesian blend timing for rest-to-rest segments.
-pub(crate) fn stretched_eval(
+fn stretched_eval(
     tau: f64,
     effective: f64,
     own: f64,
@@ -754,7 +744,7 @@ pub(crate) fn stretched_eval(
 /// `dq(1) = v1` (SI units per second), with zero endpoint accelerations.
 /// Positions and velocities are absolute SI values, not offsets.
 ///
-/// Shared with the Cartesian blend timing for minimum-jerk fly-by segments.
+/// Shared with the Cartesian path timing.
 pub(crate) fn quintic_eval(
     u: f64,
     q0: f64,
@@ -784,7 +774,9 @@ pub(crate) fn quintic_eval(
 ///
 /// Interpolates `q(0) = q0`, `q(1) = q1` with endpoint velocities `v0`, `v1`
 /// (SI units per second). Positions and velocities are absolute SI values.
-fn cubic_eval(u: f64, q0: f64, q1: f64, v0: f64, v1: f64, duration: f64) -> (f64, f64) {
+///
+/// Shared with the Cartesian path timing.
+pub(crate) fn cubic_eval(u: f64, q0: f64, q1: f64, v0: f64, v1: f64, duration: f64) -> (f64, f64) {
     if duration <= 0.0 {
         return (q0, v0);
     }
@@ -1065,6 +1057,7 @@ fn push_single_point<const N: usize, const MAX_POINTS: usize>(
         time_from_start,
         positions: q,
         velocities,
+        accelerations: [0.0; N],
     }) {
         Ok(()) => Ok(CuParameterizeStatus::Success),
         Err(_) => Ok(CuParameterizeStatus::CapacityExceeded),

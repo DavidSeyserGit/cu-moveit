@@ -4,6 +4,9 @@
 //! joins them with a quadratic Bézier curve contained in the TCP zone. Tool
 //! orientation follows shortest-arc spherical interpolation. IK and discrete
 //! joint-space collision checks are applied at every generated point and edge.
+//!
+//! The path is geometry only. Time it with any profile through
+//! [`parameterize_cartesian_path`](crate::path_timing::parameterize_cartesian_path).
 
 use bincode::Decode;
 use bincode::Encode;
@@ -23,14 +26,24 @@ use cu29::units::si::length::meter;
 use serde::Deserialize;
 use serde::Serialize;
 
+/// Programmed TCP zone of one waypoint, in the chain base frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CuTcpZone {
+    /// Index of the programmed waypoint.
+    pub waypoint: usize,
+    /// Programmed TCP position of the waypoint.
+    pub center: [Length; 3],
+    pub radius: Length,
+}
+
 /// A sampled joint configuration and whether it is a required stop.
 #[derive(Debug, Clone, Copy)]
 pub struct CuCartesianPathPoint<const N: usize> {
     pub positions: [CuJointPosition; N],
     /// True at the start, end, and every zero-radius interior waypoint.
     pub stop: bool,
-    /// Index of the waypoint whose TCP zone contains this point, when blending.
-    pub zone: Option<usize>,
+    /// The TCP zone that contains this point, when blending.
+    pub zone: Option<CuTcpZone>,
 }
 impl<const N: usize> Default for CuCartesianPathPoint<N> {
     fn default() -> Self {
@@ -93,9 +106,21 @@ impl Default for CuCartesianBlendConfig {
 pub enum CuCartesianBlendStatus {
     Success,
     InvalidInput,
-    InverseKinematicsFailed { waypoint: usize },
-    Collision { waypoint: usize },
-    ZoneExceeded { waypoint: usize },
+    /// IK found no solution at sample `step` of `steps` on the move toward
+    /// `waypoint`: on the rounded corner inside its zone when `corner`,
+    /// otherwise on the straight TCP line leading to it (or to its zone).
+    InverseKinematicsFailed {
+        waypoint: usize,
+        corner: bool,
+        step: usize,
+        steps: usize,
+    },
+    Collision {
+        waypoint: usize,
+    },
+    ZoneExceeded {
+        waypoint: usize,
+    },
     CapacityExceeded,
 }
 
@@ -217,6 +242,14 @@ fn angle(a: [f64; 4], b: [f64; 4]) -> f64 {
     2.0 * libm::acos(dot.abs().clamp(0.0, 1.0))
 }
 
+/// Position of a generated sample on the move toward `waypoint`.
+#[derive(Clone, Copy)]
+struct Progress {
+    waypoint: usize,
+    step: usize,
+    steps: usize,
+}
+
 struct Builder<'a, const N: usize, const M: usize, const O: usize, const CAP: usize> {
     chain: &'a CuKinematicChain<N>,
     model: &'a CuRobotCollisionModel<N, M>,
@@ -231,8 +264,9 @@ impl<const N: usize, const M: usize, const O: usize, const CAP: usize> Builder<'
         exact: Option<[CuJointPosition; N]>,
         stop: bool,
         zone: Option<(usize, [f64; 3], f64)>,
-        waypoint: usize,
+        progress: Progress,
     ) -> CuResult<CuCartesianBlendStatus> {
+        let waypoint = progress.waypoint;
         if self.out.len >= CAP {
             return Ok(CuCartesianBlendStatus::CapacityExceeded);
         }
@@ -248,7 +282,12 @@ impl<const N: usize, const M: usize, const O: usize, const CAP: usize> Builder<'
                 &mut q,
             )?;
             if !matches!(status, CuIkStatus::Converged { .. }) {
-                return Ok(CuCartesianBlendStatus::InverseKinematicsFailed { waypoint });
+                return Ok(CuCartesianBlendStatus::InverseKinematicsFailed {
+                    waypoint,
+                    corner: zone.is_some(),
+                    step: progress.step,
+                    steps: progress.steps,
+                });
             }
         }
         if !self
@@ -286,7 +325,11 @@ impl<const N: usize, const M: usize, const O: usize, const CAP: usize> Builder<'
         self.out.points[self.out.len] = CuCartesianPathPoint {
             positions: q,
             stop,
-            zone: zone.map(|z| z.0),
+            zone: zone.map(|(waypoint, center, radius)| CuTcpZone {
+                waypoint,
+                center: center.map(Length::new::<meter>),
+                radius: Length::new::<meter>(radius),
+            }),
         };
         self.out.len += 1;
         Ok(CuCartesianBlendStatus::Success)
@@ -322,7 +365,11 @@ impl<const N: usize, const M: usize, const O: usize, const CAP: usize> Builder<'
                 if final_point { exact } else { None },
                 stop && final_point,
                 None,
-                waypoint,
+                Progress {
+                    waypoint,
+                    step: i,
+                    steps,
+                },
             )?;
             if status != CuCartesianBlendStatus::Success {
                 return Ok(status);
@@ -340,8 +387,9 @@ impl<const N: usize, const M: usize, const O: usize, const CAP: usize> Builder<'
 /// avoid overlapping zones. Degenerate corners and zones too small relative
 /// to IK tolerance are rejected. The input joint configurations define TCP
 /// position *and orientation* through FK. Collision checking is discrete,
-/// not swept-volume continuous collision detection. Callers must validate
-/// the final timed interpolation as well as the resulting path.
+/// not swept-volume continuous collision detection;
+/// [`parameterize_cartesian_path`](crate::path_timing::parameterize_cartesian_path)
+/// rechecks the interpolated path when timing it.
 ///
 /// All output and scratch storage is const-sized; failure clears the output.
 pub fn blend_cartesian_path<const N: usize, const M: usize, const O: usize, const CAP: usize>(
@@ -437,7 +485,13 @@ pub fn blend_cartesian_path<const N: usize, const M: usize, const O: usize, cons
             for k in 1..=steps {
                 let t = k as f64 / steps as f64;
                 let pose = entry.lerp(poses[i], t).lerp(poses[i].lerp(exit, t), t);
-                let status = builder.append(pose, None, false, Some((i, poses[i].p, r)), i)?;
+                let progress = Progress {
+                    waypoint: i,
+                    step: k,
+                    steps,
+                };
+                let status =
+                    builder.append(pose, None, false, Some((i, poses[i].p, r)), progress)?;
                 if status != CuCartesianBlendStatus::Success {
                     return Ok(status);
                 }
@@ -450,7 +504,12 @@ pub fn blend_cartesian_path<const N: usize, const M: usize, const O: usize, cons
             return Ok(status);
         }
         for (i, zone) in zones.iter().enumerate().take(last).skip(1) {
-            if zone.get::<meter>() > 0.0 && !builder.out.points().iter().any(|p| p.zone == Some(i))
+            if zone.get::<meter>() > 0.0
+                && !builder
+                    .out
+                    .points()
+                    .iter()
+                    .any(|p| p.zone.is_some_and(|z| z.waypoint == i))
             {
                 return Ok(CuCartesianBlendStatus::InvalidInput);
             }
@@ -466,62 +525,20 @@ pub fn blend_cartesian_path<const N: usize, const M: usize, const O: usize, cons
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::CuTrajectoryPayload;
-    use crate::continuous::CuContinuousAnchors;
-    use crate::continuous::CuContinuousConfig;
-    use crate::continuous::CuContinuousStatus;
-    use crate::continuous::parameterize_cartesian_blend;
-    use crate::parameterize::CuJointTrajectoryLimits;
-    use crate::parameterize::CuTrajectoryProfile;
+    use crate::test_support::q;
+    use crate::test_support::robot;
     use cu_collision::CuCollisionShape;
     use cu_collision::CuSphere;
-    use cu_kinematics::CuJointAxis;
-    use cu_kinematics::CuJointLimits;
-    use cu_kinematics::CuJointSpec;
-    use cu_kinematics::CuJointVelocity;
-    use cu29::units::si::f64::Time;
-    use cu29::units::si::f64::Velocity;
-    use cu29::units::si::time::second;
-    use cu29::units::si::velocity::meter_per_second;
 
-    fn robot() -> (CuKinematicChain<3>, CuRobotCollisionModel<3, 1>) {
-        let limits = CuJointLimits::from_meters(-1.0, 1.0, 1.0);
-        let chain = CuKinematicChain::new([
-            CuJointSpec::prismatic([0.0; 3], [0.0; 3], CuJointAxis::PosX, limits),
-            CuJointSpec::prismatic([0.0; 3], [0.0; 3], CuJointAxis::PosY, limits),
-            CuJointSpec::prismatic([0.0; 3], [0.0; 3], CuJointAxis::PosZ, limits),
-        ]);
-        let sphere = CuCollisionShape::Sphere(CuSphere::from_meters([0.0; 3], 0.01));
-        let model =
-            CuRobotCollisionModel::new_attached([sphere], [Some(2)], 1, Length::new::<meter>(0.0))
-                .unwrap();
-        (chain, model)
-    }
-    fn q(x: f64, y: f64) -> [CuJointPosition; 3] {
-        [
-            Length::new::<meter>(x).into(),
-            Length::new::<meter>(y).into(),
-            Length::new::<meter>(0.0).into(),
-        ]
-    }
-    fn limits() -> CuJointTrajectoryLimits<3> {
-        CuJointTrajectoryLimits::new(
-            [CuJointVelocity::Prismatic(Velocity::new::<meter_per_second>(0.4)); 3],
-            [1.0; 3],
-        )
+    fn zones<const K: usize>(radii: [f64; K]) -> [Length; K] {
+        radii.map(Length::new::<meter>)
     }
 
     #[test]
-    fn zone_produces_a_continuous_corner_inside_tcp_radius() {
+    fn zone_produces_a_corner_inside_tcp_radius() {
         let (chain, model) = robot();
         let points = [q(0.0, 0.0), q(0.3, 0.0), q(0.3, 0.3)];
-        let zones = [
-            Length::new::<meter>(0.0),
-            Length::new::<meter>(0.1),
-            Length::new::<meter>(0.0),
-        ];
         let world = CuCollisionWorld::<1>::new();
-        let config = CuCartesianBlendConfig::default();
         let mut path = CuCartesianBlendPath::<3, 256>::default();
         assert_eq!(
             blend_cartesian_path(
@@ -529,8 +546,8 @@ mod tests {
                 &model,
                 Some(&world),
                 &points,
-                &zones,
-                &config,
+                &zones([0.0, 0.1, 0.0]),
+                &CuCartesianBlendConfig::default(),
                 &mut path
             )
             .unwrap(),
@@ -538,7 +555,9 @@ mod tests {
         );
         let mut in_zone = 0;
         for p in path.points() {
-            if p.zone == Some(1) {
+            if let Some(zone) = p.zone {
+                assert_eq!(zone.waypoint, 1);
+                assert_eq!(zone.radius, Length::new::<meter>(0.1));
                 in_zone += 1;
                 let mut pose = Transform3D::<f64>::identity();
                 chain.forward_kinematics(&p.positions, &mut pose).unwrap();
@@ -549,107 +568,14 @@ mod tests {
             }
         }
         assert!(in_zone > 2);
-        let mut trajectory = CuTrajectoryPayload::<3, 1024>::new();
-        assert_eq!(
-            parameterize_cartesian_blend(
-                &chain,
-                &model,
-                Some(&world),
-                CuContinuousAnchors {
-                    positions: &points,
-                    zones: &zones
-                },
-                &path,
-                CuContinuousConfig {
-                    limits: &limits(),
-                    profile: CuTrajectoryProfile::Cubic,
-                    blend: &config,
-                    sample_period: Time::new::<second>(0.02)
-                },
-                &mut trajectory
-            )
-            .unwrap(),
-            CuContinuousStatus::Success
-        );
-        let mut moving_inside = false;
-        for p in trajectory.points() {
-            let x = p.positions[0].si_value();
-            let y = p.positions[1].si_value();
-            if distance([x, y, 0.0], [0.3, 0.0, 0.0]) < 0.09 && y > 0.001 {
-                moving_inside |= libm::fabs(p.velocities[0].si_value())
-                    + libm::fabs(p.velocities[1].si_value())
-                    > 1e-5;
-            }
-        }
-        assert!(moving_inside, "robot must not stop inside the fly-by zone");
-        for span in trajectory.points().windows(2) {
-            let start = span[0].time_from_start.get::<second>();
-            let end = span[1].time_from_start.get::<second>();
-            for k in 0..=10 {
-                let mut pos = q(0.0, 0.0);
-                let mut vel = [CuJointVelocity::default(); 3];
-                trajectory
-                    .sample_cubic(
-                        Time::new::<second>(start + (end - start) * k as f64 / 10.0),
-                        &mut pos,
-                        &mut vel,
-                    )
-                    .unwrap();
-                assert!(vel.iter().all(|v| v.si_value().abs() <= 0.4 + 1e-8));
-                if k > 0 {
-                    let mut previous = q(0.0, 0.0);
-                    let mut previous_vel = [CuJointVelocity::default(); 3];
-                    trajectory
-                        .sample_cubic(
-                            Time::new::<second>(start + (end - start) * (k - 1) as f64 / 10.0),
-                            &mut previous,
-                            &mut previous_vel,
-                        )
-                        .unwrap();
-                    let dt = (end - start) / 10.0;
-                    for j in 0..3 {
-                        assert!(
-                            ((vel[j].si_value() - previous_vel[j].si_value()) / dt).abs()
-                                <= 1.0 + 1e-6
-                        );
-                    }
-                }
-            }
-        }
-
-        assert_eq!(trajectory.points()[0].positions, points[0]);
-        let end = trajectory.points().last().unwrap();
-        assert!((end.positions[0].si_value() - 0.3).abs() < 1e-9);
-        assert!((end.positions[1].si_value() - 0.3).abs() < 1e-9);
-        for p in trajectory
-            .points()
-            .iter()
-            .skip(1)
-            .take(trajectory.len() - 2)
-        {
-            let t = p.time_from_start.get::<second>();
-            let mut before_q = q(0.0, 0.0);
-            let mut after_q = before_q;
-            let mut before_v = [CuJointVelocity::default(); 3];
-            let mut after_v = before_v;
-            trajectory
-                .sample_cubic(Time::new::<second>(t - 1e-7), &mut before_q, &mut before_v)
-                .unwrap();
-            trajectory
-                .sample_cubic(Time::new::<second>(t + 1e-7), &mut after_q, &mut after_v)
-                .unwrap();
-            for j in 0..3 {
-                assert!((before_q[j].si_value() - after_q[j].si_value()).abs() < 1e-5);
-                assert!((before_v[j].si_value() - after_v[j].si_value()).abs() < 1e-4);
-            }
-        }
+        assert!(!path.points().iter().any(|p| p.positions == points[1]));
+        assert!(path.points()[0].stop && path.points()[path.len - 1].stop);
     }
 
     #[test]
     fn zero_zone_stops_exactly_and_collision_fails_closed() {
         let (chain, model) = robot();
         let points = [q(0.0, 0.0), q(0.3, 0.0), q(0.3, 0.3)];
-        let zero = [Length::new::<meter>(0.0); 3];
         let mut world = CuCollisionWorld::<1>::new();
         let config = CuCartesianBlendConfig::default();
         let mut path = CuCartesianBlendPath::<3, 256>::default();
@@ -659,7 +585,7 @@ mod tests {
                 &model,
                 Some(&world),
                 &points,
-                &zero,
+                &zones([0.0; 3]),
                 &config,
                 &mut path
             )
@@ -671,50 +597,20 @@ mod tests {
                 .iter()
                 .any(|p| p.stop && p.positions == points[1])
         );
-        let mut trajectory = CuTrajectoryPayload::<3, 1024>::new();
-        assert_eq!(
-            parameterize_cartesian_blend(
-                &chain,
-                &model,
-                Some(&world),
-                CuContinuousAnchors {
-                    positions: &points,
-                    zones: &zero
-                },
-                &path,
-                CuContinuousConfig {
-                    limits: &limits(),
-                    profile: CuTrajectoryProfile::Cubic,
-                    blend: &config,
-                    sample_period: Time::new::<second>(0.02)
-                },
-                &mut trajectory
-            )
-            .unwrap(),
-            CuContinuousStatus::Success
-        );
-        assert!(
-            trajectory
-                .points()
-                .iter()
-                .any(|p| (p.positions[0].si_value() - 0.3).abs() < 1e-10
-                    && p.positions[1].si_value().abs() < 1e-10
-                    && p.velocities.iter().all(|v| v.si_value().abs() < 1e-10))
-        );
+        assert!(path.points().iter().all(|p| p.zone.is_none()));
         world
             .add_obstacle(CuCollisionShape::Sphere(CuSphere::from_meters(
                 [0.2775, 0.0225, 0.0],
                 0.025,
             )))
             .unwrap();
-        let zones = [zero[0], Length::new::<meter>(0.1), zero[2]];
         assert!(matches!(
             blend_cartesian_path(
                 &chain,
                 &model,
                 Some(&world),
                 &points,
-                &zones,
+                &zones([0.0, 0.1, 0.0]),
                 &config,
                 &mut path
             )
@@ -725,24 +621,53 @@ mod tests {
     }
 
     #[test]
+    fn ik_failure_reports_the_move_and_progress() {
+        let (chain, model) = robot();
+        let world = CuCollisionWorld::<0>::new();
+        // 0.1 m samples need several 0.025 m-clamped IK iterations, so a
+        // two-iteration budget fails on the first sample toward waypoint 1.
+        let mut config = CuCartesianBlendConfig {
+            translation_step: Length::new::<meter>(0.1),
+            ..CuCartesianBlendConfig::default()
+        };
+        config.ik.max_iterations = 2;
+        let mut path = CuCartesianBlendPath::<3, 64>::default();
+        let status = blend_cartesian_path(
+            &chain,
+            &model,
+            Some(&world),
+            &[q(0.0, 0.0), q(0.3, 0.0)],
+            &zones([0.0, 0.0]),
+            &config,
+            &mut path,
+        )
+        .unwrap();
+        assert_eq!(
+            status,
+            CuCartesianBlendStatus::InverseKinematicsFailed {
+                waypoint: 1,
+                corner: false,
+                step: 1,
+                steps: 3,
+            }
+        );
+        assert_eq!(path.len, 0);
+    }
+
+    #[test]
     fn invalid_and_capacity_cases_leave_no_partial_path() {
         let (chain, model) = robot();
         let points = [q(0.0, 0.0), q(0.3, 0.0), q(0.3, 0.3)];
         let world = CuCollisionWorld::<0>::new();
         let config = CuCartesianBlendConfig::default();
         let mut path = CuCartesianBlendPath::<3, 8>::default();
-        let zones = [
-            Length::new::<meter>(0.0),
-            Length::new::<meter>(0.1),
-            Length::new::<meter>(0.0),
-        ];
         assert_eq!(
             blend_cartesian_path(
                 &chain,
                 &model,
                 Some(&world),
                 &points,
-                &zones,
+                &zones([0.0, 0.1, 0.0]),
                 &config,
                 &mut path
             )
@@ -750,14 +675,13 @@ mod tests {
             CuCartesianBlendStatus::CapacityExceeded
         );
         assert_eq!(path.len, 0);
-        let invalid = [zones[0], Length::new::<meter>(-0.1), zones[2]];
         assert_eq!(
             blend_cartesian_path(
                 &chain,
                 &model,
                 Some(&world),
                 &points,
-                &invalid,
+                &zones([0.0, -0.1, 0.0]),
                 &config,
                 &mut path
             )
@@ -765,373 +689,5 @@ mod tests {
             CuCartesianBlendStatus::InvalidInput
         );
         assert_eq!(path.len, 0);
-    }
-    #[test]
-    fn rebel_flyby_is_reachable_and_timed() {
-        let chain = cu_kinematics::igus_rebel_chain();
-        let model = cu_collision::igus_rebel_collision_model();
-        let to_q = |j1: f64| {
-            [j1, 0.75, -0.25, 0.0, -0.3, 0.0]
-                .map(|v| cu29::units::si::f64::Angle::new::<radian>(v).into())
-        };
-        let points = [to_q(-0.75), to_q(0.0), to_q(0.75)];
-        let zones = [
-            Length::new::<meter>(0.0),
-            Length::new::<meter>(0.03),
-            Length::new::<meter>(0.0),
-        ];
-        let world = CuCollisionWorld::<0>::new();
-        let mut config = CuCartesianBlendConfig::default();
-        config.ik.max_iterations = 256;
-        let mut path = CuCartesianBlendPath::<6, 256>::default();
-        let result = blend_cartesian_path(
-            &chain,
-            &model,
-            Some(&world),
-            &points,
-            &zones,
-            &config,
-            &mut path,
-        )
-        .unwrap();
-        assert_eq!(result, CuCartesianBlendStatus::Success);
-        let velocity = cu29::units::si::f64::AngularVelocity::new::<
-            cu29::units::si::angular_velocity::radian_per_second,
-        >(1.0);
-        let limits =
-            CuJointTrajectoryLimits::new([CuJointVelocity::Revolute(velocity); 6], [2.0; 6]);
-        let mut trajectory = CuTrajectoryPayload::<6, 1024>::new();
-        let status = parameterize_cartesian_blend(
-            &chain,
-            &model,
-            Some(&world),
-            CuContinuousAnchors {
-                positions: &points,
-                zones: &zones,
-            },
-            &path,
-            CuContinuousConfig {
-                limits: &limits,
-                profile: CuTrajectoryProfile::Cubic,
-                blend: &config,
-                sample_period: Time::new::<second>(0.02),
-            },
-            &mut trajectory,
-        )
-        .unwrap();
-        assert_eq!(status, CuContinuousStatus::Success);
-    }
-    #[test]
-    fn timing_rechecks_collision_and_rejects_a_flyby_that_must_stop() {
-        let (chain, model) = robot();
-        let points = [q(0.0, 0.0), q(0.3, 0.0), q(0.3, 0.3)];
-        let zones = [
-            Length::new::<meter>(0.0),
-            Length::new::<meter>(0.1),
-            Length::new::<meter>(0.0),
-        ];
-        let mut world = CuCollisionWorld::<1>::new();
-        let config = CuCartesianBlendConfig::default();
-        let mut path = CuCartesianBlendPath::<3, 256>::default();
-        assert_eq!(
-            blend_cartesian_path(
-                &chain,
-                &model,
-                Some(&world),
-                &points,
-                &zones,
-                &config,
-                &mut path
-            )
-            .unwrap(),
-            CuCartesianBlendStatus::Success
-        );
-        world
-            .add_obstacle(CuCollisionShape::Sphere(CuSphere::from_meters(
-                [0.2775, 0.0225, 0.0],
-                0.025,
-            )))
-            .unwrap();
-        let mut out = CuTrajectoryPayload::<3, 1024>::new();
-        let status = parameterize_cartesian_blend(
-            &chain,
-            &model,
-            Some(&world),
-            CuContinuousAnchors {
-                positions: &points,
-                zones: &zones,
-            },
-            &path,
-            CuContinuousConfig {
-                limits: &limits(),
-                profile: CuTrajectoryProfile::Cubic,
-                blend: &config,
-                sample_period: Time::new::<second>(0.02),
-            },
-            &mut out,
-        )
-        .unwrap();
-        assert!(matches!(status, CuContinuousStatus::Collision { .. }));
-        assert!(out.is_empty());
-
-        world.clear();
-        path.len = 3;
-        path.points[0] = CuCartesianPathPoint {
-            positions: q(0.0, 0.0),
-            stop: true,
-            zone: None,
-        };
-        path.points[1] = CuCartesianPathPoint {
-            positions: q(0.3, 0.0),
-            stop: false,
-            zone: Some(1),
-        };
-        path.points[2] = CuCartesianPathPoint {
-            positions: q(0.0, 0.0),
-            stop: true,
-            zone: None,
-        };
-        let status = parameterize_cartesian_blend(
-            &chain,
-            &model,
-            Some(&world),
-            CuContinuousAnchors {
-                positions: &points,
-                zones: &zones,
-            },
-            &path,
-            CuContinuousConfig {
-                limits: &limits(),
-                profile: CuTrajectoryProfile::Cubic,
-                blend: &config,
-                sample_period: Time::new::<second>(0.02),
-            },
-            &mut out,
-        )
-        .unwrap();
-        assert_eq!(
-            status,
-            CuContinuousStatus::NoContinuousMotion { waypoint: 1 }
-        );
-        assert!(out.is_empty());
-    }
-
-    fn timed_with_profile<const CAP: usize, const OUT: usize>(
-        chain: &CuKinematicChain<3>,
-        model: &CuRobotCollisionModel<3, 1>,
-        points: &[[CuJointPosition; 3]],
-        zones: &[Length],
-        profile: CuTrajectoryProfile,
-    ) -> (CuContinuousStatus, CuTrajectoryPayload<3, OUT>) {
-        let world = CuCollisionWorld::<0>::new();
-        let config = CuCartesianBlendConfig::default();
-        let mut path = CuCartesianBlendPath::<3, CAP>::default();
-        assert_eq!(
-            blend_cartesian_path(
-                chain,
-                model,
-                Some(&world),
-                points,
-                zones,
-                &config,
-                &mut path
-            )
-            .unwrap(),
-            CuCartesianBlendStatus::Success
-        );
-        let mut trajectory = CuTrajectoryPayload::<3, OUT>::new();
-        let status = parameterize_cartesian_blend(
-            chain,
-            model,
-            Some(&world),
-            CuContinuousAnchors {
-                positions: points,
-                zones,
-            },
-            &path,
-            CuContinuousConfig {
-                limits: &limits(),
-                blend: &config,
-                sample_period: Time::new::<second>(0.02),
-                profile,
-            },
-            &mut trajectory,
-        )
-        .unwrap();
-        (status, trajectory)
-    }
-
-    #[test]
-    fn minjerk_profile_flies_through_zone() {
-        let (chain, model) = robot();
-        let points = [q(0.0, 0.0), q(0.3, 0.0), q(0.3, 0.3)];
-        let zones = [
-            Length::new::<meter>(0.0),
-            Length::new::<meter>(0.1),
-            Length::new::<meter>(0.0),
-        ];
-        let (status, trajectory) = timed_with_profile::<256, 1024>(
-            &chain,
-            &model,
-            &points,
-            &zones,
-            CuTrajectoryProfile::MinimumJerk,
-        );
-        assert_eq!(status, CuContinuousStatus::Success);
-        let mut moving_inside = false;
-        let mut peak = 0.0f64;
-        for p in trajectory.points() {
-            for v in &p.velocities {
-                peak = peak.max(v.si_value().abs());
-            }
-            let x = p.positions[0].si_value();
-            let y = p.positions[1].si_value();
-            if distance([x, y, 0.0], [0.3, 0.0, 0.0]) < 0.09 && y > 0.001 {
-                moving_inside |= p.velocities.iter().any(|v| v.si_value().abs() > 1e-5);
-            }
-        }
-        assert!(moving_inside, "minimum-jerk must not stop inside the zone");
-        assert!(peak <= 0.4 + 1e-8, "velocity limit exceeded: {peak}");
-        // Quintic segments have zero endpoint acceleration by construction:
-        // finite differences of the evaluator at unit scale stay near zero,
-        // and endpoint velocities are honored exactly.
-        let (_, v0) = crate::parameterize::quintic_eval(0.0, 0.0, 1.0, 0.2, 0.3, 1.0);
-        let (_, v1) = crate::parameterize::quintic_eval(1e-6, 0.0, 1.0, 0.2, 0.3, 1.0);
-        assert!(
-            ((v1 - v0) / 1e-6).abs() < 1e-3,
-            "endpoint acceleration not near zero"
-        );
-        let (_, w0) = crate::parameterize::quintic_eval(0.0, 0.0, 1.0, 0.2, 0.3, 1.0);
-        let (_, w1) = crate::parameterize::quintic_eval(1.0, 0.0, 1.0, 0.2, 0.3, 1.0);
-        assert!((w0 - 0.2).abs() < 1e-12 && (w1 - 0.3).abs() < 1e-12);
-        let first = &trajectory.points()[0];
-        assert!(first.velocities.iter().all(|v| v.si_value().abs() < 1e-12));
-        let end = trajectory.points().last().unwrap();
-        assert!((end.positions[0].si_value() - 0.3).abs() < 1e-9);
-        assert!(end.velocities.iter().all(|v| v.si_value().abs() < 1e-12));
-    }
-
-    #[test]
-    fn trapezoidal_rejects_positive_zone_with_waypoint() {
-        let (chain, model) = robot();
-        let points = [q(0.0, 0.0), q(0.3, 0.0), q(0.3, 0.3)];
-        let zones = [
-            Length::new::<meter>(0.0),
-            Length::new::<meter>(0.1),
-            Length::new::<meter>(0.0),
-        ];
-        let (status, trajectory) = timed_with_profile::<256, 1024>(
-            &chain,
-            &model,
-            &points,
-            &zones,
-            CuTrajectoryProfile::Trapezoidal,
-        );
-        assert_eq!(
-            status,
-            CuContinuousStatus::NoContinuousMotion { waypoint: 1 }
-        );
-        assert!(trajectory.is_empty());
-    }
-
-    #[test]
-    fn scurve_rejects_positive_zone_with_waypoint() {
-        let (chain, model) = robot();
-        let points = [q(0.0, 0.0), q(0.3, 0.0), q(0.3, 0.3)];
-        let zones = [
-            Length::new::<meter>(0.0),
-            Length::new::<meter>(0.1),
-            Length::new::<meter>(0.0),
-        ];
-        let (status, trajectory) = timed_with_profile::<256, 1024>(
-            &chain,
-            &model,
-            &points,
-            &zones,
-            CuTrajectoryProfile::SCurve,
-        );
-        assert_eq!(
-            status,
-            CuContinuousStatus::NoContinuousMotion { waypoint: 1 }
-        );
-        assert!(trajectory.is_empty());
-    }
-
-    #[test]
-    fn trapezoidal_times_all_stop_path_with_exact_stops() {
-        let (chain, model) = robot();
-        let points = [q(0.0, 0.0), q(0.3, 0.0), q(0.3, 0.3)];
-        let zones = [Length::new::<meter>(0.0); 3];
-        let (status, trajectory) = timed_with_profile::<256, 1024>(
-            &chain,
-            &model,
-            &points,
-            &zones,
-            CuTrajectoryProfile::Trapezoidal,
-        );
-        assert_eq!(status, CuContinuousStatus::Success);
-        // Exact rest at the middle waypoint and the final configuration.
-        assert!(
-            trajectory
-                .points()
-                .iter()
-                .any(|p| (p.positions[0].si_value() - 0.3).abs() < 1e-9
-                    && p.positions[1].si_value().abs() < 1e-9
-                    && p.velocities.iter().all(|v| v.si_value().abs() < 1e-9))
-        );
-        let end = trajectory.points().last().unwrap();
-        assert!((end.positions[0].si_value() - 0.3).abs() < 1e-9);
-        assert!((end.positions[1].si_value() - 0.3).abs() < 1e-9);
-        assert!(end.velocities.iter().all(|v| v.si_value().abs() < 1e-9));
-        let mut prev = -1.0;
-        for p in trajectory.points() {
-            let t = p.time_from_start.get::<second>();
-            assert!(t > prev, "times must be strictly increasing");
-            prev = t;
-            for v in &p.velocities {
-                assert!(v.si_value().abs() <= 0.4 + 1e-6);
-            }
-        }
-    }
-
-    #[test]
-    fn mixed_stop_and_flyby_zones_on_one_path() {
-        let (chain, model) = robot();
-        let points = [q(0.0, 0.0), q(0.3, 0.0), q(0.3, 0.3), q(0.0, 0.3)];
-        let zones = [
-            Length::new::<meter>(0.0),
-            Length::new::<meter>(0.1),
-            Length::new::<meter>(0.0),
-            Length::new::<meter>(0.0),
-        ];
-        let (status, trajectory) = timed_with_profile::<256, 2048>(
-            &chain,
-            &model,
-            &points,
-            &zones,
-            CuTrajectoryProfile::Cubic,
-        );
-        assert_eq!(status, CuContinuousStatus::Success);
-        // Fly through waypoint 1, exact stop at waypoint 2.
-        let mut moving_inside = false;
-        for p in trajectory.points() {
-            let x = p.positions[0].si_value();
-            let y = p.positions[1].si_value();
-            if distance([x, y, 0.0], [0.3, 0.0, 0.0]) < 0.09 && y > 0.001 {
-                moving_inside |= p.velocities.iter().any(|v| v.si_value().abs() > 1e-5);
-            }
-        }
-        assert!(moving_inside, "cubic must not stop inside the zone");
-        assert!(
-            trajectory
-                .points()
-                .iter()
-                .any(|p| (p.positions[0].si_value() - 0.3).abs() < 1e-9
-                    && (p.positions[1].si_value() - 0.3).abs() < 1e-9
-                    && p.velocities.iter().all(|v| v.si_value().abs() < 1e-9))
-        );
-        let end = trajectory.points().last().unwrap();
-        assert!(end.positions[0].si_value().abs() < 1e-9);
-        assert!((end.positions[1].si_value() - 0.3).abs() < 1e-9);
     }
 }
