@@ -21,15 +21,21 @@
 //! {"type":"state","q":[q0..q5],"qd":[qd0..qd5],"time":<sim seconds>}\n
 //! ```
 //!
-//! Receive parses `q` into the payload. `qd` and `time` are ignored in v1.
-//! A malformed line is a [`CuError`](cu29::prelude::CuError).
+//! Receive parses `q` into positions and `qd` into velocities. `time` is
+//! ignored. A malformed line (or a missing/non-numeric `q`/`qd` array) is a
+//! [`CuError`](cu29::prelude::CuError).
 //!
 //! # Payload contract
 //!
-//! Both directions carry
-//! [`CuJointPositionsPayload<6>`](cu_kinematics::CuJointPositionsPayload): the
-//! 6-DOF igus ReBeL arm. `N` is fixed at 6 in v1; the sidecar is built to
-//! match. Joints are revolute, values are SI radians.
+//! The Tx `joint_command` channel carries
+//! [`CuJointCommandPayload<6>`](cu_controller::CuJointCommandPayload) and the
+//! Rx `joint_state` channel carries
+//! [`CuJointStatePayload<6>`](cu_controller::CuJointStatePayload): the
+//! unified controller contract for the 6-DOF igus ReBeL arm. `N` is fixed at
+//! 6 in v1; the sidecar is built to match. Joints are revolute, positions
+//! are SI radians, velocities SI radians per second. Only the command
+//! positions reach the wire; command velocities/status stay on the Copper
+//! side.
 //!
 //! # Config keys
 //!
@@ -63,10 +69,10 @@
 //!     ),
 //! ],
 //! cnx: [
-//!     ( src: "planner", dst: "mujoco/joint_command",
-//!       msg: "cu_kinematics::CuJointPositionsPayload" ),
+//!     ( src: "controller", dst: "mujoco/joint_command",
+//!       msg: "cu_controller::CuJointCommandPayload<6>" ),
 //!     ( src: "mujoco/joint_state", dst: "controller",
-//!       msg: "cu_kinematics::CuJointPositionsPayload" ),
+//!       msg: "cu_controller::CuJointStatePayload<6>" ),
 //! ],
 //! ```
 //!
@@ -78,13 +84,17 @@ use bincode::de::Decoder;
 use bincode::enc::Encoder;
 use bincode::error::DecodeError;
 use bincode::error::EncodeError;
+use cu_controller::CuJointCommandPayload;
+use cu_controller::CuJointStatePayload;
 use cu_kinematics::CuJointPosition;
-use cu_kinematics::CuJointPositionsPayload;
+use cu_kinematics::CuJointVelocity;
 use cu29::prelude::*;
 use cu29::rx_channels;
 use cu29::tx_channels;
 use cu29::units::si::angle::radian;
+use cu29::units::si::angular_velocity::radian_per_second;
 use cu29::units::si::f64::Angle;
+use cu29::units::si::f64::AngularVelocity;
 use std::io::Read;
 use std::io::Write;
 use std::net::TcpStream;
@@ -104,13 +114,13 @@ const MAX_LINE_BYTES: usize = 1024;
 
 tx_channels! {
     pub struct MujocoTxChannels: MujocoTxId {
-        joint_command => CuJointPositionsPayload<6> = "joint_command",
+        joint_command => CuJointCommandPayload<6> = "joint_command",
     }
 }
 
 rx_channels! {
     pub struct MujocoRxChannels: MujocoRxId {
-        joint_state => CuJointPositionsPayload<6> = "joint_state",
+        joint_state => CuJointStatePayload<6> = "joint_state",
     }
 }
 
@@ -180,7 +190,10 @@ impl CuMujocoSimBridge {
 }
 
 /// Encodes a joint command payload as one protocol line (with `\n`).
-pub fn encode_command_line(payload: &CuJointPositionsPayload<MUJOCO_DOF>) -> String {
+///
+/// Only the command positions reach the wire; velocities and status stay on
+/// the Copper side.
+pub fn encode_command_line(payload: &CuJointCommandPayload<MUJOCO_DOF>) -> String {
     let q: [f64; MUJOCO_DOF] = payload.positions.map(CuJointPosition::si_value);
     let mut line = serde_json::to_string(&serde_json::json!({"type": "command", "q": q}))
         .expect("command line is JSON-serializable");
@@ -188,13 +201,11 @@ pub fn encode_command_line(payload: &CuJointPositionsPayload<MUJOCO_DOF>) -> Str
     line
 }
 
-/// Decodes one sidecar state line into `out`, ignoring `qd`/`time`.
+/// Decodes one sidecar state line into `out`, parsing `q` into positions and
+/// `qd` into velocities (`time` is ignored).
 ///
 /// `out` is left untouched when the line is malformed; the error is returned.
-pub fn decode_state_line(
-    line: &str,
-    out: &mut CuJointPositionsPayload<MUJOCO_DOF>,
-) -> CuResult<()> {
+pub fn decode_state_line(line: &str, out: &mut CuJointStatePayload<MUJOCO_DOF>) -> CuResult<()> {
     let value: serde_json::Value = serde_json::from_str(line)
         .map_err(|e| CuError::new_with_cause("cu-mujoco-sim: bad JSON", e))?;
     if value.get("type").and_then(serde_json::Value::as_str) != Some("state") {
@@ -211,6 +222,15 @@ pub fn decode_state_line(
             "cu-mujoco-sim: state \"q\" must hold 6 joints",
         ));
     }
+    let qd = value
+        .get("qd")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| CuError::from("cu-mujoco-sim: state line misses array \"qd\""))?;
+    if qd.len() != MUJOCO_DOF {
+        return Err(CuError::from(
+            "cu-mujoco-sim: state \"qd\" must hold 6 joints",
+        ));
+    }
     let mut positions = [CuJointPosition::default(); MUJOCO_DOF];
     for (i, v) in q.iter().enumerate() {
         let rad = v
@@ -218,7 +238,16 @@ pub fn decode_state_line(
             .ok_or_else(|| CuError::from("cu-mujoco-sim: state \"q\" holds non-numeric joint"))?;
         positions[i] = CuJointPosition::Revolute(Angle::new::<radian>(rad));
     }
+    let mut velocities = [CuJointVelocity::default(); MUJOCO_DOF];
+    for (i, v) in qd.iter().enumerate() {
+        let rad_per_s = v
+            .as_f64()
+            .ok_or_else(|| CuError::from("cu-mujoco-sim: state \"qd\" holds non-numeric joint"))?;
+        velocities[i] =
+            CuJointVelocity::Revolute(AngularVelocity::new::<radian_per_second>(rad_per_s));
+    }
     out.positions = positions;
+    out.velocities = velocities;
     Ok(())
 }
 
@@ -289,7 +318,7 @@ impl CuBridge for CuMujocoSimBridge {
         if channel.id != MujocoTxId::JointCommand {
             return Err(CuError::from("cu-mujoco-sim: unknown Tx channel"));
         }
-        let cmd = msg.downcast_ref::<CuJointPositionsPayload<MUJOCO_DOF>>()?;
+        let cmd = msg.downcast_ref::<CuJointCommandPayload<MUJOCO_DOF>>()?;
         let Some(payload) = cmd.payload() else {
             return Ok(());
         };
@@ -351,9 +380,9 @@ impl CuBridge for CuMujocoSimBridge {
         }
         let line = core::str::from_utf8(&buf[..len])
             .map_err(|e| CuError::new_with_cause("cu-mujoco-sim: state line is not UTF-8", e))?;
-        let state = msg.downcast_mut::<CuJointPositionsPayload<MUJOCO_DOF>>()?;
+        let state = msg.downcast_mut::<CuJointStatePayload<MUJOCO_DOF>>()?;
         let Some(payload) = state.payload_mut() else {
-            let mut fresh = CuJointPositionsPayload::<MUJOCO_DOF>::default();
+            let mut fresh = CuJointStatePayload::<MUJOCO_DOF>::default();
             decode_state_line(line, &mut fresh)?;
             state.set_payload(fresh);
             return Ok(());
@@ -374,15 +403,16 @@ mod tests {
     use std::sync::mpsc::channel;
     use std::thread::spawn;
 
-    fn test_payload(q: [f64; MUJOCO_DOF]) -> CuJointPositionsPayload<MUJOCO_DOF> {
-        CuJointPositionsPayload {
+    fn test_command(q: [f64; MUJOCO_DOF]) -> CuJointCommandPayload<MUJOCO_DOF> {
+        CuJointCommandPayload {
             positions: q.map(|v| CuJointPosition::Revolute(Angle::new::<radian>(v))),
+            ..Default::default()
         }
     }
 
     #[test]
     fn test_encode_command_line_shape() {
-        let line = encode_command_line(&test_payload([0.0, 0.5, -1.0, 1.5, -0.25, 3.0]));
+        let line = encode_command_line(&test_command([0.0, 0.5, -1.0, 1.5, -0.25, 3.0]));
         assert!(line.ends_with('\n'));
         let value: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(value.get("type").and_then(|t| t.as_str()), Some("command"));
@@ -395,30 +425,39 @@ mod tests {
 
     #[test]
     fn test_decode_state_line_round_trip() {
-        let line = "{\"type\":\"state\",\"q\":[0.1,0.2,0.3,0.4,0.5,0.6],\"qd\":[0,0,0,0,0,0],\"time\":1.25}\n";
-        let mut out = CuJointPositionsPayload::<MUJOCO_DOF>::default();
+        let line = "{\"type\":\"state\",\"q\":[0.1,0.2,0.3,0.4,0.5,0.6],\"qd\":[0.01,0.02,0.03,0.04,0.05,0.06],\"time\":1.25}\n";
+        let mut out = CuJointStatePayload::<MUJOCO_DOF>::default();
         decode_state_line(line, &mut out).unwrap();
         for (i, want) in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6].iter().enumerate() {
             assert!((out.positions[i].si_value() - want).abs() < 1e-12);
+        }
+        for (i, want) in [0.01, 0.02, 0.03, 0.04, 0.05, 0.06].iter().enumerate() {
+            assert!((out.velocities[i].si_value() - want).abs() < 1e-12);
         }
     }
 
     #[test]
     fn test_decode_state_line_rejects_malformed() {
-        let mut out = CuJointPositionsPayload::<MUJOCO_DOF>::default();
+        let mut out = CuJointStatePayload::<MUJOCO_DOF>::default();
         for bad in [
             "not json\n",
             "{\"type\":\"command\",\"q\":[0,0,0,0,0,0]}\n",
             "{\"type\":\"state\",\"qd\":[0,0,0,0,0,0]}\n",
             "{\"type\":\"state\",\"q\":[0,0,0,0,0]}\n",
             "{\"type\":\"state\",\"q\":[0,0,0,0,0,0,0]}\n",
-            "{\"type\":\"state\",\"q\":[0,0,0,0,0,\"x\"]}\n",
+            "{\"type\":\"state\",\"q\":[0,0,0,0,0,\"x\"],\"qd\":[0,0,0,0,0,0]}\n",
+            "{\"type\":\"state\",\"q\":[0,0,0,0,0,0]}\n",
+            "{\"type\":\"state\",\"q\":[0,0,0,0,0,0],\"qd\":[0,0,0,0,0]}\n",
+            "{\"type\":\"state\",\"q\":[0,0,0,0,0,0],\"qd\":[0,0,0,0,0,\"x\"]}\n",
         ] {
             assert!(decode_state_line(bad, &mut out).is_err(), "accepted: {bad}");
         }
         // Rejected lines leave the payload untouched (still default zeros).
         for p in out.positions {
             assert_eq!(p.si_value(), 0.0);
+        }
+        for v in out.velocities {
+            assert_eq!(v.si_value(), 0.0);
         }
     }
 
@@ -491,11 +530,11 @@ mod tests {
             stream: None,
         };
         bridge.start(&ctx).unwrap();
-        let cmd = CuMsg::new(Some(test_payload([1.0, 0.0, 0.0, 0.0, 0.0, 0.0])));
+        let cmd = CuMsg::new(Some(test_command([1.0, 0.0, 0.0, 0.0, 0.0, 0.0])));
         bridge
             .send(&ctx, &MujocoTxChannels::JOINT_COMMAND, &cmd)
             .unwrap();
-        let mut state = CuMsg::<CuJointPositionsPayload<MUJOCO_DOF>>::new(None);
+        let mut state = CuMsg::<CuJointStatePayload<MUJOCO_DOF>>::new(None);
         bridge
             .receive(&ctx, &MujocoRxChannels::JOINT_STATE, &mut state)
             .unwrap();
