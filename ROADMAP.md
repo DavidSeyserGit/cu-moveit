@@ -55,13 +55,20 @@ tasks, deterministic replay-compatible behaviour.
    API, packaging, and cancellation semantics against the Validation Plan.
    Collision monitoring and collision-triggered abort during execution are
    deferred to Step 3; they do not block Step 1.
-2. **Planning completeness (next).** Build in this order:
+2. **Planning and simulated robot execution (next).** Build in this order:
    - A versioned, fixed-capacity planning scene shared by collision checking and
      planner tasks: stable object IDs, obstacle add/update/remove, attached
      objects with link-relative transforms, and explicit collision exclusions.
    - Consistent scene snapshots for each planning request, with scene revisions
      carried into results and deterministic restart/invalidation when the scene
      changes during anytime planning.
+   - Connect a physics simulator through a Copper joint-state/command interface.
+     Read measured joint states, plan from the current state, time the path,
+     send follower setpoints to the simulator, and observe returned joint states
+     and execution status. Use a local, git-excluded demonstration to exercise
+     the complete loop; kinematic animation alone does not satisfy this step.
+     Define the joint command/state contract here so it can also support the
+     hardware bridge in Step 4.
    - Pose-goal planning using the existing IK and joint-space RRT*, with explicit
      no-IK-solution, invalid-start/goal, capacity, and planning-failure outcomes.
    - Integrate existing Cartesian paths and TCP zones with the same scene and
@@ -70,16 +77,19 @@ tasks, deterministic replay-compatible behaviour.
    - A seeded benchmark harness reporting success rate, geometric path cost,
      planning effort, and elapsed time. Add planners such as PRM/BIT* only where
      measured results justify them.
-   Completion requires a local demonstration that updates obstacles, attaches
-   an object, and plans joint, pose-goal, and Cartesian requests consistently
-   against the selected scene revision, plus the Validation Plan checks.
+   Completion requires a local physics-simulator demonstration that reads joint
+   state, plans and times a trajectory, commands the simulated robot, and
+   observes state feedback and execution status. It also updates obstacles,
+   attaches an object, and plans joint, pose-goal, and Cartesian requests
+   consistently against the selected scene revision, plus the Validation Plan
+   checks.
 3. **Real-time servoing.** Harden `CuServoTask<N>` into a production servo
    loop: rate limiting, watchdog timeouts, singularity/limit behaviour under
    load, latency/allocation budgets enforced by tests. Add execution collision
    monitoring and collision-triggered abort with defined stop/hold reporting;
    distinguish geometric validation before execution from monitoring during it.
-4. **Robot bridges.** Define a generic `CuBridge` joint command/state contract
-   so execution stays robot-agnostic; prove it with `cu-igus-cri` for the igus
+4. **Robot bridges.** Extend the joint command/state contract established in
+   Step 2 to hardware through a generic `CuBridge`; prove it with `cu-igus-cri` for the igus
    ReBeL CRI protocol (`192.168.3.11:3920`); hardware-in-the-loop example plans
    and executes on the real ReBeL.
 5. **Generality (deliberately last).** Tree/branched kinematic structures,
