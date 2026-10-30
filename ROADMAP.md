@@ -47,7 +47,7 @@ allocation, in-place `&mut` outputs, `no_std`-compatible shared crates,
 `cu29::units` physical units, `CuResult<T>` errors, `Reflect` + `Freezable`
 tasks, deterministic replay-compatible behaviour.
 
-## Next release: 0.3
+## Release 0.3 (released in `v0.3.0`)
 
 Controller-interface completion, building on `v0.2.2`:
 
@@ -62,11 +62,11 @@ Controller-interface completion, building on `v0.2.2`:
   `CuGripperTask<IN, OUT>` maps open/close commands onto RON-configured
   output bits and optional sensor inputs, reporting open/closed/moving/fault.
   Bridge support (sim and hardware) follows with each bridge.
-- **Robot-side status/fault reporting.** `CuJointStatePayload<N>` gains a
+- **Robot-side status/fault reporting (implemented).** `CuJointStatePayload<N>` gains a
   bridge-reported status (ok, fault with code, estop, not-ready), distinct
   from the controller's own status; the controller surfaces it and faults
   instead of commanding a robot that reports a fault.
-- **Rate limiting and watchdog.** `CuControllerTask<N>` gains configurable
+- **Rate limiting and watchdog (implemented).** `CuControllerTask<N>` gains configurable
   command rate limiting (max joint velocity/acceleration of emitted
   commands) and a time-based watchdog: stale measured state (by `Tov`)
   beyond a configured age faults and holds, replacing today's purely
