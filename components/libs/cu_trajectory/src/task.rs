@@ -62,6 +62,18 @@ impl<const N: usize> Default for CuTrajectoryFollowOutput<N> {
     }
 }
 
+/// Interpolation used by a trajectory follower.
+#[derive(
+    Default, Debug, Clone, Copy, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CuTrajectoryInterpolation {
+    #[default]
+    Linear,
+    /// Position and velocity are reconstructed using cubic Hermite interpolation.
+    Cubic,
+}
+
 /// `CuTask` sampling a stored joint trajectory against the message `Tov` clock.
 ///
 /// The trajectory clock is the input message's `Tov`: adoption records the
@@ -77,6 +89,7 @@ pub struct CuFollowTrajectoryTask<const N: usize, const MAX_POINTS: usize = MAX_
     trajectory: Option<CuTrajectoryPayload<N, MAX_POINTS>>,
     #[reflect(ignore)]
     start: CuTime,
+    interpolation: CuTrajectoryInterpolation,
 }
 
 impl<const N: usize, const MAX_POINTS: usize> CuFollowTrajectoryTask<N, MAX_POINTS> {
@@ -85,6 +98,15 @@ impl<const N: usize, const MAX_POINTS: usize> CuFollowTrajectoryTask<N, MAX_POIN
         Self {
             trajectory: None,
             start: CuTime::MIN,
+            interpolation: CuTrajectoryInterpolation::Linear,
+        }
+    }
+    /// Creates an idle follower with an explicit interpolation method.
+    pub const fn new_with_interpolation(interpolation: CuTrajectoryInterpolation) -> Self {
+        Self {
+            trajectory: None,
+            start: CuTime::MIN,
+            interpolation,
         }
     }
 }
@@ -98,12 +120,14 @@ impl<const N: usize, const MAX_POINTS: usize> Default for CuFollowTrajectoryTask
 impl<const N: usize, const MAX_POINTS: usize> Freezable for CuFollowTrajectoryTask<N, MAX_POINTS> {
     fn freeze<E: Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {
         Encode::encode(&self.trajectory, encoder)?;
-        Encode::encode(&self.start, encoder)
+        Encode::encode(&self.start, encoder)?;
+        Encode::encode(&self.interpolation, encoder)
     }
 
     fn thaw<D: Decoder>(&mut self, decoder: &mut D) -> Result<(), DecodeError> {
         self.trajectory = Decode::decode(decoder)?;
         self.start = Decode::decode(decoder)?;
+        self.interpolation = Decode::decode(decoder)?;
         Ok(())
     }
 }
@@ -113,11 +137,17 @@ impl<const N: usize, const MAX_POINTS: usize> CuTask for CuFollowTrajectoryTask<
     type Input<'m> = input_msg!(CuTrajectoryPayload<N, MAX_POINTS>);
     type Output<'m> = output_msg!(CuTrajectoryFollowOutput<N>);
 
-    fn new(_cfg: Option<&ComponentConfig>, _res: Self::Resources<'_>) -> CuResult<Self>
+    fn new(cfg: Option<&ComponentConfig>, _res: Self::Resources<'_>) -> CuResult<Self>
     where
         Self: Sized,
     {
-        Ok(Self::new())
+        let interpolation = match cfg {
+            Some(cfg) => cfg
+                .get_value::<CuTrajectoryInterpolation>("interpolation")?
+                .unwrap_or_default(),
+            None => CuTrajectoryInterpolation::default(),
+        };
+        Ok(Self::new_with_interpolation(interpolation))
     }
 
     fn process<'i, 'o>(
@@ -156,11 +186,18 @@ impl<const N: usize, const MAX_POINTS: usize> CuTask for CuFollowTrajectoryTask<
         let elapsed_s = elapsed.as_nanos() as f64 / 1_000_000_000.0;
         let mut positions = [CuJointPosition::default(); N];
         let mut velocities = [CuJointVelocity::default(); N];
-        stored.sample(
-            Time::new::<second>(elapsed_s),
-            &mut positions,
-            &mut velocities,
-        )?;
+        match self.interpolation {
+            CuTrajectoryInterpolation::Linear => stored.sample(
+                Time::new::<second>(elapsed_s),
+                &mut positions,
+                &mut velocities,
+            )?,
+            CuTrajectoryInterpolation::Cubic => stored.sample_cubic(
+                Time::new::<second>(elapsed_s),
+                &mut positions,
+                &mut velocities,
+            )?,
+        }
         let status = if elapsed_s >= stored.duration().get::<second>() {
             CuFollowStatus::Finished
         } else {
@@ -233,6 +270,52 @@ mod tests {
         assert_eq!(out.status, CuFollowStatus::Running);
         assert!((out.positions[0].si_value() - 1.0).abs() < 1e-12);
         assert!((out.velocities[0].si_value() - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn cubic_follower_samples_position_and_velocity_consistently() {
+        let (ctx, _) = CuContext::new_mock_clock();
+        let mut task =
+            CuFollowTrajectoryTask::<1>::new_with_interpolation(CuTrajectoryInterpolation::Cubic);
+        let mut output = CuMsg::new(None);
+        task.process(&ctx, &msg_at(Some(two_point_traj()), 100), &mut output)
+            .unwrap();
+        task.process(&ctx, &msg_at(Some(two_point_traj()), 101), &mut output)
+            .unwrap();
+        let out = output.payload().unwrap();
+        assert!((out.positions[0].si_value() - 0.0).abs() < 1e-12);
+        assert!((out.velocities[0].si_value() - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn freeze_thaw_preserves_cubic_mode_and_clock() {
+        let (ctx, _) = CuContext::new_mock_clock();
+        let mut original =
+            CuFollowTrajectoryTask::<1>::new_with_interpolation(CuTrajectoryInterpolation::Cubic);
+        let mut output = CuMsg::new(None);
+        original
+            .process(&ctx, &msg_at(Some(two_point_traj()), 100), &mut output)
+            .unwrap();
+        let mut bytes = [0u8; 8192];
+        let mut encoder = bincode::enc::EncoderImpl::new(
+            bincode::enc::write::SliceWriter::new(&mut bytes),
+            bincode::config::standard(),
+        );
+        original.freeze(&mut encoder).unwrap();
+        let len = encoder.into_writer().bytes_written();
+        let mut decoder = bincode::de::DecoderImpl::new(
+            bincode::de::read::SliceReader::new(&bytes[..len]),
+            bincode::config::standard(),
+            (),
+        );
+        let mut restored = CuFollowTrajectoryTask::<1>::new();
+        restored.thaw(&mut decoder).unwrap();
+        restored
+            .process(&ctx, &msg_at(None, 101), &mut output)
+            .unwrap();
+        let out = output.payload().unwrap();
+        assert!((out.positions[0].si_value() - 0.0).abs() < 1e-12);
+        assert!((out.velocities[0].si_value() - 0.5).abs() < 1e-12);
     }
 
     #[test]

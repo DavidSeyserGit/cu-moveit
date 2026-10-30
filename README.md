@@ -9,6 +9,7 @@ Deterministic, zero-allocation robot manipulation, kinematics, collision checkin
 | `cu-kinematics` | `components/libs/cu_kinematics` | `lib` / `task` | Const-generic `CuKinematicChain<N>` forward kinematics, space/body geometric Jacobians, DLS inverse kinematics, differential IK with singularity/limit damping, `CuForwardKinematicsTask<N>`, `CuInverseKinematicsTask<N>`, `CuServoTask<N>`, and 6-DOF igus ReBeL model |
 | `cu-collision` | `components/libs/cu_collision` | `lib` / `task` | Fixed-capacity sphere/capsule primitives, exact signed-distance queries, `CuRobotCollisionModel<N>`, `CuCollisionWorld<MAX_OBSTACLES>`, `CuCollisionCheckTask<N>`, and igus ReBeL collision geometry |
 | `cu-robot-description` | `components/libs/cu_robot_description` | `startup lib` | URDF serial-chain extraction, primitive collision conversion, and SRDF serial groups, collision exclusions, and named states |
+| `cu-trajectory` | `components/libs/cu_trajectory` | `lib` / `task` | Fixed-capacity joint trajectories, interpolation, timing profiles, and sampled Cartesian TCP-zone blending |
 | `cu-joint-rrt-star` | `components/tasks/cu_joint_rrt_star` | `task` | Joint-space $N$-DOF RRT* anytime motion planner (`CuAnytimeTask`) with deterministic `CuRng` seeding, informed pruning, rewiring, and path shortcutting |
 
 See [ROADMAP.md](ROADMAP.md) for where this is going and what is explicitly out
@@ -110,3 +111,36 @@ Existing callers must convert angular coordinates with `angle.into()` and match
 joint-velocity variants. Joint-limit RON values now use `revolute`, `prismatic`,
 `continuous`, or `fixed` variants. Planner `step_size`, `goal_threshold`, and
 `rewire_radius` replace their former `_rad` keys and use the configured metric.
+
+## Continuous motion and TCP zones
+
+`cu_trajectory::cartesian_blend::blend_cartesian_path` takes a serial chain,
+collision model, joint waypoints, and one typed `Length` zone radius per
+waypoint. A zero interior radius is an exact stop; a positive radius replaces
+that TCP corner with a sampled quadratic fly-by path. The first and last radii
+must be zero. Tool orientation follows shortest-arc interpolation, and IK is
+seeded from the previous solution. Input/output capacity is fixed at compile
+time; invalid geometry, IK failure, collision, or capacity exhaustion clears the
+output and returns a status.
+
+`continuous::parameterize_cartesian_blend` times that path with any
+`CuTrajectoryProfile` from `CuContinuousConfig::profile`. Cubic and
+minimum-jerk honor the shared harmonic-mean knot velocities and fly through
+zones; trapezoidal and S-curve are rest-to-rest families, so a positive zone
+rejects the job with `NoContinuousMotion` naming the waypoint, while an
+all-stop path is timed with the same rest-to-rest primitives as
+`parameterize_with_profile`. It checks full-segment velocity and acceleration
+extrema (exact for cubic, analytic for minimum-jerk), repeats sampled
+collision and zone checks on the timed interpolation, and rejects unintended
+stops. Read a cubic or minimum-jerk result with
+`CuTrajectoryPayload::sample_cubic`, or configure a `CuFollowTrajectoryTask`
+with `config: {"interpolation": "cubic"}`. Match the follower's `MAX_POINTS`
+type parameter to the generated payload capacity. The default follower
+interpolation remains linear. Interpolation mode is included in newly frozen follower state;
+earlier frozen snapshots need migration.
+
+This initial implementation uses conservative automatic timing and does not
+bound jerk. Collision and zone checks are discrete and depend on their configured
+resolution; they are not swept-volume collision guarantees. The zone radius is a
+TCP-position tolerance, not a separate orientation tolerance or an exact
+reproduction of a vendor controller's zone algorithm.

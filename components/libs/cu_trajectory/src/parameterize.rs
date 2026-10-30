@@ -544,7 +544,10 @@ fn coordinate_velocity_kind(q: CuJointPosition) -> CuJointVelocity {
 }
 
 /// Trapezoidal (or triangular) traversal time for one joint displacement.
-fn joint_profile_duration(distance: f64, max_vel: f64, max_acc: f64) -> f64 {
+///
+/// Shared with the Cartesian blend timing so rest-to-rest segments reuse the
+/// exact same primitive.
+pub(crate) fn joint_profile_duration(distance: f64, max_vel: f64, max_acc: f64) -> f64 {
     if distance <= 0.0 {
         return 0.0;
     }
@@ -559,8 +562,14 @@ fn joint_profile_duration(distance: f64, max_vel: f64, max_acc: f64) -> f64 {
 /// Jerk-limited S-curve traversal time for one joint displacement.
 ///
 /// With infinite jerk this is exactly the trapezoidal time; with finite jerk
-/// it is the symmetric 7-segment duration from [`scurve_shape`].
-fn scurve_joint_duration(distance: f64, max_vel: f64, max_acc: f64, max_jerk: f64) -> f64 {
+/// it is the symmetric 7-segment duration from [`scurve_shape`]. Shared with
+/// the Cartesian blend timing.
+pub(crate) fn scurve_joint_duration(
+    distance: f64,
+    max_vel: f64,
+    max_acc: f64,
+    max_jerk: f64,
+) -> f64 {
     if distance <= 0.0 {
         return 0.0;
     }
@@ -697,11 +706,13 @@ fn scurve_eval(
 }
 
 /// Single-joint displacement with its SI limit bounds for profile evaluation.
-struct JointPrimitive {
-    distance: f64,
-    max_vel: f64,
-    max_acc: f64,
-    max_jerk: f64,
+///
+/// Shared with the Cartesian blend timing.
+pub(crate) struct JointPrimitive {
+    pub(crate) distance: f64,
+    pub(crate) max_vel: f64,
+    pub(crate) max_acc: f64,
+    pub(crate) max_jerk: f64,
 }
 
 /// Evaluates a rest-to-rest primitive stretched onto a longer segment.
@@ -710,7 +721,9 @@ struct JointPrimitive {
 /// (or fixed) segment duration. Time-scaling by `scale = own / effective`
 /// lowers peak velocity by `scale`, acceleration by `scale^2`, and jerk by
 /// `scale^3`, so every bound the primitive satisfies still holds.
-fn stretched_eval(
+///
+/// Shared with the Cartesian blend timing for rest-to-rest segments.
+pub(crate) fn stretched_eval(
     tau: f64,
     effective: f64,
     own: f64,
@@ -740,7 +753,16 @@ fn stretched_eval(
 /// Boundary conditions are `q(0) = q0`, `q(1) = q1`, `dq(0) = v0`,
 /// `dq(1) = v1` (SI units per second), with zero endpoint accelerations.
 /// Positions and velocities are absolute SI values, not offsets.
-fn quintic_eval(u: f64, q0: f64, q1: f64, v0: f64, v1: f64, duration: f64) -> (f64, f64) {
+///
+/// Shared with the Cartesian blend timing for minimum-jerk fly-by segments.
+pub(crate) fn quintic_eval(
+    u: f64,
+    q0: f64,
+    q1: f64,
+    v0: f64,
+    v1: f64,
+    duration: f64,
+) -> (f64, f64) {
     if duration <= 0.0 {
         return (q0, v0);
     }

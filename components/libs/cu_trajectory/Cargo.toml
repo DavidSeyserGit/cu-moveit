@@ -18,6 +18,8 @@ environments = ["host", "embedded"]
 
 [dependencies]
 bincode = { workspace = true }
+cu-collision = { version = "0.1.0", path = "../cu_collision", default-features = false }
+cu-spatial-payloads = { workspace = true }
 cu-kinematics = { version = "0.1.0", path = "../cu_kinematics", default-features = false }
 cu29 = { workspace = true }
 libm = { workspace = true }
@@ -28,6 +30,7 @@ default = ["std"]
 std = [
   "cu29/std",
   "cu-kinematics/std",
+  "cu-collision/std",
   "bincode/std",
   "serde/std",
 ]
