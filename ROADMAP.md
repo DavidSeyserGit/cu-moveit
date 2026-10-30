@@ -28,8 +28,9 @@ in that order.
   state import into fixed-size kinematic and collision models.
 - `cu-motion-planning`: planner-agnostic `CuJointPlanner` trait, request/path
   payloads with explicit `CuPlanStatus`, shared scene validity checks, the
-  generic anytime `CuJointPlannerTask<P, N>`, and non-sampling planners
-  (direct joint line, deterministic path optimizer).
+  generic anytime `CuJointPlannerTask<P, N>`, and built-in planners:
+  RRT-Connect and PRM (sampling), A* lattice (search), gradient path
+  optimizer and STOMP (optimization), direct joint line.
 - `cu-joint-rrt-star`: sampling-based RRT* implementing `CuJointPlanner`, with
   deterministic `CuRng` seeding, informed pruning, rewiring, and shortcutting.
 - `cu-trajectory`: fixed-capacity trajectory payloads, profile timing, per-waypoint

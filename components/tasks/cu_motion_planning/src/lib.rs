@@ -16,28 +16,45 @@
 //! invalid start or an exhausted search are published, not silently dropped.
 //!
 //! Built-in planners:
-//! - [`direct::CuJointDirectPlanner`] (non-sampling, one shot): the straight
-//!   joint-space line, or a definite failure.
-//! - [`optimizer::CuJointPathOptimizer`] (non-sampling, anytime): deterministic
-//!   gradient optimization of a fixed waypoint path for smoothness and
-//!   clearance.
+//! - Sampling: [`rrt_connect::CuJointRrtConnect`] (bidirectional,
+//!   feasibility-first) and [`prm::CuJointPrm`] (probabilistic roadmap,
+//!   improving).
+//! - Search: [`astar::CuJointAStar`] (A* on a joint-space lattice,
+//!   resolution-complete).
+//! - Optimization: [`optimizer::CuJointPathOptimizer`] (deterministic
+//!   gradient, CHOMP-style) and [`stomp::CuJointStomp`] (seeded stochastic
+//!   rollouts).
+//! - Direct: [`direct::CuJointDirectPlanner`] (straight joint line, one shot).
 //!
-//! Sampling-based planners live in their own crates (`cu-joint-rrt-star`) and
-//! share [`validity::CuSceneValidity`] for collision queries.
+//! RRT* lives in `cu-joint-rrt-star`. Every planner shares
+//! [`validity::CuSceneValidity`] for collision and clearance queries.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
+pub mod astar;
+mod common;
 pub mod direct;
 pub mod optimizer;
+pub mod prm;
+pub mod rrt_connect;
+pub mod stomp;
 pub mod task;
 pub mod validity;
 
+pub use astar::CuJointAStar;
+pub use astar::CuJointAStarParams;
 pub use direct::CuJointDirectPlanner;
 pub use optimizer::CuJointOptimizerParams;
 pub use optimizer::CuJointPathOptimizer;
+pub use prm::CuJointPrm;
+pub use prm::CuJointPrmParams;
+pub use rrt_connect::CuJointRrtConnect;
+pub use rrt_connect::CuJointRrtConnectParams;
+pub use stomp::CuJointStomp;
+pub use stomp::CuJointStompParams;
 pub use task::CuJointPlannerDebugState;
 pub use task::CuJointPlannerTask;
 pub use validity::CuSceneValidity;

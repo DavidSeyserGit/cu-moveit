@@ -10,6 +10,8 @@ use crate::CuJointPlanRequest;
 use crate::CuJointPlanner;
 use crate::CuPlanStatus;
 use crate::CuPlannerKind;
+use crate::common::check_endpoints;
+use crate::common::write_header;
 use crate::validity::CuSceneValidity;
 use crate::validity::joint_distance;
 use cu_collision::CuRobotCollisionModel;
@@ -54,38 +56,6 @@ impl<const N: usize, const M: usize> CuJointDirectPlanner<N, M> {
             effort: 0,
         }
     }
-}
-
-/// Validates the scene and endpoints shared by every planner's `begin`.
-pub(crate) fn check_endpoints<const N: usize, const M: usize>(
-    validity: &mut CuSceneValidity<N, M>,
-    request: &CuJointPlanRequest<N>,
-    metric: CuJointMetric,
-) -> CuPlanStatus {
-    if metric.validate().is_err() || !validity.capture(&request.scene, &request.exclusions) {
-        CuPlanStatus::InvalidRequest
-    } else if !validity.is_configuration_free(&request.start) {
-        CuPlanStatus::InvalidStart
-    } else if !validity.is_configuration_free(&request.goal) {
-        CuPlanStatus::InvalidGoal
-    } else {
-        CuPlanStatus::Searching
-    }
-}
-
-/// Fills the job header of `out` and clears its waypoints.
-pub(crate) fn write_header<const N: usize, const M: usize>(
-    out: &mut CuJointPlanPath<N>,
-    validity: &CuSceneValidity<N, M>,
-    status: CuPlanStatus,
-    effort: u32,
-) {
-    out.len = 0;
-    out.cost = f64::INFINITY;
-    out.effort = effort;
-    out.status = status;
-    out.scene_revision = validity.scene_revision();
-    out.exclusions = validity.exclusions().clone();
 }
 
 impl<const N: usize, const M: usize> CuJointPlanner<N> for CuJointDirectPlanner<N, M> {

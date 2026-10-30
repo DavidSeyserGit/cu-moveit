@@ -10,7 +10,7 @@ Deterministic, zero-allocation robot manipulation, kinematics, collision checkin
 | `cu-collision` | `components/libs/cu_collision` | `lib` / `task` | Fixed-capacity sphere/capsule primitives, exact signed-distance queries, `CuRobotCollisionModel<N>`, `CuCollisionWorld<MAX_OBSTACLES>`, `CuCollisionCheckTask<N>`, and igus ReBeL collision geometry |
 | `cu-robot-description` | `components/libs/cu_robot_description` | `startup lib` | URDF serial-chain extraction, primitive collision conversion, and SRDF serial groups, collision exclusions, and named states |
 | `cu-trajectory` | `components/libs/cu_trajectory` | `lib` / `task` | Fixed-capacity joint trajectories, interpolation, timing profiles, and sampled Cartesian TCP-zone blending |
-| `cu-motion-planning` | `components/tasks/cu_motion_planning` | `lib` / `task` | Planner-agnostic contract: `CuJointPlanner` trait, `CuJointPlanRequest<N>` / `CuJointPlanPath<N>` with explicit `CuPlanStatus`, shared scene validity checks, the generic anytime `CuJointPlannerTask<P, N>`, and two non-sampling planners (direct joint line, deterministic path optimizer) |
+| `cu-motion-planning` | `components/tasks/cu_motion_planning` | `lib` / `task` | Planner-agnostic contract: `CuJointPlanner` trait, `CuJointPlanRequest<N>` / `CuJointPlanPath<N>` with explicit `CuPlanStatus`, shared scene validity checks, the generic anytime `CuJointPlannerTask<P, N>`, and built-in planners: RRT-Connect and PRM (sampling), A* lattice (search), gradient path optimizer and STOMP (optimization), direct joint line |
 | `cu-joint-rrt-star` | `components/tasks/cu_joint_rrt_star` | `task` | Sampling-based RRT* implementing `CuJointPlanner`, with deterministic `CuRng` seeding, informed pruning, rewiring, and path shortcutting; `CuJointRrtStarTask` is the generic planner task running it |
 | `cu-controller` | `components/tasks/cu_controller` | `task` | Robot-agnostic joint controller with position/velocity/effort modes, robot status, state watchdog, and command rate limiting |
 | `cu-io` | `components/tasks/cu_io` | `task` | Robot-agnostic digital IO payloads and an IO-driven gripper task |
@@ -169,9 +169,16 @@ waypoints and its `status` names the reason (`invalid_start`,
 
 | Planner | Kind | Behaviour |
 |---|---|---|
+| `CuJointRrtStar` (`cu-joint-rrt-star`) | sampling | Seeded RRT* with rewiring and shortcutting; keeps shortening its path. |
+| `CuJointRrtConnect` | sampling | Bidirectional trees; fastest to a first path, converges on connection without optimizing. |
+| `CuJointPrm` | sampling | Probabilistic roadmap (up to 1024 nodes) plus Dijkstra; improves as the roadmap densifies. Rebuilt per job. |
+| `CuJointAStar` | search | Deterministic A* on a joint-space lattice (`resolution`); complete at that resolution within its node capacity. |
+| `CuJointPathOptimizer` | optimization | Deterministic CHOMP-style gradient descent on smoothness and clearance; improves each quantum. |
+| `CuJointStomp` | optimization | Seeded stochastic rollouts weighted by cost; no gradients, copes with flat or discontinuous costs. |
 | `CuJointDirectPlanner` | direct | The straight joint line or a definite `exhausted`; a cheap first attempt. |
-| `CuJointPathOptimizer` | optimization | Deterministic gradient optimization of a fixed waypoint path for smoothness and clearance; improves each quantum. |
-| `CuJointRrtStar` | sampling | Seeded RRT* with rewiring and shortcutting; improves each quantum. |
+
+The optimizers are local: they can stay stuck behind large obstacles where
+sampling or search planners still succeed.
 
 Sampling planners derive all randomness from the job seed; deterministic
 planners ignore it. New planners only implement the trait and share
