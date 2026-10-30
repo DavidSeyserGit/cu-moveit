@@ -31,7 +31,10 @@ in that order.
 - `cu-trajectory`: fixed-capacity trajectory payloads, profile timing, per-waypoint
   Cartesian TCP zones, C² spline geometry, quintic interpolation, and S-curve
   joint jerk bounds; follower preemption and empty-trajectory cancellation.
-- All five crates pass `just pr-check` and are published at
+- `cu-mujoco-sim`: `CuBridge` to a MuJoCo sidecar over TCP/JSON carrying
+  `CuJointPositionsPayload<6>` both ways (released in `v0.2.1`); the local
+  playground closes the plan → follow → sim → feedback loop.
+- All crates pass `just pr-check` and are published at
   https://github.com/DavidSeyserGit/cu-moveit.
 
 ## Approach
@@ -68,7 +71,32 @@ tasks, deterministic replay-compatible behaviour.
      and execution status. Use a local, git-excluded demonstration to exercise
      the complete loop; kinematic animation alone does not satisfy this step.
      Define the joint command/state contract here so it can also support the
-     hardware bridge in Step 4.
+     hardware bridge in Step 4. (Implemented: `cu-mujoco-sim` `CuBridge` over
+     `CuJointPositionsPayload<6>`, released in `v0.2.1`; the local playground
+     closes the loop and the Trajectory Studio executes in the sim.)
+   - **Unified robot controller (next).** Upstream `cu29` has no robot
+     controller abstraction — only the generic `CuBridge` trait and task
+     roles — so this contract is defined here, robot-agnostically:
+     a `CuControllerTask<N>` between the trajectory follower and a `CuBridge`,
+     consuming the follower setpoint plus measured joint state and emitting one
+     unified joint command (positions, optional velocities) with an explicit
+     status (idle/running/holding/fault) and tracking error. Shared
+     `CuJointStatePayload<N>` / `CuJointCommandPayload<N>` payloads (extending
+     today's `CuJointPositionsPayload<N>`) are the only interface a bridge
+     sees: simulators (`cu-mujoco-sim`) and hardware (`cu-igus-cri`, Step 4)
+     implement the same `joint_command`/`joint_state` channels, so swapping
+     sim for a real robot is a RON graph change, not an app change. Generalize
+     `cu-mujoco-sim` from fixed `N = 6` as the first consumer.
+     Shape (per Copper component design): a new crate
+     `components/tasks/cu_controller` holding the payloads and a
+     `CuControllerTask<N>` — a multi-input `CuTask` (follower setpoint +
+     measured state in, unified command out), `Reflect` + `Freezable`
+     (last command, status, watchdog state round-trip for replay), zero
+     hot-path allocation, `Tov` propagated from the state input. Bridges stay
+     pure transports: `CuBridge` with `joint_command`/`joint_state` channels,
+     polling in `preprocess`, dispatch in `send`/`receive`. Done when the
+     playground sim demo runs through the controller unchanged and a mock
+     bridge test proves the same graph shape works without MuJoCo.
    - Pose-goal planning using the existing IK and joint-space RRT*, with explicit
      no-IK-solution, invalid-start/goal, capacity, and planning-failure outcomes.
    - Integrate existing Cartesian paths and TCP zones with the same scene and
