@@ -55,9 +55,13 @@ Controller-interface completion, building on `v0.2.2`:
   carries position, velocity, and effort modes, with typed torque/force per
   joint kind. `CuControllerTask<N>` computes PD effort; bridges apply raw
   torque/force. Position-mode velocity feedforward landed with it.
-- **Gripper and digital IO.** Standard payloads and bridge channels for a
-  gripper (position/force) and digital inputs/outputs, so end-effector
-  hardware rides the same graph as the arm.
+- **Gripper and digital IO (implemented).** `cu-io` defines the
+  robot-agnostic `digital_in`/`digital_out` payloads
+  (`CuDigitalInputPayload<N>` with device status, `CuDigitalOutputPayload<N>`
+  with a drive mask). A gripper is IO, not a payload of its own:
+  `CuGripperTask<IN, OUT>` maps open/close commands onto RON-configured
+  output bits and optional sensor inputs, reporting open/closed/moving/fault.
+  Bridge support (sim and hardware) follows with each bridge.
 - **Robot-side status/fault reporting.** `CuJointStatePayload<N>` gains a
   bridge-reported status (ok, fault with code, estop, not-ready), distinct
   from the controller's own status; the controller surfaces it and faults

@@ -1,0 +1,26 @@
+[package]
+name = "cu-io"
+description = "Robot-agnostic digital IO payloads and an IO-driven gripper task for copper-rs"
+version.workspace = true
+publish.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+repository.workspace = true
+
+[package.metadata.copper]
+kind = "task"
+domains = ["control", "manipulation"]
+environments = ["host", "embedded"]
+
+[dependencies]
+bincode = { workspace = true }
+cu29 = { workspace = true }
+serde = { workspace = true }
+
+[features]
+default = ["std"]
+std = ["cu29/std", "bincode/std", "serde/std"]
