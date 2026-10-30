@@ -51,10 +51,10 @@ tasks, deterministic replay-compatible behaviour.
 
 Controller-interface completion, building on `v0.2.2`:
 
-- **Effort/torque commands.** Extend the unified command contract beyond
-  position/velocity: an effort channel on `CuJointCommandPayload<N>` (typed
-  torque/force per joint kind), with bridges declaring at compile time which
-  command levels they consume.
+- **Effort/torque commands (landed in `v0.3.0`).** `CuJointCommandPayload<N>`
+  carries position, velocity, and effort modes, with typed torque/force per
+  joint kind. `CuControllerTask<N>` computes PD effort; bridges apply raw
+  torque/force. Position-mode velocity feedforward landed with it.
 - **Gripper and digital IO.** Standard payloads and bridge channels for a
   gripper (position/force) and digital inputs/outputs, so end-effector
   hardware rides the same graph as the arm.

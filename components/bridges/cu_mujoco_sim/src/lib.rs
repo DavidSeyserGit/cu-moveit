@@ -85,6 +85,7 @@ use bincode::enc::Encoder;
 use bincode::error::DecodeError;
 use bincode::error::EncodeError;
 use cu_controller::CuJointCommandPayload;
+use cu_controller::CuJointEffort;
 use cu_controller::CuJointStatePayload;
 use cu_kinematics::CuJointPosition;
 use cu_kinematics::CuJointVelocity;
@@ -195,8 +196,12 @@ impl CuMujocoSimBridge {
 /// the Copper side.
 pub fn encode_command_line(payload: &CuJointCommandPayload<MUJOCO_DOF>) -> String {
     let q: [f64; MUJOCO_DOF] = payload.positions.map(CuJointPosition::si_value);
-    let mut line = serde_json::to_string(&serde_json::json!({"type": "command", "q": q}))
-        .expect("command line is JSON-serializable");
+    let qd: [f64; MUJOCO_DOF] = payload.velocities.map(CuJointVelocity::si_value);
+    let effort: [f64; MUJOCO_DOF] = payload.efforts.map(CuJointEffort::si_value);
+    let mut line = serde_json::to_string(
+        &serde_json::json!({"type": "command", "q": q, "qd": qd, "effort": effort, "mode": payload.mode}),
+    )
+    .expect("command line is JSON-serializable");
     line.push('\n');
     line
 }
@@ -399,6 +404,7 @@ impl CuBridge for CuMujocoSimBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cu_controller::CuControllerMode;
     use std::net::TcpListener;
     use std::sync::mpsc::channel;
     use std::thread::spawn;
@@ -421,6 +427,34 @@ mod tests {
         for (got, want) in q.iter().zip([0.0, 0.5, -1.0, 1.5, -0.25, 3.0]) {
             assert!((got.as_f64().unwrap() - want).abs() < 1e-12);
         }
+        // Default command is position mode with zero velocity/effort.
+        assert_eq!(value.get("mode").and_then(|m| m.as_str()), Some("position"));
+        assert_eq!(
+            value.get("qd").and_then(|v| v.as_array()).unwrap().len(),
+            MUJOCO_DOF
+        );
+        assert_eq!(
+            value
+                .get("effort")
+                .and_then(|v| v.as_array())
+                .unwrap()
+                .len(),
+            MUJOCO_DOF
+        );
+    }
+
+    #[test]
+    fn test_encode_command_line_carries_effort_mode() {
+        let mut payload = test_command([0.0; MUJOCO_DOF]);
+        payload.mode = CuControllerMode::Effort;
+        payload.efforts = [CuJointEffort::Revolute(cu29::units::si::f64::Torque::new::<
+            cu29::units::si::torque::newton_meter,
+        >(2.5)); MUJOCO_DOF];
+        let line = encode_command_line(&payload);
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value.get("mode").and_then(|m| m.as_str()), Some("effort"));
+        let effort = value.get("effort").and_then(|v| v.as_array()).unwrap();
+        assert!((effort[0].as_f64().unwrap() - 2.5).abs() < 1e-12);
     }
 
     #[test]

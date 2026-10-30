@@ -34,8 +34,65 @@ use cu_kinematics::CuJointVelocity;
 use cu_trajectory::CuFollowStatus;
 use cu_trajectory::CuTrajectoryFollowOutput;
 use cu29::prelude::*;
+use cu29::units::si::f64::{Force, Torque};
+use cu29::units::si::force::newton;
+use cu29::units::si::torque::newton_meter;
 use serde::Deserialize;
 use serde::Serialize;
+
+mod serde_arrays;
+
+/// Command level a bridge is asked to apply.
+#[derive(
+    Default, Debug, Clone, Copy, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CuControllerMode {
+    /// Position setpoints; the bridge closes the servo loop (with velocity
+    /// feedforward from the command velocities).
+    #[default]
+    Position,
+    /// Velocity setpoints; the bridge servo drives the commanded joint
+    /// velocities (positions ride along as a drift reference).
+    Velocity,
+    /// Effort setpoints computed by the controller's own PD law; the bridge
+    /// applies them as raw torque/force (plus its own gravity compensation).
+    Effort,
+}
+
+/// A joint effort carries the physical unit of its joint (torque or force).
+#[derive(Debug, Clone, Copy, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect)]
+#[serde(rename_all = "snake_case")]
+pub enum CuJointEffort {
+    Revolute(Torque),
+    Prismatic(Force),
+    Fixed,
+}
+
+impl Default for CuJointEffort {
+    fn default() -> Self {
+        Self::Revolute(Torque::default())
+    }
+}
+
+impl CuJointEffort {
+    /// Builds an effort matching the kind of the given joint coordinate.
+    pub fn from_position(position: CuJointPosition, value: f64) -> Self {
+        match position {
+            CuJointPosition::Revolute(_) => Self::Revolute(Torque::new::<newton_meter>(value)),
+            CuJointPosition::Prismatic(_) => Self::Prismatic(Force::new::<newton>(value)),
+            CuJointPosition::Fixed => Self::Fixed,
+        }
+    }
+    #[doc(hidden)]
+    pub fn si_value(self) -> f64 {
+        match self {
+            Self::Revolute(v) => v.get::<newton_meter>(),
+            Self::Prismatic(v) => v.get::<newton>(),
+            Self::Fixed => 0.0,
+        }
+    }
+}
 
 /// Controller status carried by [`CuJointCommandPayload`].
 #[derive(
@@ -85,6 +142,11 @@ pub struct CuJointCommandPayload<const N: usize> {
     pub status: CuControllerStatus,
     /// Largest absolute joint error (setpoint − measured) seen this cycle.
     pub max_tracking_error: CuJointPosition,
+    /// Command level the bridge is asked to apply.
+    pub mode: CuControllerMode,
+    /// Effort setpoints (only meaningful when `mode` is `Effort`).
+    #[serde(with = "crate::serde_arrays::effort_array")]
+    pub efforts: [CuJointEffort; N],
 }
 
 impl<const N: usize> Default for CuJointCommandPayload<N> {
@@ -94,6 +156,8 @@ impl<const N: usize> Default for CuJointCommandPayload<N> {
             velocities: [CuJointVelocity::default(); N],
             status: CuControllerStatus::default(),
             max_tracking_error: CuJointPosition::default(),
+            mode: CuControllerMode::default(),
+            efforts: [CuJointEffort::default(); N],
         }
     }
 }
@@ -108,10 +172,20 @@ impl<const N: usize> Default for CuJointCommandPayload<N> {
 /// - `tracking_error_limit_rad` (`f64`, default `0.5`): max allowed absolute
 ///   joint error in radians before the controller faults and holds the
 ///   measured state.
+/// - `mode` (`CuControllerMode`, default `position`): command level —
+///   `position`, `velocity`, or `effort`.
+/// - `effort_kp` / `effort_kv` (`f64`, defaults `20.0` / `0.8`): PD gains
+///   for effort mode, per joint kind (N m/rad resp. N/m proportional).
+///   In effort mode, hold/fault paths apply a damping brake
+///   (`-effort_kv * measured velocity`); with no measured state the effort
+///   is zero and the bridge's gravity compensation is all that holds the arm.
 #[derive(Reflect)]
 #[reflect(no_field_bounds, from_reflect = false, type_path = false)]
 pub struct CuControllerTask<const N: usize> {
     tracking_error_limit_rad: f64,
+    mode: CuControllerMode,
+    effort_kp: f64,
+    effort_kv: f64,
     #[reflect(ignore)]
     last_command: [CuJointPosition; N],
     #[reflect(ignore)]
@@ -124,9 +198,32 @@ impl<const N: usize> CuControllerTask<N> {
     pub fn new_with_limit(tracking_error_limit_rad: f64) -> Self {
         Self {
             tracking_error_limit_rad,
+            mode: CuControllerMode::default(),
+            effort_kp: 20.0,
+            effort_kv: 0.8,
             last_command: [CuJointPosition::default(); N],
             last_status: CuControllerStatus::Idle,
             has_command: false,
+        }
+    }
+
+    /// Sets the command level (takes effect on the next cycle).
+    pub fn set_mode(&mut self, mode: CuControllerMode) {
+        self.mode = mode;
+    }
+
+    /// Returns the active command level.
+    pub fn mode(&self) -> CuControllerMode {
+        self.mode
+    }
+
+    /// Sets the effort-mode PD gains (proportional, derivative). Units are
+    /// per joint kind: N m/rad and N m s/rad for revolute joints, N/m and
+    /// N s/m for prismatic joints. Non-finite or negative values are ignored.
+    pub fn set_effort_gains(&mut self, kp: f64, kv: f64) {
+        if kp.is_finite() && kp >= 0.0 && kv.is_finite() && kv >= 0.0 {
+            self.effort_kp = kp;
+            self.effort_kv = kv;
         }
     }
 }
@@ -140,6 +237,9 @@ impl<const N: usize> Default for CuControllerTask<N> {
 impl<const N: usize> Freezable for CuControllerTask<N> {
     fn freeze<E: Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {
         Encode::encode(&self.tracking_error_limit_rad, encoder)?;
+        Encode::encode(&self.mode, encoder)?;
+        Encode::encode(&self.effort_kp, encoder)?;
+        Encode::encode(&self.effort_kv, encoder)?;
         Encode::encode(&self.last_command, encoder)?;
         Encode::encode(&self.last_status, encoder)?;
         Encode::encode(&self.has_command, encoder)
@@ -147,6 +247,9 @@ impl<const N: usize> Freezable for CuControllerTask<N> {
 
     fn thaw<D: Decoder>(&mut self, decoder: &mut D) -> Result<(), DecodeError> {
         self.tracking_error_limit_rad = Decode::decode(decoder)?;
+        self.mode = Decode::decode(decoder)?;
+        self.effort_kp = Decode::decode(decoder)?;
+        self.effort_kv = Decode::decode(decoder)?;
         self.last_command = Decode::decode(decoder)?;
         self.last_status = Decode::decode(decoder)?;
         self.has_command = Decode::decode(decoder)?;
@@ -172,7 +275,28 @@ impl<const N: usize> CuTask for CuControllerTask<N> {
                 "cu-controller: 'tracking_error_limit_rad' must be positive and finite",
             ));
         }
-        Ok(Self::new_with_limit(limit))
+        let mut task = Self::new_with_limit(limit);
+        if let Some(cfg) = cfg {
+            let kp = cfg.get::<f64>("effort_kp")?;
+            let kv = cfg.get::<f64>("effort_kv")?;
+            if kp.is_some_and(|v| !v.is_finite() || v < 0.0)
+                || kv.is_some_and(|v| !v.is_finite() || v < 0.0)
+            {
+                return Err(CuError::from(
+                    "cu-controller: 'effort_kp'/'effort_kv' must be finite and >= 0",
+                ));
+            }
+            task.mode = cfg
+                .get_value::<CuControllerMode>("mode")?
+                .unwrap_or_default();
+            if let Some(kp) = kp {
+                task.effort_kp = kp;
+            }
+            if let Some(kv) = kv {
+                task.effort_kv = kv;
+            }
+        }
+        Ok(task)
     }
 
     fn process<'i, 'o>(
@@ -185,7 +309,10 @@ impl<const N: usize> CuTask for CuControllerTask<N> {
         let state = input.1.payload();
         let setpoint = input.0.payload();
 
-        let mut command = CuJointCommandPayload::<N>::default();
+        let mut command = CuJointCommandPayload::<N> {
+            mode: self.mode,
+            ..Default::default()
+        };
         match (setpoint, state) {
             (None, None) => {
                 command.positions = self.last_command;
@@ -198,6 +325,14 @@ impl<const N: usize> CuTask for CuControllerTask<N> {
             (None, Some(state)) => {
                 command.positions = state.positions;
                 command.status = CuControllerStatus::Idle;
+                if self.mode == CuControllerMode::Effort {
+                    for j in 0..N {
+                        command.efforts[j] = CuJointEffort::from_position(
+                            state.positions[j],
+                            -self.effort_kv * state.velocities[j].si_value(),
+                        );
+                    }
+                }
             }
             (Some(_), None) => {
                 command.positions = self.last_command;
@@ -220,9 +355,30 @@ impl<const N: usize> CuTask for CuControllerTask<N> {
                 {
                     command.positions = state.positions;
                     command.status = CuControllerStatus::Fault;
+                    if self.mode == CuControllerMode::Effort {
+                        // Damping brake: no stiffness towards the setpoint,
+                        // but resist motion instead of going limp.
+                        for j in 0..N {
+                            command.efforts[j] = CuJointEffort::from_position(
+                                state.positions[j],
+                                -self.effort_kv * state.velocities[j].si_value(),
+                            );
+                        }
+                    }
                 } else {
                     command.positions = setpoint.positions;
                     command.velocities = setpoint.velocities;
+                    if self.mode == CuControllerMode::Effort {
+                        for j in 0..N {
+                            let pos_err =
+                                setpoint.positions[j].si_value() - state.positions[j].si_value();
+                            let vel_err =
+                                setpoint.velocities[j].si_value() - state.velocities[j].si_value();
+                            let effort = self.effort_kp * pos_err + self.effort_kv * vel_err;
+                            command.efforts[j] =
+                                CuJointEffort::from_position(setpoint.positions[j], effort);
+                        }
+                    }
                     command.status = match setpoint.status {
                         CuFollowStatus::Running => CuControllerStatus::Running,
                         CuFollowStatus::Finished => CuControllerStatus::Holding,
@@ -327,6 +483,49 @@ mod tests {
         let mut task = CuControllerTask::<2>::default();
         let out = run(&mut task, Some(follow(0.4, CuFollowStatus::Running)), None);
         assert_eq!(out.status, CuControllerStatus::Fault);
+    }
+
+    #[test]
+    fn test_effort_mode_computes_pd_effort() {
+        let mut task = CuControllerTask::<2>::new_with_limit(0.5);
+        task.set_mode(CuControllerMode::Effort);
+        task.set_effort_gains(10.0, 2.0);
+        let out = run(
+            &mut task,
+            Some(follow(0.5, CuFollowStatus::Running)),
+            Some(state(0.0)),
+        );
+        assert_eq!(out.mode, CuControllerMode::Effort);
+        assert_eq!(out.status, CuControllerStatus::Running);
+        // tau = 10 * (0.5 - 0) + 2 * (0.1 - 0) = 5.2 N m
+        assert!((out.efforts[0].si_value() - 5.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_effort_fault_outputs_zero_effort() {
+        let mut task = CuControllerTask::<2>::new_with_limit(0.1);
+        task.set_mode(CuControllerMode::Effort);
+        let out = run(
+            &mut task,
+            Some(follow(1.0, CuFollowStatus::Running)),
+            Some(state(0.0)),
+        );
+        assert_eq!(out.status, CuControllerStatus::Fault);
+        assert_eq!(out.efforts[0].si_value(), 0.0);
+    }
+
+    #[test]
+    fn test_velocity_mode_tags_command() {
+        let mut task = CuControllerTask::<2>::new_with_limit(0.5);
+        task.set_mode(CuControllerMode::Velocity);
+        let out = run(
+            &mut task,
+            Some(follow(0.4, CuFollowStatus::Running)),
+            Some(state(0.35)),
+        );
+        assert_eq!(out.mode, CuControllerMode::Velocity);
+        assert_eq!(out.status, CuControllerStatus::Running);
+        assert_eq!(out.efforts[0].si_value(), 0.0);
     }
 
     #[test]
