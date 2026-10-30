@@ -150,3 +150,17 @@ execution curve still needs a separate collision and zone recheck. Checks are di
 resolution; they are not swept-volume collision guarantees. The zone radius is a
 TCP-position tolerance, not a separate orientation tolerance or an exact
 reproduction of a vendor controller's zone algorithm.
+
+## Planning scene snapshots
+
+`CuPlanningScene<O, A>` stores fixed-capacity obstacle and attached-shape
+geometry with stable object IDs and a scene revision. The collision-check task
+accepts joint positions and a scene snapshot. RRT* currently retains its
+obstacle-world input; capturing scene snapshots per planning job and echoing
+scene revisions in results is the next integration step.
+
+Attached shapes use link-local geometry and zero-based FK frame indices.
+Attached-object exclusions are not yet configurable through the scene, so
+contact with a mounting link counts as collision. Segment checks are discrete.
+Scene validation at deserialization boundaries and revision exhaustion handling
+remain work in progress; scene integration is not yet a completed phase-2 API.

@@ -28,7 +28,10 @@ in that order.
   state import into fixed-size kinematic and collision models.
 - `cu-joint-rrt-star`: joint-space `CuAnytimeTask` RRT* with deterministic
   `CuRng` seeding, informed pruning, rewiring, and shortcutting.
-- All four crates pass `just pr-check` and are published at
+- `cu-trajectory`: fixed-capacity trajectory payloads, profile timing, per-waypoint
+  Cartesian TCP zones, C² spline geometry, quintic interpolation, and S-curve
+  joint jerk bounds; follower preemption and empty-trajectory cancellation.
+- All five crates pass `just pr-check` and are published at
   https://github.com/DavidSeyserGit/cu-moveit.
 
 ## Approach
@@ -43,21 +46,38 @@ tasks, deterministic replay-compatible behaviour.
 
 ## Steps
 
-1. **Trajectory generation and execution (next).** Time-parameterization of
-   geometric paths under velocity/acceleration/jerk limits (TOPP-style) into
-   fixed-capacity trajectory payloads; `CuFollowTrajectoryTask<N>` with
-   interpolation, progress/failure reporting, preemption, and abort; execution
-   monitoring against the collision model. A local-only demonstration (in the
-   git-excluded `playground/`, never committed) proves URDF → RRT* → timed
-   trajectory → simulated execution end-to-end.
-2. **Planning completeness.** Versioned, fixed-capacity planning-scene API
-   (attached objects, obstacle add/remove) shared by collision and planner
-   tasks; Cartesian paths and pose-goal planning on the existing IK; added
-   planners (e.g. PRM/BIT*-class) only where seeded benchmark results justify
-   them; deterministic benchmark harness (success rate, path cost, time).
+1. **Trajectory generation and simulated execution (implemented; closeout pending).**
+   Fixed-capacity trajectory payloads, profile timing, per-waypoint Cartesian
+   TCP-zone blending, and `CuFollowTrajectoryTask<N>` interpolation, status,
+   preemption, and cancellation are implemented. Cartesian S-curve joint jerk
+   bounds require quintic execution. The git-excluded `playground/` demonstrates
+   local planning, timing, and simulated playback. Closeout reviews the public
+   API, packaging, and cancellation semantics against the Validation Plan.
+   Collision monitoring and collision-triggered abort during execution are
+   deferred to Step 3; they do not block Step 1.
+2. **Planning completeness (next).** Build in this order:
+   - A versioned, fixed-capacity planning scene shared by collision checking and
+     planner tasks: stable object IDs, obstacle add/update/remove, attached
+     objects with link-relative transforms, and explicit collision exclusions.
+   - Consistent scene snapshots for each planning request, with scene revisions
+     carried into results and deterministic restart/invalidation when the scene
+     changes during anytime planning.
+   - Pose-goal planning using the existing IK and joint-space RRT*, with explicit
+     no-IK-solution, invalid-start/goal, capacity, and planning-failure outcomes.
+   - Integrate existing Cartesian paths and TCP zones with the same scene and
+     request/result contracts. Recheck the reconstructed execution curve for
+     joint limits, collisions, and zone containment before accepting a plan.
+   - A seeded benchmark harness reporting success rate, geometric path cost,
+     planning effort, and elapsed time. Add planners such as PRM/BIT* only where
+     measured results justify them.
+   Completion requires a local demonstration that updates obstacles, attaches
+   an object, and plans joint, pose-goal, and Cartesian requests consistently
+   against the selected scene revision, plus the Validation Plan checks.
 3. **Real-time servoing.** Harden `CuServoTask<N>` into a production servo
    loop: rate limiting, watchdog timeouts, singularity/limit behaviour under
-   load, latency/allocation budgets enforced by tests.
+   load, latency/allocation budgets enforced by tests. Add execution collision
+   monitoring and collision-triggered abort with defined stop/hold reporting;
+   distinguish geometric validation before execution from monitoring during it.
 4. **Robot bridges.** Define a generic `CuBridge` joint command/state contract
    so execution stays robot-agnostic; prove it with `cu-igus-cri` for the igus
    ReBeL CRI protocol (`192.168.3.11:3920`); hardware-in-the-loop example plans
@@ -113,9 +133,9 @@ Passing tests alone does not close a phase.
 
 ## Risks / Open Questions
 
-- Highest risk: Step 1 execution semantics (preemption, abort, monitoring)
-  fixing trajectory payload shapes that later steps must live with; validate
-  with the end-to-end example before freezing them.
+- Highest risk: scene revision and invalidation semantics across anytime planning
+  and later execution monitoring. Define ownership and stale-result handling
+  before freezing the scene/request/result contracts.
 - Undecided: additional robot presets beyond the igus ReBeL (added only when a
   bridge or user needs one); the second bridge target after `cu-igus-cri`
   (decided by hardware access); whether benchmark results ship as a report

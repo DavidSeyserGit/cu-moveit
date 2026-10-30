@@ -22,6 +22,8 @@ extern crate alloc;
 
 pub mod model;
 pub mod robots;
+pub mod scene;
+pub mod scene_query;
 pub mod serde_arrays;
 pub mod shapes;
 pub mod task;
@@ -32,6 +34,12 @@ pub use model::CuCollisionWorld;
 pub use model::CuContactKind;
 pub use model::CuRobotCollisionModel;
 pub use robots::igus_rebel_collision_model;
+pub use scene::CuAttachedShape;
+pub use scene::CuObjectId;
+pub use scene::CuPlanningScene;
+pub use scene::CuSceneError;
+pub use scene::CuSceneObstacle;
+pub use scene::CuSceneRevision;
 pub use shapes::CuCapsule;
 pub use shapes::CuCollisionShape;
 pub use shapes::CuSphere;
@@ -53,6 +61,7 @@ mod tests {
     use crate::CuCollisionShape;
     use crate::CuCollisionWorld;
     use crate::CuContactKind;
+    use crate::CuPlanningScene;
     use crate::CuRobotCollisionModel;
     use crate::CuSphere;
     use crate::capsule_capsule_signed_distance;
@@ -192,7 +201,7 @@ mod tests {
     #[test]
     fn test_collision_check_task() {
         let (ctx, _mock) = CuContext::new_mock_clock();
-        let mut task = CuCollisionCheckTask::<6, 8, 8>::new_with_model(
+        let mut task = CuCollisionCheckTask::<6, 8, 8, 8>::new_with_model(
             igus_rebel_chain(),
             igus_rebel_collision_model(),
         );
@@ -200,10 +209,10 @@ mod tests {
         let joints_msg = CuMsg::new(Some(CuJointPositionsPayload {
             positions: [Angle64::new::<radian>(0.0).into(); 6],
         }));
-        let world_msg = CuMsg::new(Some(CuCollisionWorld::<8>::new()));
+        let scene_msg = CuMsg::new(Some(CuPlanningScene::<8, 8>::new()));
         let mut out_msg = CuMsg::new(None);
 
-        task.process(&ctx, &(&joints_msg, &world_msg), &mut out_msg)
+        task.process(&ctx, &(&joints_msg, &scene_msg), &mut out_msg)
             .unwrap();
         let report = out_msg.payload().unwrap();
         assert!(report.is_collision_free());
