@@ -23,6 +23,7 @@ extern crate alloc;
 pub mod model;
 pub mod robots;
 pub mod scene;
+pub mod scene_exclusions;
 pub mod scene_query;
 pub mod serde_arrays;
 pub mod shapes;
@@ -40,6 +41,10 @@ pub use scene::CuPlanningScene;
 pub use scene::CuSceneError;
 pub use scene::CuSceneObstacle;
 pub use scene::CuSceneRevision;
+pub use scene_exclusions::CuSceneExclusion;
+pub use scene_exclusions::CuSceneExclusionPartner;
+pub use scene_exclusions::CuSceneExclusions;
+pub use scene_exclusions::DEFAULT_MAX_SCENE_EXCLUSIONS;
 pub use shapes::CuCapsule;
 pub use shapes::CuCollisionShape;
 pub use shapes::CuSphere;
@@ -63,6 +68,7 @@ mod tests {
     use crate::CuContactKind;
     use crate::CuPlanningScene;
     use crate::CuRobotCollisionModel;
+    use crate::CuSceneExclusions;
     use crate::CuSphere;
     use crate::capsule_capsule_signed_distance;
     use crate::capsule_sphere_signed_distance;
@@ -210,10 +216,15 @@ mod tests {
             positions: [Angle64::new::<radian>(0.0).into(); 6],
         }));
         let scene_msg = CuMsg::new(Some(CuPlanningScene::<8, 8>::new()));
+        let exclusions_msg = CuMsg::new(Some(CuSceneExclusions::new()));
         let mut out_msg = CuMsg::new(None);
 
-        task.process(&ctx, &(&joints_msg, &scene_msg), &mut out_msg)
-            .unwrap();
+        task.process(
+            &ctx,
+            &(&joints_msg, &scene_msg, &exclusions_msg),
+            &mut out_msg,
+        )
+        .unwrap();
         let report = out_msg.payload().unwrap();
         assert!(report.is_collision_free());
     }

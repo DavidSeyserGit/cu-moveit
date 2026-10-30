@@ -15,6 +15,9 @@
 //! or corner and the next follows the selected profile from one boundary speed
 //! to the other. Joint velocity and acceleration bounds follow from analytic
 //! derivative bounds of `q(s)` and of the path-speed profile; S-curve joint jerk is bounded on the executed quintic reconstruction.
+//! Every profile is finally certified on the reconstruction its follower executes — quintic
+//! Hermite for the S-curve, cubic Hermite for the others — and stretched uniformly when a peak
+//! exceeds a limit.
 
 use crate::CuTrajectoryPayload;
 use crate::CuTrajectoryPoint;
@@ -24,9 +27,10 @@ use crate::parameterize::CuJointTrajectoryLimits;
 use crate::parameterize::CuTrajectoryProfile;
 use crate::parameterize::cubic_eval;
 use crate::parameterize::quintic_eval;
+use crate::quintic::cubic_limit_ratio;
+use crate::quintic::polynomial_extrema;
 use crate::quintic::quintic_limit_ratio;
 use crate::quintic::stretch_time;
-use crate::quintic::unit_roots;
 use bincode::Decode;
 use bincode::Encode;
 use cu_collision::CuCollisionWorld;
@@ -89,8 +93,9 @@ pub struct CuPathTimingConfig<const N: usize> {
 /// is rechecked for collisions and zone containment with discrete
 /// samples, not swept-volume continuous collision detection. This check does
 /// not certify the reconstructed execution curve against geometry. Execute the
-/// S-curve result with `sample_quintic` (or a quintic follower) to preserve
-/// its validated position, velocity and acceleration. All scratch storage is const-sized.
+/// S-curve result with `sample_quintic` (or a quintic follower) and the other
+/// profiles with `sample_cubic` (or the cubic follower) to preserve their
+/// validated position, velocity and acceleration. All scratch storage is const-sized.
 pub fn parameterize_cartesian_path<
     const N: usize,
     const M: usize,
@@ -575,19 +580,23 @@ fn time_path<const N: usize, const M: usize, const O: usize, const CAP: usize, c
         elapsed += duration;
     }
 
-    // The follower executes the quintic Hermite motion through these knots,
-    // so the limits are checked on exactly that motion. Stretching time by
-    // the worst ratio of peak to limit makes every peak fit: velocity,
-    // acceleration and jerk scale by 1/k, 1/k^2 and 1/k^3, keeping the shape.
-    if scurve {
-        match quintic_limit_ratio(out, limits) {
-            Some(ratio) if ratio.is_finite() => {
-                if ratio > 1.0 {
-                    stretch_time(out, ratio * (1.0 + 1e-9))?;
-                }
+    // The follower executes a Hermite motion through these knots — quintic
+    // for the S-curve, cubic for the others — so the limits are checked on
+    // exactly that reconstruction. Stretching time by the worst ratio of peak
+    // to limit makes every peak fit: velocity, acceleration and jerk scale by
+    // 1/k, 1/k^2 and 1/k^3, keeping the shape.
+    let ratio = if scurve {
+        quintic_limit_ratio(out, limits)
+    } else {
+        cubic_limit_ratio(out, limits)
+    };
+    match ratio {
+        Some(ratio) if ratio.is_finite() => {
+            if ratio > 1.0 {
+                stretch_time(out, ratio * (1.0 + 1e-9))?;
             }
-            _ => return Ok(CuPathTimingStatus::InvalidInput),
         }
+        _ => return Ok(CuPathTimingStatus::InvalidInput),
     }
     Ok(CuPathTimingStatus::Success)
 }
@@ -1128,51 +1137,6 @@ fn plan_polynomial(
         }
     }
     Some(hi)
-}
-
-/// Exact `(max speed, min speed, max |acceleration|)` of a Hermite move.
-///
-/// Cubic speed is quadratic (vertex) and acceleration linear (ends). Quintic
-/// (zero end accelerations) acceleration is `u·(6a3 + 12a4·u + 20a5·u^2)/T^2`
-/// and jerk quadratic, so all critical points are quadratic roots.
-fn polynomial_extrema(quintic: bool, length: f64, v0: f64, v1: f64, t: f64) -> (f64, f64, f64) {
-    let mut high = v0.max(v1);
-    let mut low = v0.min(v1);
-    let mut acc = 0.0_f64;
-    if quintic {
-        let start = length - v0 * t;
-        let end = (v1 - v0) * t;
-        let a3 = 10.0 * start - 4.0 * end;
-        let a4 = -15.0 * start + 7.0 * end;
-        let a5 = 6.0 * start - 3.0 * end;
-        let speed =
-            |u: f64| v0 + (3.0 * a3 * u * u + 4.0 * a4 * u * u * u + 5.0 * a5 * u * u * u * u) / t;
-        let accel = |u: f64| (6.0 * a3 * u + 12.0 * a4 * u * u + 20.0 * a5 * u * u * u) / (t * t);
-        for u in unit_roots(20.0 * a5, 12.0 * a4, 6.0 * a3)
-            .into_iter()
-            .flatten()
-        {
-            high = high.max(speed(u));
-            low = low.min(speed(u));
-        }
-        for u in unit_roots(60.0 * a5, 24.0 * a4, 6.0 * a3)
-            .into_iter()
-            .flatten()
-        {
-            acc = acc.max(libm::fabs(accel(u)));
-        }
-    } else {
-        let a = v0 * t;
-        let b = 3.0 * length - 2.0 * a - v1 * t;
-        let c = -2.0 * length + a + v1 * t;
-        if let Some(u) = unit_roots(0.0, 6.0 * c, 2.0 * b)[0] {
-            let speed = (a + u * (2.0 * b + 3.0 * c * u)) / t;
-            high = high.max(speed);
-            low = low.min(speed);
-        }
-        acc = libm::fabs(2.0 * b).max(libm::fabs(2.0 * b + 6.0 * c)) / (t * t);
-    }
-    (high, low, acc)
 }
 
 #[cfg(test)]

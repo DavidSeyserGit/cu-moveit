@@ -6,8 +6,9 @@
 //!
 //! All storage is pre-allocated with compile-time const capacities (`MAX_OBSTACLES`, `MAX_ATTACHED`),
 //! strictly allocation-free on the execution path, and versioned via monotonic [`CuSceneRevision`].
-//! Mutations are transactional: failed operations (capacity overflow, missing ID, invalid links)
-//! leave state unchanged, while successful modifications advance the scene revision.
+//! Mutations are transactional: failed operations (capacity overflow, missing ID, invalid links,
+//! invalid geometry, or revision exhaustion) leave state unchanged, while successful modifications
+//! advance the scene revision without wrapping.
 
 use crate::model::CuCollisionWorld;
 use crate::shapes::CuCollisionShape;
@@ -16,6 +17,7 @@ use bincode::Decode;
 use bincode::Encode;
 use cu_spatial_payloads::Transform3D;
 use cu29::prelude::*;
+use cu29::units::si::length::meter;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -24,6 +26,53 @@ pub const DEFAULT_MAX_SCENE_OBSTACLES: usize = 32;
 
 /// Default capacity for attached collision shapes in [`CuPlanningScene`].
 pub const DEFAULT_MAX_ATTACHED_SHAPES: usize = 8;
+
+/// Returns `true` if `shape` contains strictly finite coordinates and non-negative finite radius.
+fn is_valid_shape(shape: &CuCollisionShape) -> bool {
+    match shape {
+        CuCollisionShape::Sphere(sph) => {
+            let c0 = sph.center[0].get::<meter>();
+            let c1 = sph.center[1].get::<meter>();
+            let c2 = sph.center[2].get::<meter>();
+            let r = sph.radius.get::<meter>();
+            c0.is_finite() && c1.is_finite() && c2.is_finite() && r.is_finite() && r >= 0.0
+        }
+        CuCollisionShape::Capsule(cap) => {
+            let a0 = cap.a[0].get::<meter>();
+            let a1 = cap.a[1].get::<meter>();
+            let a2 = cap.a[2].get::<meter>();
+            let b0 = cap.b[0].get::<meter>();
+            let b1 = cap.b[1].get::<meter>();
+            let b2 = cap.b[2].get::<meter>();
+            let r = cap.radius.get::<meter>();
+            a0.is_finite()
+                && a1.is_finite()
+                && a2.is_finite()
+                && b0.is_finite()
+                && b1.is_finite()
+                && b2.is_finite()
+                && r.is_finite()
+                && r >= 0.0
+        }
+    }
+}
+
+/// Returns `true` if `frame` has strictly finite 4x4 matrix components.
+fn is_finite_transform(frame: &Transform3D<f64>) -> bool {
+    let mat = frame.to_matrix();
+    let mut r = 0;
+    while r < 4 {
+        let mut c = 0;
+        while c < 4 {
+            if !mat[r][c].is_finite() {
+                return false;
+            }
+            c += 1;
+        }
+        r += 1;
+    }
+    true
+}
 
 /// Strongly typed, stable object identifier for obstacles and attached shapes in a planning scene.
 #[derive(
@@ -58,9 +107,9 @@ impl CuObjectId {
         self.0
     }
 
-    /// Returns `true` if this identifier is non-zero and valid.
+    /// Returns `true` if this identifier is non-zero, not reserved, and valid.
     pub const fn is_valid(self) -> bool {
-        self.0 != 0
+        self.0 != 0 && self.0 < u32::MAX
     }
 }
 
@@ -103,10 +152,19 @@ impl CuSceneRevision {
         self.0
     }
 
-    /// Returns the next revision in sequence.
+    /// Returns the next revision in sequence, or `None` if the counter has reached maximum.
+    #[must_use]
+    pub const fn checked_next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(v) => Some(Self(v)),
+            None => None,
+        }
+    }
+
+    /// Returns the next revision in sequence, saturating at [`u64::MAX`] to avoid wrapping.
     #[must_use]
     pub const fn next(self) -> Self {
-        Self(self.0.wrapping_add(1))
+        Self(self.0.saturating_add(1))
     }
 }
 
@@ -133,6 +191,10 @@ pub enum CuSceneError {
     InvalidLinkIndex { link_index: usize, max_links: usize },
     /// Target destination capacity is too small to receive the exported data.
     OutputCapacityExceeded,
+    /// Scene revision counter has reached maximum value and cannot advance.
+    RevisionExhausted,
+    /// Collision shape contains invalid or non-finite geometry.
+    InvalidGeometry,
 }
 
 impl core::fmt::Display for CuSceneError {
@@ -165,6 +227,15 @@ impl core::fmt::Display for CuSceneError {
             Self::OutputCapacityExceeded => {
                 write!(f, "target output buffer capacity exceeded")
             }
+            Self::RevisionExhausted => {
+                write!(f, "planning scene revision counter exhausted")
+            }
+            Self::InvalidGeometry => {
+                write!(
+                    f,
+                    "planning scene collision shape contains invalid or non-finite geometry"
+                )
+            }
         }
     }
 }
@@ -193,6 +264,12 @@ impl From<CuSceneError> for CuError {
             CuSceneError::OutputCapacityExceeded => {
                 CuError::from("cu_collision: target output buffer capacity exceeded")
             }
+            CuSceneError::RevisionExhausted => {
+                CuError::from("cu_collision: planning scene revision exhausted")
+            }
+            CuSceneError::InvalidGeometry => {
+                CuError::from("cu_collision: invalid or non-finite collision shape geometry")
+            }
         }
     }
 }
@@ -212,6 +289,17 @@ impl CuSceneObstacle {
     /// Creates a new scene obstacle with the specified ID and collision shape.
     pub const fn new(id: CuObjectId, shape: CuCollisionShape) -> Self {
         Self { id, shape }
+    }
+
+    /// Creates a new scene obstacle, validating ID and geometry.
+    pub fn try_new(id: CuObjectId, shape: CuCollisionShape) -> CuResult<Self> {
+        if !id.is_valid() {
+            return Err(CuSceneError::InvalidObjectId(id).into());
+        }
+        if !is_valid_shape(&shape) {
+            return Err(CuSceneError::InvalidGeometry.into());
+        }
+        Ok(Self { id, shape })
     }
 }
 
@@ -238,6 +326,21 @@ impl CuAttachedShape {
         }
     }
 
+    /// Creates a new attached shape, validating ID and geometry.
+    pub fn try_new(id: CuObjectId, link_index: usize, shape: CuCollisionShape) -> CuResult<Self> {
+        if !id.is_valid() {
+            return Err(CuSceneError::InvalidObjectId(id).into());
+        }
+        if !is_valid_shape(&shape) {
+            return Err(CuSceneError::InvalidGeometry.into());
+        }
+        Ok(Self {
+            id,
+            link_index,
+            shape,
+        })
+    }
+
     /// Creates an attached shape by applying a link-relative transform to an input shape in place.
     pub fn new_with_transform(
         id: CuObjectId,
@@ -252,6 +355,34 @@ impl CuAttachedShape {
             link_index,
             shape: local_shape,
         }
+    }
+
+    /// Creates an attached shape by applying a link-relative transform, validating ID, frame, and geometry.
+    pub fn try_new_with_transform(
+        id: CuObjectId,
+        link_index: usize,
+        shape: &CuCollisionShape,
+        link_from_shape: &Transform3D<f64>,
+    ) -> CuResult<Self> {
+        if !id.is_valid() {
+            return Err(CuSceneError::InvalidObjectId(id).into());
+        }
+        if !is_valid_shape(shape) {
+            return Err(CuSceneError::InvalidGeometry.into());
+        }
+        if !is_finite_transform(link_from_shape) {
+            return Err(CuSceneError::InvalidGeometry.into());
+        }
+        let mut local_shape = *shape;
+        transform_shape(link_from_shape, shape, &mut local_shape);
+        if !is_valid_shape(&local_shape) {
+            return Err(CuSceneError::InvalidGeometry.into());
+        }
+        Ok(Self {
+            id,
+            link_index,
+            shape: local_shape,
+        })
     }
 }
 
@@ -376,11 +507,23 @@ mod serde_scene_arrays {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct CuPlanningSceneSnapshot<const MAX_OBSTACLES: usize, const MAX_ATTACHED: usize> {
+    revision: CuSceneRevision,
+    next_id: u32,
+    #[serde(with = "serde_scene_arrays::obstacle_array")]
+    obstacles: [CuSceneObstacle; MAX_OBSTACLES],
+    obstacle_count: u32,
+    #[serde(with = "serde_scene_arrays::attached_array")]
+    attached_shapes: [CuAttachedShape; MAX_ATTACHED],
+    attached_count: u32,
+}
+
 /// Fixed-capacity, versioned planning scene storage (`CuMsgPayload`-compliant).
 ///
 /// Holds environment obstacles in world frame and attached shapes in robot link frames.
 /// Every mutation is transactional and increments [`CuSceneRevision`] on success.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Reflect)]
+#[derive(Debug, Clone, PartialEq, Reflect)]
 #[reflect(no_field_bounds, from_reflect = false, type_path = false)]
 pub struct CuPlanningScene<
     const MAX_OBSTACLES: usize = DEFAULT_MAX_SCENE_OBSTACLES,
@@ -388,10 +531,8 @@ pub struct CuPlanningScene<
 > {
     revision: CuSceneRevision,
     next_id: u32,
-    #[serde(with = "serde_scene_arrays::obstacle_array")]
     obstacles: [CuSceneObstacle; MAX_OBSTACLES],
     obstacle_count: u32,
-    #[serde(with = "serde_scene_arrays::attached_array")]
     attached_shapes: [CuAttachedShape; MAX_ATTACHED],
     attached_count: u32,
 }
@@ -404,6 +545,52 @@ impl<const MAX_OBSTACLES: usize, const MAX_ATTACHED: usize> Default
     }
 }
 
+impl<const MAX_OBSTACLES: usize, const MAX_ATTACHED: usize> Serialize
+    for CuPlanningScene<MAX_OBSTACLES, MAX_ATTACHED>
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if let Err(msg) = self.check_invariants() {
+            return Err(serde::ser::Error::custom(msg));
+        }
+        let snapshot = CuPlanningSceneSnapshot {
+            revision: self.revision,
+            next_id: self.next_id,
+            obstacles: self.obstacles,
+            obstacle_count: self.obstacle_count,
+            attached_shapes: self.attached_shapes,
+            attached_count: self.attached_count,
+        };
+        snapshot.serialize(serializer)
+    }
+}
+
+impl<'de, const MAX_OBSTACLES: usize, const MAX_ATTACHED: usize> Deserialize<'de>
+    for CuPlanningScene<MAX_OBSTACLES, MAX_ATTACHED>
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw =
+            CuPlanningSceneSnapshot::<MAX_OBSTACLES, MAX_ATTACHED>::deserialize(deserializer)?;
+        let scene = Self {
+            revision: raw.revision,
+            next_id: raw.next_id,
+            obstacles: raw.obstacles,
+            obstacle_count: raw.obstacle_count,
+            attached_shapes: raw.attached_shapes,
+            attached_count: raw.attached_count,
+        };
+        if let Err(msg) = scene.check_invariants() {
+            return Err(serde::de::Error::custom(msg));
+        }
+        Ok(scene)
+    }
+}
+
 impl<const MAX_OBSTACLES: usize, const MAX_ATTACHED: usize> Encode
     for CuPlanningScene<MAX_OBSTACLES, MAX_ATTACHED>
 {
@@ -411,6 +598,9 @@ impl<const MAX_OBSTACLES: usize, const MAX_ATTACHED: usize> Encode
         &self,
         encoder: &mut E,
     ) -> Result<(), bincode::error::EncodeError> {
+        if let Err(msg) = self.check_invariants() {
+            return Err(bincode::error::EncodeError::Other(msg));
+        }
         Encode::encode(&self.revision, encoder)?;
         Encode::encode(&self.next_id, encoder)?;
         Encode::encode(&self.obstacle_count, encoder)?;
@@ -433,20 +623,20 @@ impl<C, const MAX_OBSTACLES: usize, const MAX_ATTACHED: usize> Decode<C>
         let attached_count: u32 = Decode::decode(decoder)?;
         let attached_shapes = Decode::decode(decoder)?;
 
-        if obstacle_count as usize > MAX_OBSTACLES || attached_count as usize > MAX_ATTACHED {
-            return Err(bincode::error::DecodeError::Other(
-                "Invalid planning scene snapshot: count exceeds capacity",
-            ));
-        }
-
-        Ok(Self {
+        let scene = Self {
             revision,
             next_id,
             obstacles,
             obstacle_count,
             attached_shapes,
             attached_count,
-        })
+        };
+
+        if let Err(msg) = scene.check_invariants() {
+            return Err(bincode::error::DecodeError::Other(msg));
+        }
+
+        Ok(scene)
     }
 }
 
@@ -473,6 +663,138 @@ impl<const MAX_OBSTACLES: usize, const MAX_ATTACHED: usize>
             attached_shapes: [CuAttachedShape::default(); MAX_ATTACHED],
             attached_count: 0,
         }
+    }
+
+    /// Internal invariant checker returning static error string for serialization formats.
+    fn check_invariants(&self) -> Result<(), &'static str> {
+        if self.obstacle_count as usize > MAX_OBSTACLES {
+            return Err("planning scene obstacle count exceeds capacity");
+        }
+        if self.attached_count as usize > MAX_ATTACHED {
+            return Err("planning scene attached shape count exceeds capacity");
+        }
+        if self.next_id == 0 {
+            return Err("planning scene next_id must be non-zero");
+        }
+
+        let obs_count = self.obstacle_count as usize;
+        let att_count = self.attached_count as usize;
+
+        let mut i = 0;
+        while i < obs_count {
+            let obs = &self.obstacles[i];
+            if !obs.id.is_valid() {
+                return Err("active scene obstacle has invalid or zero object id");
+            }
+            if obs.id.as_u32() >= self.next_id {
+                return Err("scene obstacle id is greater than or equal to next_id");
+            }
+            if !is_valid_shape(&obs.shape) {
+                return Err("scene obstacle has invalid or non-finite geometry");
+            }
+            let mut j = i + 1;
+            while j < obs_count {
+                if self.obstacles[j].id == obs.id {
+                    return Err("duplicate object id in scene obstacles");
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+
+        let mut i = 0;
+        while i < att_count {
+            let att = &self.attached_shapes[i];
+            if !att.id.is_valid() {
+                return Err("active attached shape has invalid or zero object id");
+            }
+            if att.id.as_u32() >= self.next_id {
+                return Err("attached shape id is greater than or equal to next_id");
+            }
+            if !is_valid_shape(&att.shape) {
+                return Err("attached shape has invalid or non-finite geometry");
+            }
+            let mut j = i + 1;
+            while j < att_count {
+                if self.attached_shapes[j].id == att.id {
+                    return Err("duplicate object id in attached shapes");
+                }
+                j += 1;
+            }
+            let mut j = 0;
+            while j < obs_count {
+                if self.obstacles[j].id == att.id {
+                    return Err("duplicate object id between obstacle and attached shape");
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+
+        Ok(())
+    }
+
+    /// Validates all structural, identity, and geometric invariants of the planning scene.
+    ///
+    /// Checks that:
+    /// - Active counts do not exceed static capacities.
+    /// - `next_id` is strictly non-zero and greater than all active object IDs.
+    /// - All active obstacles and attached shapes have non-zero, valid IDs.
+    /// - All active object IDs are pairwise unique across obstacles and attached shapes.
+    /// - All active collision primitives contain finite coordinates and non-negative finite radii.
+    pub fn validate_invariants(&self) -> CuResult<()> {
+        let obs_count = self.obstacle_count as usize;
+        if obs_count > MAX_OBSTACLES {
+            return Err(CuSceneError::ObstacleCapacityExceeded.into());
+        }
+        let att_count = self.attached_count as usize;
+        if att_count > MAX_ATTACHED {
+            return Err(CuSceneError::AttachedCapacityExceeded.into());
+        }
+        if self.next_id == 0 {
+            return Err(CuSceneError::InvalidObjectId(CuObjectId::NIL).into());
+        }
+
+        for (i, obs) in self.obstacles[..obs_count].iter().enumerate() {
+            if !obs.id.is_valid() {
+                return Err(CuSceneError::InvalidObjectId(obs.id).into());
+            }
+            if obs.id.as_u32() >= self.next_id {
+                return Err(CuSceneError::InvalidObjectId(obs.id).into());
+            }
+            if !is_valid_shape(&obs.shape) {
+                return Err(CuSceneError::InvalidGeometry.into());
+            }
+            for other in self.obstacles[i + 1..obs_count].iter() {
+                if other.id == obs.id {
+                    return Err(CuSceneError::DuplicateObjectId(obs.id).into());
+                }
+            }
+        }
+
+        for (i, att) in self.attached_shapes[..att_count].iter().enumerate() {
+            if !att.id.is_valid() {
+                return Err(CuSceneError::InvalidObjectId(att.id).into());
+            }
+            if att.id.as_u32() >= self.next_id {
+                return Err(CuSceneError::InvalidObjectId(att.id).into());
+            }
+            if !is_valid_shape(&att.shape) {
+                return Err(CuSceneError::InvalidGeometry.into());
+            }
+            for other in self.attached_shapes[i + 1..att_count].iter() {
+                if other.id == att.id {
+                    return Err(CuSceneError::DuplicateObjectId(att.id).into());
+                }
+            }
+            for obs in self.obstacles[..obs_count].iter() {
+                if obs.id == att.id {
+                    return Err(CuSceneError::DuplicateObjectId(att.id).into());
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Returns the current scene revision.
@@ -507,7 +829,7 @@ impl<const MAX_OBSTACLES: usize, const MAX_ATTACHED: usize>
 
     /// Returns the total number of objects (obstacles and attached shapes) in the scene.
     pub const fn total_object_count(&self) -> usize {
-        (self.obstacle_count + self.attached_count) as usize
+        self.obstacle_count.saturating_add(self.attached_count) as usize
     }
 
     /// Returns `true` if obstacle storage is at capacity.
@@ -527,12 +849,14 @@ impl<const MAX_OBSTACLES: usize, const MAX_ATTACHED: usize>
 
     /// Borrows the active environment obstacles as a slice.
     pub fn obstacles(&self) -> &[CuSceneObstacle] {
-        &self.obstacles[..self.obstacle_count as usize]
+        let count = (self.obstacle_count as usize).min(MAX_OBSTACLES);
+        &self.obstacles[..count]
     }
 
     /// Borrows the active attached shapes as a slice.
     pub fn attached_shapes(&self) -> &[CuAttachedShape] {
-        &self.attached_shapes[..self.attached_count as usize]
+        let count = (self.attached_count as usize).min(MAX_ATTACHED);
+        &self.attached_shapes[..count]
     }
 
     /// Looks up an obstacle shape by its typed object ID.
@@ -549,39 +873,57 @@ impl<const MAX_OBSTACLES: usize, const MAX_ATTACHED: usize>
 
     /// Returns `true` if the specified object identifier is present in the scene.
     pub fn contains(&self, id: CuObjectId) -> bool {
+        if !id.is_valid() {
+            return false;
+        }
         self.find_obstacle_index(id).is_some() || self.find_attached_index(id).is_some()
     }
 
     /// Finds the internal array index of an obstacle by its typed object ID.
     pub fn find_obstacle_index(&self, id: CuObjectId) -> Option<usize> {
-        let count = self.obstacle_count as usize;
+        if !id.is_valid() {
+            return None;
+        }
+        let count = (self.obstacle_count as usize).min(MAX_OBSTACLES);
         (0..count).find(|&i| self.obstacles[i].id == id)
     }
 
     /// Finds the internal array index of an attached shape by its typed object ID.
     pub fn find_attached_index(&self, id: CuObjectId) -> Option<usize> {
-        let count = self.attached_count as usize;
+        if !id.is_valid() {
+            return None;
+        }
+        let count = (self.attached_count as usize).min(MAX_ATTACHED);
         (0..count).find(|&i| self.attached_shapes[i].id == id)
     }
 
     /// Appends a new obstacle to the scene with an automatically generated unique [`CuObjectId`].
     ///
-    /// On success, advances [`CuSceneRevision`]. On capacity failure, state is unmodified.
+    /// On success, advances [`CuSceneRevision`]. On failure (capacity, geometry, or revision exhaustion),
+    /// state is unmodified.
     pub fn add_obstacle(&mut self, shape: CuCollisionShape) -> CuResult<CuObjectId> {
         if self.is_obstacle_full() {
             return Err(CuSceneError::ObstacleCapacityExceeded.into());
         }
+        if !is_valid_shape(&shape) {
+            return Err(CuSceneError::InvalidGeometry.into());
+        }
+        let next_rev = self
+            .revision
+            .checked_next()
+            .ok_or(CuSceneError::RevisionExhausted)?;
         let id = self.alloc_id()?;
         let idx = self.obstacle_count as usize;
         self.obstacles[idx] = CuSceneObstacle::new(id, shape);
         self.obstacle_count += 1;
-        self.revision = self.revision.next();
+        self.revision = next_rev;
         Ok(id)
     }
 
     /// Adds an obstacle with an explicit [`CuObjectId`].
     ///
-    /// Fails if the ID is invalid, already in use, or if capacity is exceeded.
+    /// Fails if the ID is invalid, already in use, geometry is non-finite, capacity is exceeded,
+    /// or revision is exhausted. On failure, state is unmodified.
     pub fn add_obstacle_with_id(
         &mut self,
         id: CuObjectId,
@@ -590,40 +932,73 @@ impl<const MAX_OBSTACLES: usize, const MAX_ATTACHED: usize>
         if !id.is_valid() {
             return Err(CuSceneError::InvalidObjectId(id).into());
         }
+        if !is_valid_shape(&shape) {
+            return Err(CuSceneError::InvalidGeometry.into());
+        }
         if self.is_obstacle_full() {
             return Err(CuSceneError::ObstacleCapacityExceeded.into());
         }
         if self.contains(id) {
             return Err(CuSceneError::DuplicateObjectId(id).into());
         }
+        let next_rev = self
+            .revision
+            .checked_next()
+            .ok_or(CuSceneError::RevisionExhausted)?;
+        let new_next_id = if id.as_u32() >= self.next_id {
+            id.as_u32()
+                .checked_add(1)
+                .ok_or(CuSceneError::InvalidObjectId(id))?
+        } else {
+            self.next_id
+        };
         let idx = self.obstacle_count as usize;
         self.obstacles[idx] = CuSceneObstacle::new(id, shape);
         self.obstacle_count += 1;
-        if id.as_u32() >= self.next_id {
-            self.next_id = id.as_u32().saturating_add(1);
-        }
-        self.revision = self.revision.next();
+        self.next_id = new_next_id;
+        self.revision = next_rev;
         Ok(())
     }
 
     /// Updates the collision geometry of an existing obstacle in place.
     ///
-    /// Fails with [`CuSceneError::ObjectNotFound`] if the obstacle is not present.
+    /// Fails with [`CuSceneError::ObjectNotFound`] if the obstacle is not present,
+    /// [`CuSceneError::InvalidGeometry`] if geometry is invalid, or
+    /// [`CuSceneError::RevisionExhausted`] on revision exhaustion. On failure, state is unmodified.
     pub fn update_obstacle(&mut self, id: CuObjectId, shape: CuCollisionShape) -> CuResult<()> {
-        let Some(idx) = self.find_obstacle_index(id) else {
-            return Err(CuSceneError::ObjectNotFound(id).into());
-        };
+        if !id.is_valid() {
+            return Err(CuSceneError::InvalidObjectId(id).into());
+        }
+        if !is_valid_shape(&shape) {
+            return Err(CuSceneError::InvalidGeometry.into());
+        }
+        let idx = self
+            .find_obstacle_index(id)
+            .ok_or(CuSceneError::ObjectNotFound(id))?;
+        let next_rev = self
+            .revision
+            .checked_next()
+            .ok_or(CuSceneError::RevisionExhausted)?;
         self.obstacles[idx].shape = shape;
-        self.revision = self.revision.next();
+        self.revision = next_rev;
         Ok(())
     }
 
     /// Removes an obstacle by ID and compacts the storage in place, preserving insertion order.
+    ///
+    /// On failure, state is unmodified.
     pub fn remove_obstacle(&mut self, id: CuObjectId) -> CuResult<CuCollisionShape> {
-        let count = self.obstacle_count as usize;
-        let Some(idx) = self.find_obstacle_index(id) else {
-            return Err(CuSceneError::ObjectNotFound(id).into());
-        };
+        if !id.is_valid() {
+            return Err(CuSceneError::InvalidObjectId(id).into());
+        }
+        let count = (self.obstacle_count as usize).min(MAX_OBSTACLES);
+        let idx = self
+            .find_obstacle_index(id)
+            .ok_or(CuSceneError::ObjectNotFound(id))?;
+        let next_rev = self
+            .revision
+            .checked_next()
+            .ok_or(CuSceneError::RevisionExhausted)?;
         let removed = self.obstacles[idx].shape;
         let mut i = idx;
         while i + 1 < count {
@@ -632,11 +1007,13 @@ impl<const MAX_OBSTACLES: usize, const MAX_ATTACHED: usize>
         }
         self.obstacles[count - 1] = CuSceneObstacle::default();
         self.obstacle_count -= 1;
-        self.revision = self.revision.next();
+        self.revision = next_rev;
         Ok(removed)
     }
 
     /// Appends an attached shape to the scene with an automatically generated unique [`CuObjectId`].
+    ///
+    /// On failure (capacity, geometry, or revision exhaustion), state is unmodified.
     pub fn add_attached_shape(
         &mut self,
         link_index: usize,
@@ -645,15 +1022,25 @@ impl<const MAX_OBSTACLES: usize, const MAX_ATTACHED: usize>
         if self.is_attached_full() {
             return Err(CuSceneError::AttachedCapacityExceeded.into());
         }
+        if !is_valid_shape(&shape) {
+            return Err(CuSceneError::InvalidGeometry.into());
+        }
+        let next_rev = self
+            .revision
+            .checked_next()
+            .ok_or(CuSceneError::RevisionExhausted)?;
         let id = self.alloc_id()?;
         let idx = self.attached_count as usize;
         self.attached_shapes[idx] = CuAttachedShape::new(id, link_index, shape);
         self.attached_count += 1;
-        self.revision = self.revision.next();
+        self.revision = next_rev;
         Ok(id)
     }
 
     /// Adds an attached shape with an explicit [`CuObjectId`].
+    ///
+    /// Fails if the ID is invalid, already in use, geometry is non-finite, capacity is exceeded,
+    /// or revision is exhausted. On failure, state is unmodified.
     pub fn add_attached_shape_with_id(
         &mut self,
         id: CuObjectId,
@@ -663,68 +1050,122 @@ impl<const MAX_OBSTACLES: usize, const MAX_ATTACHED: usize>
         if !id.is_valid() {
             return Err(CuSceneError::InvalidObjectId(id).into());
         }
+        if !is_valid_shape(&shape) {
+            return Err(CuSceneError::InvalidGeometry.into());
+        }
         if self.is_attached_full() {
             return Err(CuSceneError::AttachedCapacityExceeded.into());
         }
         if self.contains(id) {
             return Err(CuSceneError::DuplicateObjectId(id).into());
         }
+        let next_rev = self
+            .revision
+            .checked_next()
+            .ok_or(CuSceneError::RevisionExhausted)?;
+        let new_next_id = if id.as_u32() >= self.next_id {
+            id.as_u32()
+                .checked_add(1)
+                .ok_or(CuSceneError::InvalidObjectId(id))?
+        } else {
+            self.next_id
+        };
         let idx = self.attached_count as usize;
         self.attached_shapes[idx] = CuAttachedShape::new(id, link_index, shape);
         self.attached_count += 1;
-        if id.as_u32() >= self.next_id {
-            self.next_id = id.as_u32().saturating_add(1);
-        }
-        self.revision = self.revision.next();
+        self.next_id = new_next_id;
+        self.revision = next_rev;
         Ok(())
     }
 
     /// Updates the collision geometry of an attached shape in place.
+    ///
+    /// On failure, state is unmodified.
     pub fn update_attached_shape(
         &mut self,
         id: CuObjectId,
         shape: CuCollisionShape,
     ) -> CuResult<()> {
-        let Some(idx) = self.find_attached_index(id) else {
-            return Err(CuSceneError::ObjectNotFound(id).into());
-        };
+        if !id.is_valid() {
+            return Err(CuSceneError::InvalidObjectId(id).into());
+        }
+        if !is_valid_shape(&shape) {
+            return Err(CuSceneError::InvalidGeometry.into());
+        }
+        let idx = self
+            .find_attached_index(id)
+            .ok_or(CuSceneError::ObjectNotFound(id))?;
+        let next_rev = self
+            .revision
+            .checked_next()
+            .ok_or(CuSceneError::RevisionExhausted)?;
         self.attached_shapes[idx].shape = shape;
-        self.revision = self.revision.next();
+        self.revision = next_rev;
         Ok(())
     }
 
     /// Updates the attached link index of an attached shape in place.
+    ///
+    /// On failure, state is unmodified.
     pub fn update_attached_link(&mut self, id: CuObjectId, link_index: usize) -> CuResult<()> {
-        let Some(idx) = self.find_attached_index(id) else {
-            return Err(CuSceneError::ObjectNotFound(id).into());
-        };
+        if !id.is_valid() {
+            return Err(CuSceneError::InvalidObjectId(id).into());
+        }
+        let idx = self
+            .find_attached_index(id)
+            .ok_or(CuSceneError::ObjectNotFound(id))?;
+        let next_rev = self
+            .revision
+            .checked_next()
+            .ok_or(CuSceneError::RevisionExhausted)?;
         self.attached_shapes[idx].link_index = link_index;
-        self.revision = self.revision.next();
+        self.revision = next_rev;
         Ok(())
     }
 
     /// Updates both link index and geometry of an attached shape in place.
+    ///
+    /// On failure, state is unmodified.
     pub fn update_attached(
         &mut self,
         id: CuObjectId,
         link_index: usize,
         shape: CuCollisionShape,
     ) -> CuResult<()> {
-        let Some(idx) = self.find_attached_index(id) else {
-            return Err(CuSceneError::ObjectNotFound(id).into());
-        };
+        if !id.is_valid() {
+            return Err(CuSceneError::InvalidObjectId(id).into());
+        }
+        if !is_valid_shape(&shape) {
+            return Err(CuSceneError::InvalidGeometry.into());
+        }
+        let idx = self
+            .find_attached_index(id)
+            .ok_or(CuSceneError::ObjectNotFound(id))?;
+        let next_rev = self
+            .revision
+            .checked_next()
+            .ok_or(CuSceneError::RevisionExhausted)?;
         self.attached_shapes[idx].link_index = link_index;
         self.attached_shapes[idx].shape = shape;
-        self.revision = self.revision.next();
+        self.revision = next_rev;
         Ok(())
     }
 
     /// Removes an attached shape by ID and compacts the storage in place.
+    ///
+    /// On failure, state is unmodified.
     pub fn remove_attached_shape(&mut self, id: CuObjectId) -> CuResult<CuAttachedShape> {
-        let count = self.attached_count as usize;
-        let Some(idx) = self.find_attached_index(id) else {
-            return Err(CuSceneError::ObjectNotFound(id).into());
-        };
+        if !id.is_valid() {
+            return Err(CuSceneError::InvalidObjectId(id).into());
+        }
+        let count = (self.attached_count as usize).min(MAX_ATTACHED);
+        let idx = self
+            .find_attached_index(id)
+            .ok_or(CuSceneError::ObjectNotFound(id))?;
+        let next_rev = self
+            .revision
+            .checked_next()
+            .ok_or(CuSceneError::RevisionExhausted)?;
         let removed = self.attached_shapes[idx];
         let mut i = idx;
         while i + 1 < count {
@@ -733,25 +1174,36 @@ impl<const MAX_OBSTACLES: usize, const MAX_ATTACHED: usize>
         }
         self.attached_shapes[count - 1] = CuAttachedShape::default();
         self.attached_count -= 1;
-        self.revision = self.revision.next();
+        self.revision = next_rev;
         Ok(removed)
     }
 
     /// Transitions an existing obstacle into an attached shape on `link_index` (e.g. object grasp).
     ///
-    /// Preserves the stable [`CuObjectId`]. Fails if obstacle not found or attached storage full.
+    /// Preserves the stable [`CuObjectId`]. Fails if obstacle not found, geometry is invalid,
+    /// attached storage is full, or revision is exhausted. On failure, state is unmodified.
     pub fn attach_obstacle(
         &mut self,
         id: CuObjectId,
         link_index: usize,
         local_shape: CuCollisionShape,
     ) -> CuResult<()> {
+        if !id.is_valid() {
+            return Err(CuSceneError::InvalidObjectId(id).into());
+        }
+        if !is_valid_shape(&local_shape) {
+            return Err(CuSceneError::InvalidGeometry.into());
+        }
         if self.is_attached_full() {
             return Err(CuSceneError::AttachedCapacityExceeded.into());
         }
         let obs_idx = self
             .find_obstacle_index(id)
             .ok_or(CuSceneError::ObjectNotFound(id))?;
+        let next_rev = self
+            .revision
+            .checked_next()
+            .ok_or(CuSceneError::RevisionExhausted)?;
 
         // Remove from obstacles in place
         let obs_count = self.obstacle_count as usize;
@@ -768,20 +1220,31 @@ impl<const MAX_OBSTACLES: usize, const MAX_ATTACHED: usize>
         self.attached_shapes[att_idx] = CuAttachedShape::new(id, link_index, local_shape);
         self.attached_count += 1;
 
-        self.revision = self.revision.next();
+        self.revision = next_rev;
         Ok(())
     }
 
     /// Detaches an attached shape into an environment obstacle in world coordinates (e.g. object release).
     ///
-    /// Preserves the stable [`CuObjectId`]. Fails if attached shape not found or obstacle storage full.
+    /// Preserves the stable [`CuObjectId`]. Fails if attached shape not found, geometry is invalid,
+    /// obstacle storage is full, or revision is exhausted. On failure, state is unmodified.
     pub fn detach_shape(&mut self, id: CuObjectId, world_shape: CuCollisionShape) -> CuResult<()> {
+        if !id.is_valid() {
+            return Err(CuSceneError::InvalidObjectId(id).into());
+        }
+        if !is_valid_shape(&world_shape) {
+            return Err(CuSceneError::InvalidGeometry.into());
+        }
         if self.is_obstacle_full() {
             return Err(CuSceneError::ObstacleCapacityExceeded.into());
         }
         let att_idx = self
             .find_attached_index(id)
             .ok_or(CuSceneError::ObjectNotFound(id))?;
+        let next_rev = self
+            .revision
+            .checked_next()
+            .ok_or(CuSceneError::RevisionExhausted)?;
 
         // Remove from attached shapes in place
         let att_count = self.attached_count as usize;
@@ -798,43 +1261,65 @@ impl<const MAX_OBSTACLES: usize, const MAX_ATTACHED: usize>
         self.obstacles[obs_idx] = CuSceneObstacle::new(id, world_shape);
         self.obstacle_count += 1;
 
-        self.revision = self.revision.next();
+        self.revision = next_rev;
         Ok(())
     }
 
     /// Clears all obstacles and attached shapes in place, advancing revision if not already empty.
-    pub fn clear(&mut self) {
+    ///
+    /// On failure (such as revision exhaustion), state is unmodified.
+    pub fn clear(&mut self) -> CuResult<()> {
         if !self.is_empty() {
+            let next_rev = self
+                .revision
+                .checked_next()
+                .ok_or(CuSceneError::RevisionExhausted)?;
             self.obstacles = [CuSceneObstacle::default(); MAX_OBSTACLES];
             self.obstacle_count = 0;
             self.attached_shapes = [CuAttachedShape::default(); MAX_ATTACHED];
             self.attached_count = 0;
-            self.revision = self.revision.next();
+            self.revision = next_rev;
         }
+        Ok(())
     }
 
     /// Clears all obstacles in place, advancing revision if obstacles were present.
-    pub fn clear_obstacles(&mut self) {
+    ///
+    /// On failure (such as revision exhaustion), state is unmodified.
+    pub fn clear_obstacles(&mut self) -> CuResult<()> {
         if self.obstacle_count > 0 {
+            let next_rev = self
+                .revision
+                .checked_next()
+                .ok_or(CuSceneError::RevisionExhausted)?;
             self.obstacles = [CuSceneObstacle::default(); MAX_OBSTACLES];
             self.obstacle_count = 0;
-            self.revision = self.revision.next();
+            self.revision = next_rev;
         }
+        Ok(())
     }
 
     /// Clears all attached shapes in place, advancing revision if attached shapes were present.
-    pub fn clear_attached_shapes(&mut self) {
+    ///
+    /// On failure (such as revision exhaustion), state is unmodified.
+    pub fn clear_attached_shapes(&mut self) -> CuResult<()> {
         if self.attached_count > 0 {
+            let next_rev = self
+                .revision
+                .checked_next()
+                .ok_or(CuSceneError::RevisionExhausted)?;
             self.attached_shapes = [CuAttachedShape::default(); MAX_ATTACHED];
             self.attached_count = 0;
-            self.revision = self.revision.next();
+            self.revision = next_rev;
         }
+        Ok(())
     }
 
     /// Executes a transaction block on the planning scene.
     ///
     /// If the closure `f` succeeds, modifications are committed and revision changes if state was modified.
-    /// If `f` returns an error, the scene rolls back to its pre-transaction state and revision is preserved.
+    /// If `f` returns an error or revision exhaustion occurs, the scene rolls back to its pre-transaction state
+    /// and revision is preserved.
     pub fn transaction<F, R>(&mut self, f: F) -> CuResult<R>
     where
         F: FnOnce(&mut Self) -> CuResult<R>,
@@ -843,7 +1328,14 @@ impl<const MAX_OBSTACLES: usize, const MAX_ATTACHED: usize>
         match f(self) {
             Ok(result) => {
                 if *self != backup && self.revision == backup.revision {
-                    self.revision = self.revision.next();
+                    let next_rev = match self.revision.checked_next() {
+                        Some(rev) => rev,
+                        None => {
+                            *self = backup;
+                            return Err(CuSceneError::RevisionExhausted.into());
+                        }
+                    };
+                    self.revision = next_rev;
                 }
                 Ok(result)
             }
@@ -855,13 +1347,24 @@ impl<const MAX_OBSTACLES: usize, const MAX_ATTACHED: usize>
     }
 
     /// Populates a caller-provided [`CuCollisionWorld`] in place with all active scene obstacles.
+    ///
+    /// Validates count capacity and geometry invariants transactionally:
+    /// on error, `out_world` is left completely unmodified.
     pub fn write_collision_world<const MAX_OUT: usize>(
         &self,
         out_world: &mut CuCollisionWorld<MAX_OUT>,
     ) -> CuResult<()> {
         let count = self.obstacle_count as usize;
+        if count > MAX_OBSTACLES {
+            return Err(CuSceneError::ObstacleCapacityExceeded.into());
+        }
         if count > MAX_OUT {
             return Err(CuSceneError::OutputCapacityExceeded.into());
+        }
+        for obs in self.obstacles[..count].iter() {
+            if !is_valid_shape(&obs.shape) {
+                return Err(CuSceneError::InvalidGeometry.into());
+            }
         }
         out_world.clear();
         for obs in self.obstacles[..count].iter() {
@@ -872,6 +1375,9 @@ impl<const MAX_OBSTACLES: usize, const MAX_ATTACHED: usize>
 
     /// Computes world-space shapes for all active attached shapes using `link_frames`,
     /// writing them into `out_shapes` and setting `out_len` in place.
+    ///
+    /// Validates count capacity, link indices, frame transforms, and geometry invariants transactionally:
+    /// on error, neither `out_shapes` nor `out_len` is modified.
     pub fn world_attached_shapes<const N: usize, const MAX_OUT: usize>(
         &self,
         link_frames: &[Transform3D<f64>; N],
@@ -879,13 +1385,13 @@ impl<const MAX_OBSTACLES: usize, const MAX_ATTACHED: usize>
         out_len: &mut usize,
     ) -> CuResult<()> {
         let count = self.attached_count as usize;
+        if count > MAX_ATTACHED {
+            return Err(CuSceneError::AttachedCapacityExceeded.into());
+        }
         if count > MAX_OUT {
             return Err(CuSceneError::OutputCapacityExceeded.into());
         }
-        for (att, out_shape) in self.attached_shapes[..count]
-            .iter()
-            .zip(out_shapes[..count].iter_mut())
-        {
+        for att in self.attached_shapes[..count].iter() {
             if att.link_index >= N {
                 return Err(CuSceneError::InvalidLinkIndex {
                     link_index: att.link_index,
@@ -893,6 +1399,26 @@ impl<const MAX_OBSTACLES: usize, const MAX_ATTACHED: usize>
                 }
                 .into());
             }
+            if !is_valid_shape(&att.shape) {
+                return Err(CuSceneError::InvalidGeometry.into());
+            }
+            if !is_finite_transform(&link_frames[att.link_index]) {
+                return Err(CuSceneError::InvalidGeometry.into());
+            }
+        }
+        // Validate every transform result before writing anything so that a
+        // failure leaves `out_shapes` completely unmodified (transactional).
+        let mut scratch = CuCollisionShape::default();
+        for att in self.attached_shapes[..count].iter() {
+            transform_shape(&link_frames[att.link_index], &att.shape, &mut scratch);
+            if !is_valid_shape(&scratch) {
+                return Err(CuSceneError::InvalidGeometry.into());
+            }
+        }
+        for (att, out_shape) in self.attached_shapes[..count]
+            .iter()
+            .zip(out_shapes[..count].iter_mut())
+        {
             transform_shape(&link_frames[att.link_index], &att.shape, out_shape);
         }
         *out_len = count;

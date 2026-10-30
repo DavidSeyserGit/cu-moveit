@@ -25,6 +25,7 @@ use serde::Serialize;
 
 use crate::CuTrajectoryPayload;
 use crate::CuTrajectoryPoint;
+use crate::quintic::polynomial_extrema;
 
 /// Per-joint speed, acceleration, and jerk limits for time-parameterization.
 ///
@@ -155,7 +156,7 @@ pub enum CuParameterizeStatus {
     /// non-positive, non-finite, mismatched to the waypoint joint kinds, or
     /// inconsistent with the profile (non-zero waypoint velocity under a
     /// rest-to-rest profile, fixed duration below the synchronized minimum,
-    /// sampled velocity above a limit, or wrong timing slice length).
+    /// segment velocity above a limit, or wrong timing slice length).
     InvalidLimits,
     /// `out` filled before the resampled trajectory completed.
     CapacityExceeded,
@@ -220,12 +221,14 @@ pub fn parameterize_trajectory<const N: usize, const MAX_POINTS: usize>(
 ///   peak velocity (`|v| <= 1.875 * distance / duration`) and acceleration
 ///   (`|a| <= (10 / sqrt(3)) * distance / duration^2`) satisfy the limits;
 ///   with any non-zero waypoint velocity the derived duration falls back to
-///   the trapezoidal minimum. Sampled velocities are validated against the
-///   limits (exceeding is `InvalidLimits`).
+///   the trapezoidal minimum. The exact velocity extrema of every segment,
+///   waypoint velocities included, are validated against the limits
+///   (exceeding is `InvalidLimits`).
 /// - `Cubic`: cubic Hermite polynomial per segment per joint honoring the
 ///   specified waypoint velocities exactly. Duration: fixed when given,
-///   otherwise the trapezoidal minimum; sampled velocities are validated
-///   against the limits (exceeding is `InvalidLimits`).
+///   otherwise the trapezoidal minimum; the exact velocity extrema of every
+///   segment, waypoint velocities included, are validated against the limits
+///   (exceeding is `InvalidLimits`).
 ///
 /// # Guarantees (all profiles)
 ///
@@ -312,10 +315,11 @@ pub fn parameterize_with_profile<const N: usize, const MAX_POINTS: usize>(
             s += 1;
         }
     }
-    if timing
-        .waypoint_velocities
-        .is_some_and(|vias| vias.len() != waypoints.len() || !vias_valid(waypoints, vias))
-    {
+    if timing.waypoint_velocities.is_some_and(|vias| {
+        vias.len() != waypoints.len()
+            || !vias_valid(waypoints, vias)
+            || !vias_within_limits(waypoints, vias, limits)
+    }) {
         return Ok(CuParameterizeStatus::InvalidLimits);
     }
     let rest_only = matches!(
@@ -357,6 +361,13 @@ pub fn parameterize_with_profile<const N: usize, const MAX_POINTS: usize>(
         let solo = waypoint_velocity(timing, 0, waypoints[0]);
         return push_single_point(out, Time::default(), waypoints[0], solo);
     }
+    if matches!(
+        profile,
+        CuTrajectoryProfile::MinimumJerk | CuTrajectoryProfile::Cubic
+    ) && !segments_within_limits(waypoints, limits, profile, timing, all_zero_via)
+    {
+        return Ok(CuParameterizeStatus::InvalidLimits);
+    }
     if !try_push(
         out,
         CuTrajectoryPoint {
@@ -376,14 +387,6 @@ pub fn parameterize_with_profile<const N: usize, const MAX_POINTS: usize>(
         }
         let at = locate_segment(t, waypoints, limits, profile, timing, all_zero_via);
         let (positions, velocities) = eval_segment(&at, t, waypoints, limits, profile, timing);
-        if matches!(
-            profile,
-            CuTrajectoryProfile::MinimumJerk | CuTrajectoryProfile::Cubic
-        ) && !sample_within_limits(&velocities, limits)
-        {
-            out.clear();
-            return Ok(CuParameterizeStatus::InvalidLimits);
-        }
         if !try_push(
             out,
             CuTrajectoryPoint {
@@ -1030,18 +1033,76 @@ fn eval_segment<const N: usize>(
     (positions, velocities)
 }
 
-/// Checks sampled velocities against the limits with a small float tolerance.
-fn sample_within_limits<const N: usize>(
-    velocities: &[CuJointVelocity; N],
+/// Checks waypoint-velocity magnitudes against the per-joint velocity limits.
+fn vias_within_limits<const N: usize>(
+    waypoints: &[[CuJointPosition; N]],
+    vias: &[[CuJointVelocity; N]],
     limits: &CuJointTrajectoryLimits<N>,
 ) -> bool {
-    let mut j = 0;
-    while j < N {
-        let bound = limits.max_velocities[j].si_value() * (1.0 + 1e-9) + 1e-12;
-        if velocities[j].si_value().abs() > bound {
-            return false;
+    let mut i = 0;
+    while i < vias.len() {
+        let mut j = 0;
+        while j < N {
+            if matches!(waypoints[i][j], CuJointPosition::Fixed) {
+                j += 1;
+                continue;
+            }
+            let bound = limits.max_velocities[j].si_value() * (1.0 + 1e-9) + 1e-12;
+            if vias[i][j].si_value().abs() > bound {
+                return false;
+            }
+            j += 1;
         }
-        j += 1;
+        i += 1;
+    }
+    true
+}
+
+/// Checks the exact velocity extrema of every Hermite segment — waypoint
+/// velocities at the ends included — against the velocity limits, with a
+/// small float tolerance.
+///
+/// Sampling alone cannot certify this: a segment shorter than the sample
+/// period receives no interior samples, and a peak between two samples stays
+/// unseen, so the analytic extrema are checked instead.
+fn segments_within_limits<const N: usize>(
+    waypoints: &[[CuJointPosition; N]],
+    limits: &CuJointTrajectoryLimits<N>,
+    profile: CuTrajectoryProfile,
+    timing: &CuTrajectoryTiming<'_, N>,
+    all_zero_via: bool,
+) -> bool {
+    let quintic = profile == CuTrajectoryProfile::MinimumJerk;
+    let mut seg = 0;
+    while seg + 1 < waypoints.len() {
+        let duration = effective_duration(seg, waypoints, limits, profile, timing, all_zero_via);
+        if duration <= 0.0 {
+            seg += 1;
+            continue;
+        }
+        let start_vel = waypoint_velocity(timing, seg, waypoints[seg]);
+        let end_vel = waypoint_velocity(timing, seg + 1, waypoints[seg + 1]);
+        let mut j = 0;
+        while j < N {
+            if matches!(waypoints[seg][j], CuJointPosition::Fixed) {
+                j += 1;
+                continue;
+            }
+            let distance = waypoints[seg + 1][j].si_value() - waypoints[seg][j].si_value();
+            let (high, low, _) = polynomial_extrema(
+                quintic,
+                distance,
+                start_vel[j].si_value(),
+                end_vel[j].si_value(),
+                duration,
+            );
+            let bound = limits.max_velocities[j].si_value() * (1.0 + 1e-9) + 1e-12;
+            if !high.is_finite() || !low.is_finite() || high > bound || low < -bound {
+                return false;
+            }
+            j += 1;
+        }
+        seg += 1;
     }
     true
 }

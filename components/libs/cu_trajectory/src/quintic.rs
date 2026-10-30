@@ -1,13 +1,16 @@
-//! Quintic Hermite reconstruction of stored joint knots and its exact limits.
+//! Hermite reconstruction of stored joint knots and its exact limits.
 //!
 //! A [`CuTrajectoryPayload`] stores position, velocity and acceleration at
 //! every knot. Between two knots the motion is the unique quintic matching all
 //! six boundary values, which makes position, velocity *and* acceleration
 //! continuous across the whole trajectory, so joint jerk is finite everywhere.
+//! The cubic Hermite through positions and velocities alone is the lighter
+//! reconstruction used by the cubic follower mode.
 //!
-//! The peaks of velocity, acceleration and jerk of that quintic are computed in
-//! closed form ([`quintic_limit_ratio`]). Stretching all knot times by a factor
-//! `k` ([`stretch_time`]) keeps the quintic's shape and scales the peaks by
+//! The peaks of velocity, acceleration and jerk of the quintic are computed in
+//! closed form ([`quintic_limit_ratio`]), and the velocity and acceleration
+//! peaks of the cubic in [`cubic_limit_ratio`]. Stretching all knot times by a
+//! factor `k` ([`stretch_time`]) keeps the shape and scales the peaks by
 //! `1/k`, `1/k^2` and `1/k^3`, so a trajectory whose ratio to the limits is
 //! `r > 1` satisfies them exactly after stretching by `r`.
 
@@ -215,6 +218,133 @@ pub fn quintic_limit_ratio<const N: usize, const CAP: usize>(
                 .max(v / vmax)
                 .max(libm::sqrt(acc / amax))
                 .max(libm::cbrt(jerk / jmax));
+        }
+    }
+    Some(ratio)
+}
+
+/// Exact `(max speed, min speed, max |acceleration|)` of a cubic or quintic
+/// Hermite move over duration `t` with endpoint speeds `v0`, `v1`.
+///
+/// Cubic speed is quadratic (vertex) and acceleration linear (ends). Quintic
+/// (zero end accelerations) acceleration is `u·(6a3 + 12a4·u + 20a5·u^2)/T^2`
+/// and jerk quadratic, so all critical points are quadratic roots.
+pub(crate) fn polynomial_extrema(
+    quintic: bool,
+    length: f64,
+    v0: f64,
+    v1: f64,
+    t: f64,
+) -> (f64, f64, f64) {
+    let mut high = v0.max(v1);
+    let mut low = v0.min(v1);
+    let mut acc = 0.0_f64;
+    if quintic {
+        let start = length - v0 * t;
+        let end = (v1 - v0) * t;
+        let a3 = 10.0 * start - 4.0 * end;
+        let a4 = -15.0 * start + 7.0 * end;
+        let a5 = 6.0 * start - 3.0 * end;
+        let speed =
+            |u: f64| v0 + (3.0 * a3 * u * u + 4.0 * a4 * u * u * u + 5.0 * a5 * u * u * u * u) / t;
+        let accel = |u: f64| (6.0 * a3 * u + 12.0 * a4 * u * u + 20.0 * a5 * u * u * u) / (t * t);
+        for u in unit_roots(20.0 * a5, 12.0 * a4, 6.0 * a3)
+            .into_iter()
+            .flatten()
+        {
+            high = high.max(speed(u));
+            low = low.min(speed(u));
+        }
+        for u in unit_roots(60.0 * a5, 24.0 * a4, 6.0 * a3)
+            .into_iter()
+            .flatten()
+        {
+            acc = acc.max(libm::fabs(accel(u)));
+        }
+    } else {
+        let a = v0 * t;
+        let b = 3.0 * length - 2.0 * a - v1 * t;
+        let c = -2.0 * length + a + v1 * t;
+        if let Some(u) = unit_roots(0.0, 6.0 * c, 2.0 * b)[0] {
+            let speed = (a + u * (2.0 * b + 3.0 * c * u)) / t;
+            high = high.max(speed);
+            low = low.min(speed);
+        }
+        acc = libm::fabs(2.0 * b).max(libm::fabs(2.0 * b + 6.0 * c)) / (t * t);
+    }
+    (high, low, acc)
+}
+
+/// Smallest uniform time stretch under which the cubic Hermite reconstruction
+/// (positions and velocities) of `trajectory` respects the velocity and
+/// acceleration limits, as a ratio of peak to limit.
+///
+/// Returns the largest of `peak_v / v_max` and `sqrt(peak_a / a_max)` over all
+/// segments and non-fixed joints. A result `<= 1` means the limits already
+/// hold exactly. Returns `None` for fewer than two knots, non-positive
+/// segment durations, non-finite values, joint-kind disagreements or limits
+/// that are not positive.
+pub(crate) fn cubic_limit_ratio<const N: usize, const CAP: usize>(
+    trajectory: &CuTrajectoryPayload<N, CAP>,
+    limits: &CuJointTrajectoryLimits<N>,
+) -> Option<f64> {
+    if trajectory.len() < 2 || trajectory.len() > CAP {
+        return None;
+    }
+    let mut ratio = 0.0_f64;
+    for pair in trajectory.points().windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        let t = b.time_from_start.get::<second>() - a.time_from_start.get::<second>();
+        if !t.is_finite() || t <= 0.0 {
+            return None;
+        }
+        for j in 0..N {
+            if matches!(a.positions[j], CuJointPosition::Fixed) {
+                continue;
+            }
+            let kinds_agree = matches!(
+                (
+                    a.positions[j],
+                    b.positions[j],
+                    a.velocities[j],
+                    b.velocities[j],
+                    limits.max_velocities[j]
+                ),
+                (
+                    CuJointPosition::Revolute(_),
+                    CuJointPosition::Revolute(_),
+                    CuJointVelocity::Revolute(_),
+                    CuJointVelocity::Revolute(_),
+                    CuJointVelocity::Revolute(_)
+                ) | (
+                    CuJointPosition::Prismatic(_),
+                    CuJointPosition::Prismatic(_),
+                    CuJointVelocity::Prismatic(_),
+                    CuJointVelocity::Prismatic(_),
+                    CuJointVelocity::Prismatic(_)
+                )
+            );
+            let (vmax, amax) = (
+                limits.max_velocities[j].si_value(),
+                limits.max_accelerations[j],
+            );
+            if !kinds_agree || vmax.is_nan() || vmax <= 0.0 || amax.is_nan() || amax <= 0.0 {
+                return None;
+            }
+            let (high, low, acc) = polynomial_extrema(
+                false,
+                b.positions[j].si_value() - a.positions[j].si_value(),
+                a.velocities[j].si_value(),
+                b.velocities[j].si_value(),
+                t,
+            );
+            if !high.is_finite() || !low.is_finite() || !acc.is_finite() {
+                return None;
+            }
+            ratio = ratio
+                .max(high / vmax)
+                .max(-low / vmax)
+                .max(libm::sqrt(acc / amax));
         }
     }
     Some(ratio)

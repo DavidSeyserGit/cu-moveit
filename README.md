@@ -133,7 +133,9 @@ each zone is crossed at a constant corner speed bounded by its curvature, and
 the moves between stops and corners follow the profile from one boundary speed
 to the next. Joint velocity and acceleration stay within the configured limits;
 S-curve joint jerk is checked on the quintic reconstruction, including curvature
-contributions; uniform time stretching brings its peaks within the limits. The geometric spline is
+contributions. Every profile is certified on the reconstruction its follower
+executes — quintic Hermite for the S-curve, cubic Hermite for the others — and
+uniform time stretching brings any excess within the limits. The geometric spline is
 rechecked for joint limits, collisions, and zone containment, and a path that
 reverses inside a zone is rejected with `NoContinuousMotion` naming the
 waypoint. Read the result with
@@ -155,12 +157,19 @@ reproduction of a vendor controller's zone algorithm.
 
 `CuPlanningScene<O, A>` stores fixed-capacity obstacle and attached-shape
 geometry with stable object IDs and a scene revision. The collision-check task
-accepts joint positions and a scene snapshot. RRT* currently retains its
-obstacle-world input; capturing scene snapshots per planning job and echoing
-scene revisions in results is the next integration step.
+accepts joint positions, a scene snapshot, and stable-ID collision exclusions.
+RRT* captures the scene and resolved exclusions once per planning job, checks
+obstacles and attached shapes throughout planning, and returns `scene_revision` and the captured exclusion set
+with the path. Consumers must compare both with their current inputs before
+accepting a plan. Refinement uses the captured snapshot until the next
+base call starts a new job.
 
 Attached shapes use link-local geometry and zero-based FK frame indices.
-Attached-object exclusions are not yet configurable through the scene, so
-contact with a mounting link counts as collision. Segment checks are discrete.
-Scene validation at deserialization boundaries and revision exhaustion handling
-remain work in progress; scene integration is not yet a completed phase-2 API.
+`CuSceneExclusions` permits explicit attached-object contact with a robot shape,
+another attached object, or an obstacle. Scene objects are referenced by stable
+IDs; robot shapes use their model construction indices. Invalid exclusion
+references reject the query or planning job. Scene and exclusions must be published consistently.
+
+Scene decoding validates identity, counts, and geometry. Mutations fail before
+changing state if the revision cannot advance. Segment collision checks remain
+discrete and depend on the configured joint resolution.

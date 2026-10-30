@@ -16,8 +16,15 @@ use bincode::de::Decoder;
 use bincode::enc::Encoder;
 use bincode::error::DecodeError;
 use bincode::error::EncodeError;
+use cu_collision::CuCollisionReport;
+use cu_collision::CuCollisionShape;
 use cu_collision::CuCollisionWorld;
+use cu_collision::CuPlanningScene;
 use cu_collision::CuRobotCollisionModel;
+use cu_collision::CuSceneExclusions;
+use cu_collision::CuSceneRevision;
+use cu_collision::scene_query::CuSceneQueryExclusions;
+use cu_collision::scene_query::check_attached_configuration;
 use cu_kinematics::CuJointMetric;
 use cu_kinematics::CuJointPosition;
 use cu_kinematics::CuJointPositionsPayload;
@@ -37,8 +44,12 @@ use serde::Serialize;
 pub const MAX_NODES: usize = 256;
 /// Fixed capacity of waypoints in a published `CuJointPlanPath`.
 pub const MAX_WAYPOINTS: usize = 32;
-/// Fixed capacity of obstacles in `CuJointPlanRequest`.
+/// Fixed capacity of scene obstacles in `CuJointPlanRequest`.
 pub const MAX_OBSTACLES: usize = 16;
+/// Fixed capacity of attached shapes in `CuJointPlanRequest`.
+pub const MAX_ATTACHED_SHAPES: usize = 8;
+/// Fixed capacity of stable-ID exclusions in `CuJointPlanRequest`.
+pub const MAX_EXCLUSIONS: usize = 16;
 
 const CONVERGED_QUALITY: f32 = 0.999;
 
@@ -83,7 +94,8 @@ impl Default for CuJointRrtParams {
 #[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect)]
 #[reflect(no_field_bounds, from_reflect = false, type_path = false)]
 pub struct CuJointPlanRequest<const N: usize> {
-    pub world: CuCollisionWorld<MAX_OBSTACLES>,
+    pub scene: CuPlanningScene<MAX_OBSTACLES, MAX_ATTACHED_SHAPES>,
+    pub exclusions: CuSceneExclusions<MAX_EXCLUSIONS>,
     #[serde(with = "cu_kinematics::serde_arrays::position_array")]
     pub start: [CuJointPosition; N],
     #[serde(with = "cu_kinematics::serde_arrays::position_array")]
@@ -93,7 +105,8 @@ pub struct CuJointPlanRequest<const N: usize> {
 impl<const N: usize> Default for CuJointPlanRequest<N> {
     fn default() -> Self {
         Self {
-            world: CuCollisionWorld::new(),
+            scene: CuPlanningScene::new(),
+            exclusions: CuSceneExclusions::new(),
             start: [CuJointPosition::default(); N],
             goal: [CuJointPosition::default(); N],
         }
@@ -111,6 +124,10 @@ pub struct CuJointPlanPath<const N: usize> {
     pub cost: f64,
     /// Total RRT* iterations executed on this job.
     pub iterations: u32,
+    /// Scene revision the published path was planned against.
+    pub scene_revision: CuSceneRevision,
+    /// Collision exclusions captured for this plan; compare with the current set.
+    pub exclusions: CuSceneExclusions<MAX_EXCLUSIONS>,
 }
 
 impl<const N: usize> Default for CuJointPlanPath<N> {
@@ -120,6 +137,8 @@ impl<const N: usize> Default for CuJointPlanPath<N> {
             len: 0,
             cost: f64::INFINITY,
             iterations: 0,
+            scene_revision: CuSceneRevision::INITIAL,
+            exclusions: CuSceneExclusions::new(),
         }
     }
 }
@@ -132,6 +151,7 @@ pub struct CuJointPlannerDebugState {
     pub best_cost: f64,
     pub published_cost: f64,
     pub published_quality: Quality,
+    pub scene_revision: CuSceneRevision,
 }
 
 #[derive(Clone, Copy)]
@@ -156,7 +176,13 @@ pub struct CuJointRrtStar<const N: usize, const M: usize = N> {
     chain: CuKinematicChain<N>,
     collision_model: CuRobotCollisionModel<N, M>,
     params: CuJointRrtParams,
+    scene: CuPlanningScene<MAX_OBSTACLES, MAX_ATTACHED_SHAPES>,
     world: CuCollisionWorld<MAX_OBSTACLES>,
+    attached_shapes: [CuCollisionShape; MAX_ATTACHED_SHAPES],
+    attached_frames: [Option<usize>; MAX_ATTACHED_SHAPES],
+    attached_len: usize,
+    query_exclusions: CuSceneQueryExclusions<MAX_EXCLUSIONS>,
+    exclusions: CuSceneExclusions<MAX_EXCLUSIONS>,
     start: [CuJointPosition; N],
     goal: [CuJointPosition; N],
     straight_line_cost: f64,
@@ -171,11 +197,13 @@ pub struct CuJointRrtStar<const N: usize, const M: usize = N> {
 
 impl<const N: usize, const M: usize> CuJointRrtStar<N, M> {
     /// Creates and initializes a new joint-space RRT* solver for `(start, goal)`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         chain: CuKinematicChain<N>,
         collision_model: CuRobotCollisionModel<N, M>,
         params: CuJointRrtParams,
-        world: CuCollisionWorld<MAX_OBSTACLES>,
+        scene: CuPlanningScene<MAX_OBSTACLES, MAX_ATTACHED_SHAPES>,
+        exclusions: &CuSceneExclusions<MAX_EXCLUSIONS>,
         start: [CuJointPosition; N],
         goal: [CuJointPosition; N],
         seed: u64,
@@ -184,7 +212,13 @@ impl<const N: usize, const M: usize> CuJointRrtStar<N, M> {
             chain,
             collision_model,
             params,
+            scene: CuPlanningScene::new(),
             world: CuCollisionWorld::new(),
+            attached_shapes: [CuCollisionShape::default(); MAX_ATTACHED_SHAPES],
+            attached_frames: [None; MAX_ATTACHED_SHAPES],
+            attached_len: 0,
+            query_exclusions: CuSceneQueryExclusions::new(),
+            exclusions: CuSceneExclusions::new(),
             start,
             goal,
             straight_line_cost: 0.0,
@@ -196,19 +230,21 @@ impl<const N: usize, const M: usize> CuJointRrtStar<N, M> {
             rng: CuRng::from_seed(seed),
             valid_endpoints: false,
         };
-        solver.reset(world, start, goal, seed);
+        solver.reset(scene, exclusions, start, goal, seed);
         solver
     }
 
     /// Resets the solver in place for a new job without allocating.
     pub fn reset(
         &mut self,
-        world: CuCollisionWorld<MAX_OBSTACLES>,
+        scene: CuPlanningScene<MAX_OBSTACLES, MAX_ATTACHED_SHAPES>,
+        exclusions: &CuSceneExclusions<MAX_EXCLUSIONS>,
         start: [CuJointPosition; N],
         goal: [CuJointPosition; N],
         seed: u64,
     ) {
-        self.world = world;
+        self.scene = scene;
+        self.exclusions = exclusions.clone();
         self.start = start;
         self.goal = goal;
         self.straight_line_cost = joint_distance(&start, &goal, self.params.metric);
@@ -218,15 +254,11 @@ impl<const N: usize, const M: usize> CuJointRrtStar<N, M> {
         self.iterations = 0;
         self.rng.reseed(seed);
 
-        let start_ok = self
-            .collision_model
-            .is_configuration_collision_free(&self.chain, &self.start, Some(&self.world))
-            .unwrap_or(false);
-        let goal_ok = self
-            .collision_model
-            .is_configuration_collision_free(&self.chain, &self.goal, Some(&self.world))
-            .unwrap_or(false);
-        self.valid_endpoints = start_ok
+        let scene_ok = self.capture_scene(exclusions);
+        let start_ok = scene_ok && self.is_scene_configuration_free(&self.start);
+        let goal_ok = scene_ok && self.is_scene_configuration_free(&self.goal);
+        self.valid_endpoints = scene_ok
+            && start_ok
             && goal_ok
             && self.params.metric.validate().is_ok()
             && self.params.step_size.is_finite()
@@ -251,17 +283,7 @@ impl<const N: usize, const M: usize> CuJointRrtStar<N, M> {
             if self.straight_line_cost <= 1e-9 {
                 self.goal_node_idx = Some(0);
                 self.best_cost = 0.0;
-            } else if self
-                .collision_model
-                .is_segment_collision_free(
-                    &self.chain,
-                    &self.start,
-                    &self.goal,
-                    self.params.collision_check_step,
-                    Some(&self.world),
-                )
-                .unwrap_or(false)
-            {
+            } else if self.is_scene_segment_free(&self.start, &self.goal) {
                 // Direct line-of-sight connection from start to goal!
                 self.nodes[1] = RrtNode {
                     q: self.goal,
@@ -309,11 +331,7 @@ impl<const N: usize, const M: usize> CuJointRrtStar<N, M> {
                 continue;
             }
 
-            if !self
-                .collision_model
-                .is_configuration_collision_free(&self.chain, &q_new, Some(&self.world))
-                .unwrap_or(false)
-            {
+            if !self.is_scene_configuration_free(&q_new) {
                 continue;
             }
 
@@ -322,17 +340,7 @@ impl<const N: usize, const M: usize> CuJointRrtStar<N, M> {
             let mut best_new_cost = self.nodes[nearest_idx].cost
                 + joint_distance(&self.nodes[nearest_idx].q, &q_new, self.params.metric);
 
-            if !self
-                .collision_model
-                .is_segment_collision_free(
-                    &self.chain,
-                    &self.nodes[nearest_idx].q,
-                    &q_new,
-                    self.params.collision_check_step,
-                    Some(&self.world),
-                )
-                .unwrap_or(false)
-            {
+            if !self.is_scene_segment_free(&self.nodes[nearest_idx].q, &q_new) {
                 continue;
             }
 
@@ -343,16 +351,7 @@ impl<const N: usize, const M: usize> CuJointRrtStar<N, M> {
                     if d <= rewire_radius {
                         let cand_cost = self.nodes[idx].cost + d;
                         if cand_cost < best_new_cost
-                            && self
-                                .collision_model
-                                .is_segment_collision_free(
-                                    &self.chain,
-                                    &self.nodes[idx].q,
-                                    &q_new,
-                                    self.params.collision_check_step,
-                                    Some(&self.world),
-                                )
-                                .unwrap_or(false)
+                            && self.is_scene_segment_free(&self.nodes[idx].q, &q_new)
                         {
                             best_parent = idx;
                             best_new_cost = cand_cost;
@@ -370,45 +369,66 @@ impl<const N: usize, const M: usize> CuJointRrtStar<N, M> {
             };
             self.node_count += 1;
 
-            // Rewire neighbors through `new_idx` if cheaper
+            // Rewire neighbors through `new_idx` if cheaper. Skipping ancestors of
+            // `new_idx` keeps the parent links acyclic.
+            let mut rewired = false;
             let mut nbr = 0;
             while nbr < new_idx {
                 if nbr != best_parent {
                     let d = joint_distance(&q_new, &self.nodes[nbr].q, self.params.metric);
                     if d <= rewire_radius
                         && best_new_cost + d < self.nodes[nbr].cost
-                        && self
-                            .collision_model
-                            .is_segment_collision_free(
-                                &self.chain,
-                                &q_new,
-                                &self.nodes[nbr].q,
-                                self.params.collision_check_step,
-                                Some(&self.world),
-                            )
-                            .unwrap_or(false)
+                        && !self.is_ancestor_of(nbr, new_idx)
+                        && self.is_scene_segment_free(&q_new, &self.nodes[nbr].q)
                     {
                         self.nodes[nbr].parent = new_idx as u16;
                         self.nodes[nbr].cost = best_new_cost + d;
+                        rewired = true;
                     }
                 }
                 nbr += 1;
+            }
+
+            // Propagate rewired costs to descendants so tree costs stay consistent.
+            if rewired {
+                let mut pass = 0;
+                loop {
+                    let mut changed = false;
+                    let mut i = 0;
+                    while i < self.node_count {
+                        let p = self.nodes[i].parent;
+                        if p != u16::MAX {
+                            let pu = p as usize;
+                            let c = self.nodes[pu].cost
+                                + joint_distance(
+                                    &self.nodes[pu].q,
+                                    &self.nodes[i].q,
+                                    self.params.metric,
+                                );
+                            if c < self.nodes[i].cost - 1e-12 {
+                                self.nodes[i].cost = c;
+                                changed = true;
+                            }
+                        }
+                        i += 1;
+                    }
+                    pass += 1;
+                    if !changed || pass >= self.node_count {
+                        break;
+                    }
+                }
+                if let Some(g) = self.goal_node_idx
+                    && self.nodes[g].cost < self.best_cost
+                {
+                    self.best_cost = self.nodes[g].cost;
+                }
             }
 
             // Try connecting `new_idx` to `goal` if within `goal_threshold` and capacity allows
             let dist_to_goal = joint_distance(&q_new, &self.goal, self.params.metric);
             if dist_to_goal <= goal_threshold
                 && best_new_cost + dist_to_goal < self.best_cost
-                && self
-                    .collision_model
-                    .is_segment_collision_free(
-                        &self.chain,
-                        &q_new,
-                        &self.goal,
-                        self.params.collision_check_step,
-                        Some(&self.world),
-                    )
-                    .unwrap_or(false)
+                && self.is_scene_segment_free(&q_new, &self.goal)
             {
                 if let Some(g_idx) = self.goal_node_idx {
                     self.nodes[g_idx].parent = new_idx as u16;
@@ -455,83 +475,232 @@ impl<const N: usize, const M: usize> CuJointRrtStar<N, M> {
         self.node_count as u32
     }
 
+    /// Returns the scene revision captured for the current job.
+    pub const fn scene_revision(&self) -> CuSceneRevision {
+        self.scene.revision()
+    }
+
+    /// Captures the scene snapshot into query caches, returning `false` when invalid.
+    ///
+    /// Stable-ID `exclusions` resolve against the captured snapshot; invalid
+    /// references invalidate the whole job.
+    fn capture_scene(&mut self, exclusions: &CuSceneExclusions<MAX_EXCLUSIONS>) -> bool {
+        if self.scene.write_collision_world(&mut self.world).is_err() {
+            self.attached_len = 0;
+            return false;
+        }
+        let attached = self.scene.attached_shapes();
+        if attached.len() > MAX_ATTACHED_SHAPES {
+            self.attached_len = 0;
+            return false;
+        }
+        let mut i = 0;
+        while i < attached.len() {
+            if attached[i].link_index >= N {
+                self.attached_len = 0;
+                return false;
+            }
+            self.attached_shapes[i] = attached[i].shape;
+            self.attached_frames[i] = Some(attached[i].link_index);
+            i += 1;
+        }
+        while i < MAX_ATTACHED_SHAPES {
+            self.attached_shapes[i] = CuCollisionShape::default();
+            self.attached_frames[i] = None;
+            i += 1;
+        }
+        self.attached_len = attached.len();
+        let mut resolved = CuSceneQueryExclusions::new();
+        if exclusions
+            .resolve(
+                &self.scene,
+                self.collision_model.shape_count(),
+                &mut resolved,
+            )
+            .is_err()
+        {
+            self.attached_len = 0;
+            return false;
+        }
+        self.query_exclusions = resolved;
+        true
+    }
+
+    /// Returns `true` when `q` is within limits and free of self, environment,
+    /// and attached-shape collisions against the captured scene snapshot.
+    fn is_scene_configuration_free(&self, q: &[CuJointPosition; N]) -> bool {
+        if !self
+            .collision_model
+            .is_configuration_collision_free(&self.chain, q, Some(&self.world))
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        if self.attached_len == 0 {
+            return true;
+        }
+        let mut attached_world_shapes = [CuCollisionShape::default(); MAX_ATTACHED_SHAPES];
+        let mut robot_world_shapes = [CuCollisionShape::default(); M];
+        let mut report = CuCollisionReport::<0>::default();
+        check_attached_configuration(
+            &self.collision_model,
+            &self.chain,
+            q,
+            &self.attached_shapes,
+            &self.attached_frames,
+            self.attached_len,
+            Some(&self.world),
+            &self.query_exclusions,
+            &mut attached_world_shapes,
+            &mut robot_world_shapes,
+            &mut report,
+        )
+        .is_ok()
+            && report.is_collision_free()
+    }
+
+    /// Returns `true` when the interpolated segment from `a` to `b` is collision-free
+    /// against the captured scene snapshot at the configured resolution.
+    fn is_scene_segment_free(&self, a: &[CuJointPosition; N], b: &[CuJointPosition; N]) -> bool {
+        let metric = self.params.collision_check_step.metric();
+        if metric.validate().is_err() {
+            return false;
+        }
+        let mut max_delta = 0.0_f64;
+        let mut j = 0;
+        while j < N {
+            if self.chain.joints()[j].validate_coordinate(a[j]).is_err()
+                || self.chain.joints()[j].validate_coordinate(b[j]).is_err()
+            {
+                return false;
+            }
+            let delta = (metric.normalized(b[j]) - metric.normalized(a[j])).abs();
+            if delta > max_delta {
+                max_delta = delta;
+            }
+            j += 1;
+        }
+        if max_delta > 1_000_000.0 {
+            return false;
+        }
+        let steps = (libm::ceil(max_delta) as usize).max(1);
+        let mut s = 0;
+        while s <= steps {
+            let alpha = (s as f64) / (steps as f64);
+            let mut q_interp = [CuJointPosition::default(); N];
+            let mut k = 0;
+            while k < N {
+                match a[k].interpolate(b[k], alpha) {
+                    Ok(q) => q_interp[k] = q,
+                    Err(_) => return false,
+                }
+                k += 1;
+            }
+            if !self.is_scene_configuration_free(&q_interp) {
+                return false;
+            }
+            s += 1;
+        }
+        true
+    }
+
     /// Computes the normalized quality in `[0.0, 1.0]` (`straight_line_cost / best_cost`).
     pub fn quality(&self) -> Quality {
-        if !self.has_solution() || !self.best_cost.is_finite() {
+        self.quality_of_cost(self.best_cost)
+    }
+
+    /// Computes the normalized quality in `[0.0, 1.0]` of an actually emitted path
+    /// (`straight_line_cost / cost`).
+    pub fn quality_of_cost(&self, cost: f64) -> Quality {
+        if !self.has_solution() || !cost.is_finite() {
             return quality_from_f32(0.0);
         }
-        if self.straight_line_cost <= 1e-9 || self.best_cost <= 1e-9 {
+        if self.straight_line_cost <= 1e-9 || cost <= 1e-9 {
             return quality_from_f32(1.0);
         }
-        let ratio = (self.straight_line_cost / self.best_cost).clamp(0.0, 1.0);
+        let ratio = (self.straight_line_cost / cost).clamp(0.0, 1.0);
         quality_from_f32(ratio as f32)
     }
 
+    /// Dimensionless joint-space L2 cost of an emitted waypoint sequence
+    /// (`waypoints[..len]`) using the configured metric.
+    pub fn path_cost(
+        &self,
+        waypoints: &[CuJointPositionsPayload<N>; MAX_WAYPOINTS],
+        len: u32,
+    ) -> f64 {
+        let mut total = 0.0_f64;
+        let mut i = 0usize;
+        while i + 1 < len as usize {
+            total += joint_distance(
+                &waypoints[i].positions,
+                &waypoints[i + 1].positions,
+                self.params.metric,
+            );
+            i += 1;
+        }
+        total
+    }
+
     /// Extracts and shortcuts the best path in place into `out_waypoints`, returning the
-    /// number of waypoints written (`Some(len)`), or `None` if no solution exists or it exceeds `MAX_WAYPOINTS`.
+    /// number of waypoints written (`Some(len)`), or `None` if no solution exists or the
+    /// shortcut path still exceeds `MAX_WAYPOINTS`.
     pub fn write_path(
         &self,
         out_waypoints: &mut [CuJointPositionsPayload<N>; MAX_WAYPOINTS],
     ) -> Option<u32> {
-        let mut curr = self.goal_node_idx?;
-        let mut raw_chain = [[CuJointPosition::default(); N]; MAX_WAYPOINTS];
-        let mut count = 0usize;
+        let mut anchor = self.goal_node_idx?;
 
-        while curr != u16::MAX as usize {
+        // Greedy line-of-sight shortcutting while walking the parent chain from the goal
+        // back to the start, so raw paths longer than MAX_WAYPOINTS are still shortcut
+        // before any capacity rejection. `shortcut[..count]` runs from goal back to start.
+        let mut shortcut = [[CuJointPosition::default(); N]; MAX_WAYPOINTS];
+        let mut count = 0usize;
+        shortcut[count] = self.nodes[anchor].q;
+        count += 1;
+
+        let mut steps = 0;
+        loop {
+            let parent = self.nodes[anchor].parent;
+            if parent == u16::MAX {
+                break; // `anchor` is the start node
+            }
+            steps += 1;
+            if steps > self.node_count {
+                return None; // defensive: parent chain never reached the root
+            }
+            // Farthest ancestor toward the start reachable from `anchor` in a straight line.
+            let mut chosen = parent as usize;
+            let mut curr = parent as usize;
+            let mut hops = 0;
+            while hops <= self.node_count {
+                hops += 1;
+                let up = self.nodes[curr].parent;
+                if up == u16::MAX {
+                    break;
+                }
+                if self.is_scene_segment_free(&self.nodes[anchor].q, &self.nodes[up as usize].q) {
+                    chosen = up as usize;
+                }
+                curr = up as usize;
+            }
             if count >= MAX_WAYPOINTS {
                 return None;
             }
-            raw_chain[count] = self.nodes[curr].q;
+            shortcut[count] = self.nodes[chosen].q;
             count += 1;
-            let parent = self.nodes[curr].parent;
-            if parent == u16::MAX {
-                break;
-            }
-            curr = parent as usize;
+            anchor = chosen;
         }
 
-        // Reverse `raw_chain[..count]` so index 0 is `start` and `count - 1` is `goal`
-        let mut ordered = [[CuJointPosition::default(); N]; MAX_WAYPOINTS];
+        // Reverse goal->start into start->goal.
         let mut i = 0;
         while i < count {
-            ordered[i] = raw_chain[count - 1 - i];
+            out_waypoints[i] = CuJointPositionsPayload {
+                positions: shortcut[count - 1 - i],
+            };
             i += 1;
         }
-
-        // Greedy line-of-sight shortcutting
-        let mut out_len = 0usize;
-        let mut anchor = 0usize;
-        out_waypoints[0] = CuJointPositionsPayload {
-            positions: ordered[0],
-        };
-        out_len += 1;
-
-        while anchor + 1 < count {
-            let mut farthest = count - 1;
-            while farthest > anchor + 1 {
-                if self
-                    .collision_model
-                    .is_segment_collision_free(
-                        &self.chain,
-                        &ordered[anchor],
-                        &ordered[farthest],
-                        self.params.collision_check_step,
-                        Some(&self.world),
-                    )
-                    .unwrap_or(false)
-                {
-                    break;
-                }
-                farthest -= 1;
-            }
-            out_waypoints[out_len] = CuJointPositionsPayload {
-                positions: ordered[farthest],
-            };
-            out_len += 1;
-            anchor = farthest;
-        }
-
-        Some(out_len as u32)
+        Some(count as u32)
     }
 
     fn sample_config(&mut self) -> [CuJointPosition; N] {
@@ -550,6 +719,20 @@ impl<const N: usize, const M: usize> CuJointRrtStar<N, M> {
             j += 1;
         }
         q
+    }
+
+    /// Returns `true` when `maybe_ancestor` lies on the parent chain of `node`.
+    fn is_ancestor_of(&self, maybe_ancestor: usize, node: usize) -> bool {
+        let mut curr = node;
+        let mut guard = 0;
+        while curr != u16::MAX as usize && guard <= self.node_count {
+            if curr == maybe_ancestor {
+                return true;
+            }
+            curr = self.nodes[curr].parent as usize;
+            guard += 1;
+        }
+        false
     }
 
     fn nearest_node(&self, q_target: &[CuJointPosition; N]) -> usize {
@@ -678,25 +861,38 @@ impl<const N: usize, const M: usize> CuJointRrtStarTask<N, M> {
             best_cost: p.map_or(f64::INFINITY, CuJointRrtStar::best_cost),
             published_cost: self.published_cost,
             published_quality: self.published_quality,
+            scene_revision: p.map_or(CuSceneRevision::INITIAL, CuJointRrtStar::scene_revision),
         }
     }
 
     fn publish(&mut self, output: &mut CuMsg<CuJointPlanPath<N>>) -> Quality {
-        if let Some(planner) = self.planner.as_ref()
-            && planner.has_solution()
-            && planner.best_cost() < self.published_cost
-        {
-            let mut waypoints = core::array::from_fn(|_| CuJointPositionsPayload::default());
-            if let Some(len) = planner.write_path(&mut waypoints) {
-                output.set_payload(CuJointPlanPath {
-                    waypoints,
-                    len,
-                    cost: planner.best_cost(),
-                    iterations: planner.iterations(),
-                });
-                self.published_cost = planner.best_cost();
-                self.published_quality = planner.quality();
-            }
+        let Some(planner) = self.planner.as_ref() else {
+            return self.published_quality;
+        };
+        if !planner.has_solution() {
+            return self.published_quality;
+        }
+        let mut waypoints = core::array::from_fn(|_| CuJointPositionsPayload::default());
+        let Some(len) = planner.write_path(&mut waypoints) else {
+            // The best path does not fit the waypoint capacity even after shortcutting:
+            // signal that no accurate path can be published.
+            output.clear_payload();
+            self.published_quality = quality_from_f32(0.0);
+            return self.published_quality;
+        };
+        // Publish the cost and quality of the actually emitted (shortcut) path.
+        let cost = planner.path_cost(&waypoints, len);
+        if cost < self.published_cost || self.published_quality.raw() <= 0.0 {
+            output.set_payload(CuJointPlanPath {
+                waypoints,
+                len,
+                cost,
+                iterations: planner.iterations(),
+                scene_revision: planner.scene_revision(),
+                exclusions: planner.exclusions.clone(),
+            });
+            self.published_cost = cost;
+            self.published_quality = planner.quality_of_cost(cost);
         }
         self.published_quality
     }
@@ -784,14 +980,21 @@ impl<const N: usize, const M: usize> CuAnytimeTask for CuJointRrtStarTask<N, M> 
 
         let planner = match self.planner.as_mut() {
             Some(planner) => {
-                planner.reset(request.world.clone(), request.start, request.goal, seed);
+                planner.reset(
+                    request.scene.clone(),
+                    &request.exclusions,
+                    request.start,
+                    request.goal,
+                    seed,
+                );
                 planner
             }
             None => self.planner.insert(CuJointRrtStar::new(
                 self.chain,
                 self.collision_model,
                 self.params,
-                request.world.clone(),
+                request.scene.clone(),
+                &request.exclusions,
                 request.start,
                 request.goal,
                 seed,
@@ -865,7 +1068,8 @@ mod tests {
         let mut task = CuJointRrtStarTask::<1>::new(Some(&cfg), resources()).unwrap();
         let (ctx, _) = CuContext::new_mock_clock();
         let request = CuMsg::new(Some(CuJointPlanRequest {
-            world: CuCollisionWorld::new(),
+            scene: CuPlanningScene::new(),
+            exclusions: CuSceneExclusions::new(),
             start: [Angle64::new::<radian>(0.0).into()],
             goal: [Angle64::new::<radian>(0.5).into()],
         }));
@@ -901,7 +1105,8 @@ mod tests {
         ];
 
         let req = CuMsg::new(Some(CuJointPlanRequest {
-            world: CuCollisionWorld::new(),
+            scene: CuPlanningScene::new(),
+            exclusions: CuSceneExclusions::new(),
             start,
             goal,
         }));
@@ -953,15 +1158,20 @@ mod tests {
             .unwrap();
         let m = mid_ee.to_matrix();
 
-        let mut world = CuCollisionWorld::new();
-        world
+        let mut scene = CuPlanningScene::<MAX_OBSTACLES, MAX_ATTACHED_SHAPES>::new();
+        scene
             .add_obstacle(CuCollisionShape::Sphere(CuSphere::from_meters(
                 [m[0][3], m[1][3], m[2][3]],
                 0.08,
             )))
             .unwrap();
 
-        let req = CuMsg::new(Some(CuJointPlanRequest { world, start, goal }));
+        let req = CuMsg::new(Some(CuJointPlanRequest {
+            scene,
+            exclusions: CuSceneExclusions::new(),
+            start,
+            goal,
+        }));
         let mut out = CuMsg::new(None);
 
         let status = task.base(&ctx, &req, &mut out).unwrap();
@@ -986,6 +1196,12 @@ mod tests {
         // Verify every segment of the published path is collision-free
         let model = igus_rebel_collision_model();
         let chain = igus_rebel_chain();
+        let mut verify_world = CuCollisionWorld::<MAX_OBSTACLES>::new();
+        req.payload()
+            .unwrap()
+            .scene
+            .write_collision_world(&mut verify_world)
+            .unwrap();
         for w in 0..(path.len as usize - 1) {
             assert!(
                 model
@@ -994,7 +1210,7 @@ mod tests {
                         &path.waypoints[w].positions,
                         &path.waypoints[w + 1].positions,
                         Angle64::new::<radian>(0.05),
-                        Some(&req.payload().unwrap().world),
+                        Some(&verify_world),
                     )
                     .unwrap()
             );

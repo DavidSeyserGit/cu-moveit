@@ -2,6 +2,8 @@
 
 use cu_collision::CuCollisionReport;
 use cu_collision::CuCollisionWorld;
+use cu_collision::CuPlanningScene;
+use cu_collision::CuSceneExclusions;
 use cu_joint_rrt_star::CuJointPlanRequest;
 use cu_joint_rrt_star::CuJointRrtParams;
 use cu_joint_rrt_star::CuJointRrtStarTask;
@@ -42,7 +44,7 @@ fn main() -> CuResult<()> {
         return Err(CuError::from("Example IK did not converge"));
     }
     let mut report = CuCollisionReport::<16>::default();
-    let world = CuCollisionWorld::new();
+    let world = CuCollisionWorld::<0>::new();
     robot.collision_model.check_configuration(
         &robot.chain,
         &solution,
@@ -62,7 +64,13 @@ fn main() -> CuResult<()> {
         7,
     );
     let (ctx, _) = CuContext::new_mock_clock();
-    let request = CuMsg::new(Some(CuJointPlanRequest { world, start, goal }));
+    let scene = CuPlanningScene::<16, 8>::new();
+    let request = CuMsg::new(Some(CuJointPlanRequest {
+        scene,
+        exclusions: CuSceneExclusions::new(),
+        start,
+        goal,
+    }));
     let mut output = CuMsg::new(None);
     planner.base(&ctx, &request, &mut output)?;
     for _ in 0..8 {

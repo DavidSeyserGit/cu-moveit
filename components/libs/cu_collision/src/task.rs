@@ -6,6 +6,8 @@ use crate::model::CuRobotCollisionModel;
 use crate::scene::CuPlanningScene;
 use crate::scene::DEFAULT_MAX_ATTACHED_SHAPES;
 use crate::scene::DEFAULT_MAX_SCENE_OBSTACLES;
+use crate::scene_exclusions::CuSceneExclusions;
+use crate::scene_exclusions::DEFAULT_MAX_SCENE_EXCLUSIONS;
 use crate::scene_query::CuSceneQueryExclusions;
 use crate::scene_query::check_attached_shapes;
 use crate::shapes::CuCollisionShape;
@@ -32,6 +34,7 @@ pub struct CuCollisionCheckTask<
     const MAX_OBS: usize = DEFAULT_MAX_OBSTACLES,
     const MAX_ATTACHED: usize = DEFAULT_MAX_ATTACHED,
     const MAX_CONTACTS: usize = DEFAULT_MAX_CONTACTS,
+    const MAX_EXCL: usize = DEFAULT_MAX_SCENE_EXCLUSIONS,
     const M: usize = N,
 > {
     #[reflect(ignore)]
@@ -45,8 +48,9 @@ impl<
     const MAX_OBS: usize,
     const MAX_ATTACHED: usize,
     const MAX_CONTACTS: usize,
+    const MAX_EXCL: usize,
     const M: usize,
-> CuCollisionCheckTask<N, MAX_OBS, MAX_ATTACHED, MAX_CONTACTS, M>
+> CuCollisionCheckTask<N, MAX_OBS, MAX_ATTACHED, MAX_CONTACTS, MAX_EXCL, M>
 {
     /// Creates a collision check task from an explicit kinematic chain and robot collision model.
     pub const fn new_with_model(
@@ -68,13 +72,16 @@ impl<
 
     /// Checks self-collision, environment obstacles, and attached shapes for configuration `q`
     /// against an optional planning scene snapshot, populating `out_report` in place.
+    ///
+    /// Stable-ID `exclusions` resolve against `scene`; invalid references fail the check.
     pub fn check_configuration(
         &self,
         q: &[CuJointPosition; N],
         scene: Option<&CuPlanningScene<MAX_OBS, MAX_ATTACHED>>,
+        exclusions: Option<&CuSceneExclusions<MAX_EXCL>>,
         out_report: &mut CuCollisionReport<MAX_CONTACTS>,
     ) -> CuResult<()> {
-        check_scene_configuration(&self.chain, &self.model, q, scene, out_report)
+        check_scene_configuration(&self.chain, &self.model, q, scene, exclusions, out_report)
     }
 }
 
@@ -83,8 +90,9 @@ impl<
     const MAX_OBS: usize,
     const MAX_ATTACHED: usize,
     const MAX_CONTACTS: usize,
+    const MAX_EXCL: usize,
     const M: usize,
-> Freezable for CuCollisionCheckTask<N, MAX_OBS, MAX_ATTACHED, MAX_CONTACTS, M>
+> Freezable for CuCollisionCheckTask<N, MAX_OBS, MAX_ATTACHED, MAX_CONTACTS, MAX_EXCL, M>
 {
 }
 
@@ -93,14 +101,16 @@ impl<
     const MAX_OBS: usize,
     const MAX_ATTACHED: usize,
     const MAX_CONTACTS: usize,
+    const MAX_EXCL: usize,
     const M: usize,
-> CuTask for CuCollisionCheckTask<N, MAX_OBS, MAX_ATTACHED, MAX_CONTACTS, M>
+> CuTask for CuCollisionCheckTask<N, MAX_OBS, MAX_ATTACHED, MAX_CONTACTS, MAX_EXCL, M>
 {
     type Resources<'r> = ();
     type Input<'m> = input_msg!(
         'm,
         CuJointPositionsPayload<N>,
-        CuPlanningScene<MAX_OBS, MAX_ATTACHED>
+        CuPlanningScene<MAX_OBS, MAX_ATTACHED>,
+        CuSceneExclusions<MAX_EXCL>
     );
     type Output<'m> = output_msg!(CuCollisionReport<MAX_CONTACTS>);
 
@@ -126,8 +136,10 @@ impl<
     ) -> CuResult<()> {
         output.tov = if !matches!(input.0.tov, Tov::None) {
             input.0.tov
-        } else {
+        } else if !matches!(input.1.tov, Tov::None) {
             input.1.tov
+        } else {
+            input.2.tov
         };
 
         let Some(joints) = input.0.payload() else {
@@ -136,12 +148,14 @@ impl<
         };
 
         let scene = input.1.payload();
+        let exclusions = input.2.payload();
         let mut report = CuCollisionReport::<MAX_CONTACTS>::default();
         check_scene_configuration(
             &self.chain,
             &self.model,
             &joints.positions,
             scene,
+            exclusions,
             &mut report,
         )?;
         output.set_payload(report);
@@ -157,17 +171,19 @@ fn check_scene_configuration<
     const MAX_OBS: usize,
     const MAX_ATTACHED: usize,
     const MAX_CONTACTS: usize,
+    const MAX_EXCL: usize,
 >(
     chain: &CuKinematicChain<N>,
     model: &CuRobotCollisionModel<N, M>,
     q: &[CuJointPosition; N],
     scene: Option<&CuPlanningScene<MAX_OBS, MAX_ATTACHED>>,
+    exclusions: Option<&CuSceneExclusions<MAX_EXCL>>,
     out_report: &mut CuCollisionReport<MAX_CONTACTS>,
 ) -> CuResult<()> {
     let mut frames = [Transform3D::<f64>::identity(); N];
     let mut ee = Transform3D::<f64>::identity();
     chain.forward_frames(q, &mut frames, &mut ee)?;
-    check_scene_frames(model, &frames, scene, out_report)
+    check_scene_frames(model, &frames, scene, exclusions, out_report)
 }
 
 /// Evaluates self-collision, environment obstacles, and attached shapes for precomputed `link_frames`
@@ -178,18 +194,29 @@ fn check_scene_frames<
     const MAX_OBS: usize,
     const MAX_ATTACHED: usize,
     const MAX_CONTACTS: usize,
+    const MAX_EXCL: usize,
 >(
     model: &CuRobotCollisionModel<N, M>,
     link_frames: &[Transform3D<f64>; N],
     scene: Option<&CuPlanningScene<MAX_OBS, MAX_ATTACHED>>,
+    exclusions: Option<&CuSceneExclusions<MAX_EXCL>>,
     out_report: &mut CuCollisionReport<MAX_CONTACTS>,
 ) -> CuResult<()> {
     match scene {
         None => {
+            if exclusions.is_some_and(|e| !e.is_empty()) {
+                return Err(CuError::from(
+                    "cu_collision: scene exclusions require a planning scene snapshot",
+                ));
+            }
             model.check_frames::<MAX_OBS, MAX_CONTACTS>(link_frames, None, out_report);
             Ok(())
         }
         Some(scene) => {
+            let mut query_exclusions = CuSceneQueryExclusions::<MAX_EXCL>::new();
+            if let Some(exclusions) = exclusions {
+                exclusions.resolve(scene, model.shape_count(), &mut query_exclusions)?;
+            }
             let mut world = CuCollisionWorld::<MAX_OBS>::new();
             scene.write_collision_world(&mut world)?;
             model.check_frames(link_frames, Some(&world), out_report);
@@ -204,7 +231,6 @@ fn check_scene_frames<
                     attached_frames[i] = Some(att.link_index);
                 }
 
-                let exclusions = CuSceneQueryExclusions::<0>::new();
                 let mut out_attached_world_shapes = [CuCollisionShape::default(); MAX_ATTACHED];
                 let mut out_robot_world_shapes = [CuCollisionShape::default(); M];
                 check_attached_shapes(
@@ -214,7 +240,7 @@ fn check_scene_frames<
                     &attached_frames,
                     attached_len,
                     Some(&world),
-                    &exclusions,
+                    &query_exclusions,
                     &mut out_attached_world_shapes,
                     &mut out_robot_world_shapes,
                     out_report,

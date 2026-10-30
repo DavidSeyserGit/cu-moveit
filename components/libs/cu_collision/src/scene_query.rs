@@ -41,6 +41,13 @@
 //! equivalent automatic skip for attached-vs-robot pairs: the model does not
 //! expose its per-shape frame indices, so those pairs must be excluded
 //! explicitly until it does.
+//!
+//! A `None` frame means a shape fixed in the base frame, so two `None` shapes
+//! are also one rigid body and are skipped just like equal `Some` frames.
+//!
+//! Scene-level callers address exclusions by stable object ID with
+//! [`CuSceneExclusions`](crate::scene_exclusions::CuSceneExclusions) and
+//! resolve them against the current snapshot into this index-based set.
 
 use crate::model::CuCollisionReport;
 use crate::model::CuCollisionWorld;
@@ -169,6 +176,16 @@ impl<const MAX_EXCLUSIONS: usize> CuSceneQueryExclusions<MAX_EXCLUSIONS> {
         self.len == 0
     }
 
+    /// Returns the maximum number of exclusions.
+    pub const fn capacity(&self) -> usize {
+        MAX_EXCLUSIONS
+    }
+
+    /// Removes all active exclusions in place.
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
     /// Borrows the active exclusions.
     pub fn as_slice(&self) -> &[CuSceneQueryExclusion] {
         &self.entries[..self.len]
@@ -233,6 +250,9 @@ pub fn transform_attached_shapes<const N: usize, const A: usize>(
 /// the shapes were transformed with. Distances are also merged into
 /// `out_report.min_signed_distance`, including for pairs that do not violate
 /// `safety_margin`.
+///
+/// Transactional with respect to the report: all inputs are validated before
+/// the first pair is observed, so on error `out_report` is left unmodified.
 pub fn check_attached_world_shapes<const MAX_CONTACTS: usize, const MAX_EXCLUSIONS: usize>(
     attached_world_shapes: &[CuCollisionShape],
     attached_frames: &[Option<usize>],
@@ -269,8 +289,9 @@ pub fn check_attached_world_shapes<const MAX_CONTACTS: usize, const MAX_EXCLUSIO
     while i < attached_world_shapes.len() {
         let mut j = i + 1;
         while j < attached_world_shapes.len() {
-            let same_frame =
-                attached_frames[i].is_some() && attached_frames[i] == attached_frames[j];
+            // Equal frames are one rigid body, including `None == None` (both
+            // fixed in the base frame); they cannot move relative to each other.
+            let same_frame = attached_frames[i] == attached_frames[j];
             if !same_frame && !exclusions.is_excluded(i, CuQueryPartnerKind::AttachedShape, j) {
                 let dist =
                     shape_signed_distance(&attached_world_shapes[i], &attached_world_shapes[j]);
@@ -366,6 +387,7 @@ pub fn attached_world_shapes_collision_free<const MAX_EXCLUSIONS: usize>(
 /// Scratch arrays are caller-owned so repeated queries reuse the same storage.
 /// Pair the call with `model.check_frames(link_frames, world, out_report)`
 /// (which clears the report first) for a combined robot + attached result.
+/// On error, `out_report` is left unmodified.
 #[allow(clippy::too_many_arguments)]
 pub fn check_attached_shapes<
     const N: usize,
@@ -386,6 +408,11 @@ pub fn check_attached_shapes<
     out_robot_world_shapes: &mut [CuCollisionShape; M],
     out_report: &mut CuCollisionReport<MAX_CONTACTS>,
 ) -> CuResult<()> {
+    if model.shape_count() > M {
+        return Err(CuError::from(
+            "cu_collision: robot shape count exceeds output capacity",
+        ));
+    }
     transform_attached_shapes(
         link_frames,
         attached_shapes,
@@ -394,7 +421,7 @@ pub fn check_attached_shapes<
         out_attached_world_shapes,
     )?;
     model.world_link_shapes(link_frames, out_robot_world_shapes);
-    let robot_count = model.shape_count().min(M);
+    let robot_count = model.shape_count();
     let obstacles: &[CuCollisionShape] = match world {
         Some(world) => world.as_slice(),
         None => &[],
@@ -411,7 +438,8 @@ pub fn check_attached_shapes<
 }
 
 /// Runs forward kinematics for `q` and appends attached-shape contacts into
-/// `out_report` without clearing it. See [`check_attached_shapes`].
+/// `out_report` without clearing it. See [`check_attached_shapes`]. On error,
+/// `out_report` is left unmodified.
 #[allow(clippy::too_many_arguments)]
 pub fn check_attached_configuration<
     const N: usize,

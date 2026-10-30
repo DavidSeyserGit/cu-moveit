@@ -3,6 +3,8 @@
 use cu_collision::CuCollisionReport;
 use cu_collision::CuCollisionShape;
 use cu_collision::CuCollisionWorld;
+use cu_collision::CuPlanningScene;
+use cu_collision::CuSceneExclusions;
 use cu_joint_rrt_star::CuJointPlanPath;
 use cu_joint_rrt_star::CuJointPlanRequest;
 use cu_joint_rrt_star::CuJointRrtParams;
@@ -166,7 +168,8 @@ fn named_states_drive_a_mixed_joint_anytime_planner() {
     );
     let (ctx, _) = CuContext::new_mock_clock();
     let input = CuMsg::new(Some(CuJointPlanRequest {
-        world: CuCollisionWorld::new(),
+        scene: CuPlanningScene::new(),
+        exclusions: CuSceneExclusions::new(),
         start,
         goal,
     }));
