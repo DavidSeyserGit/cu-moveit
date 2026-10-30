@@ -18,8 +18,8 @@ environments = ["host", "embedded"]
 
 [dependencies]
 bincode = { workspace = true }
-cu-kinematics = { version = "0.3.0", path = "../../libs/cu_kinematics", default-features = false }
-cu-trajectory = { version = "0.3.0", path = "../../libs/cu_trajectory", default-features = false }
+cu-kinematics = { version = "0.4.0", path = "../../libs/cu_kinematics", default-features = false }
+cu-trajectory = { version = "0.4.0", path = "../../libs/cu_trajectory", default-features = false }
 cu29 = { workspace = true }
 serde = { workspace = true }
 
