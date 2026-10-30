@@ -14,8 +14,8 @@ domains = ["algorithm/manipulation"]
 environments = ["host"]
 
 [dependencies]
-cu-kinematics = { version = "0.4.0", path = "../cu_kinematics", default-features = false }
-cu-collision = { version = "0.4.0", path = "../cu_collision", default-features = false }
+cu-kinematics = { version = "0.4.1", path = "../cu_kinematics", default-features = false }
+cu-collision = { version = "0.4.1", path = "../cu_collision", default-features = false }
 cu-spatial-payloads = { workspace = true }
 cu29 = { workspace = true }
 roxmltree = { version = "0.21", optional = true }

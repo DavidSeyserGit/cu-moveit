@@ -18,8 +18,8 @@ environments = ["host"]
 
 [dependencies]
 bincode = { workspace = true }
-cu-controller = { version = "0.4.0", path = "../../tasks/cu_controller", default-features = false }
-cu-kinematics = { version = "0.4.0", path = "../../libs/cu_kinematics", default-features = false }
+cu-controller = { version = "0.4.1", path = "../../tasks/cu_controller", default-features = false }
+cu-kinematics = { version = "0.4.1", path = "../../libs/cu_kinematics", default-features = false }
 cu29 = { workspace = true }
 serde = { workspace = true }
 serde_json = "1.0"
