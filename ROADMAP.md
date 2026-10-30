@@ -47,6 +47,27 @@ allocation, in-place `&mut` outputs, `no_std`-compatible shared crates,
 `cu29::units` physical units, `CuResult<T>` errors, `Reflect` + `Freezable`
 tasks, deterministic replay-compatible behaviour.
 
+## Next release: 0.3
+
+Controller-interface completion, building on `v0.2.2`:
+
+- **Effort/torque commands.** Extend the unified command contract beyond
+  position/velocity: an effort channel on `CuJointCommandPayload<N>` (typed
+  torque/force per joint kind), with bridges declaring at compile time which
+  command levels they consume.
+- **Gripper and digital IO.** Standard payloads and bridge channels for a
+  gripper (position/force) and digital inputs/outputs, so end-effector
+  hardware rides the same graph as the arm.
+- **Robot-side status/fault reporting.** `CuJointStatePayload<N>` gains a
+  bridge-reported status (ok, fault with code, estop, not-ready), distinct
+  from the controller's own status; the controller surfaces it and faults
+  instead of commanding a robot that reports a fault.
+- **Rate limiting and watchdog.** `CuControllerTask<N>` gains configurable
+  command rate limiting (max joint velocity/acceleration of emitted
+  commands) and a time-based watchdog: stale measured state (by `Tov`)
+  beyond a configured age faults and holds, replacing today's purely
+  per-cycle checks. (Pulled forward from Step 3.)
+
 ## Steps
 
 1. **Trajectory generation and simulated execution (implemented; closeout pending).**
@@ -94,9 +115,9 @@ tasks, deterministic replay-compatible behaviour.
      (last command, status, watchdog state round-trip for replay), zero
      hot-path allocation, `Tov` propagated from the state input. Bridges stay
      pure transports: `CuBridge` with `joint_command`/`joint_state` channels,
-     polling in `preprocess`, dispatch in `send`/`receive`. Done when the
-     playground sim demo runs through the controller unchanged and a mock
-     bridge test proves the same graph shape works without MuJoCo.
+     polling in `preprocess`, dispatch in `send`/`receive`. Done: the
+     playground sim demo runs through the controller unchanged
+     (`v0.2.2`).
    - Pose-goal planning using the existing IK and joint-space RRT*, with explicit
      no-IK-solution, invalid-start/goal, capacity, and planning-failure outcomes.
    - Integrate existing Cartesian paths and TCP zones with the same scene and
@@ -112,8 +133,9 @@ tasks, deterministic replay-compatible behaviour.
    consistently against the selected scene revision, plus the Validation Plan
    checks.
 3. **Real-time servoing.** Harden `CuServoTask<N>` into a production servo
-   loop: rate limiting, watchdog timeouts, singularity/limit behaviour under
-   load, latency/allocation budgets enforced by tests. Add execution collision
+   loop (controller rate limiting and watchdog land earlier, in 0.3):
+   singularity/limit behaviour under load, latency/allocation budgets
+   enforced by tests. Add execution collision
    monitoring and collision-triggered abort with defined stop/hold reporting;
    distinguish geometric validation before execution from monitoring during it.
 4. **Robot bridges.** Extend the joint command/state contract established in
