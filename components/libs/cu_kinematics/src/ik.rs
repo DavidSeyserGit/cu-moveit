@@ -19,7 +19,21 @@ use cu29::units::si::velocity::meter_per_second;
 use serde::Deserialize;
 use serde::Serialize;
 
-/// Parameters of the Damped Least-Squares (DLS) inverse kinematics solver.
+/// Which inverse-kinematics solver [`CuIkParams`] selects.
+#[derive(
+    Default, Debug, Clone, Copy, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CuIkSolver {
+    /// Damped least squares: stable near singularities, uses `damping`.
+    #[default]
+    DampedLeastSquares,
+    /// Undamped pseudoinverse: exact steps away from singularities; the
+    /// solve errors instead of damping when the Jacobian is singular.
+    Pseudoinverse,
+}
+
+/// Parameters of the inverse kinematics solver selected by `solver`.
 ///
 /// RON (every field optional, SI values):
 /// `{"max_iterations": 64, "position_tolerance": 1e-4, "orientation_tolerance": 1e-3,
@@ -27,6 +41,8 @@ use serde::Serialize;
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode, Reflect)]
 #[serde(default, deny_unknown_fields)]
 pub struct CuIkParams {
+    /// The solver algorithm.
+    pub solver: CuIkSolver,
     /// Maximum solver iterations per call.
     pub max_iterations: u32,
     /// Position convergence threshold.
@@ -46,6 +62,7 @@ pub struct CuIkParams {
 impl Default for CuIkParams {
     fn default() -> Self {
         Self {
+            solver: CuIkSolver::default(),
             max_iterations: 64,
             position_tolerance: Length64::new::<meter>(1e-4),
             orientation_tolerance: Angle64::new::<radian>(1e-3),
@@ -60,7 +77,9 @@ impl Default for CuIkParams {
 impl CuIkParams {
     /// Rejects non-positive or non-finite damping, tolerances, and step sizes.
     pub fn validate(&self) -> CuResult<()> {
-        if self.damping <= 0.0 || !self.damping.is_finite() {
+        if self.solver == CuIkSolver::DampedLeastSquares
+            && (self.damping <= 0.0 || !self.damping.is_finite())
+        {
             return Err(CuError::from(
                 "cu_kinematics: IK damping must be positive and finite",
             ));
@@ -426,7 +445,10 @@ impl<const N: usize> CuKinematicChain<N> {
 
         let mut current_pose = Transform3D::<f64>::identity();
         let mut jac = [[0.0_f64; N]; 6];
-        let lambda_sq = cfg.damping * cfg.damping;
+        let lambda_sq = match cfg.solver {
+            CuIkSolver::DampedLeastSquares => cfg.damping * cfg.damping,
+            CuIkSolver::Pseudoinverse => 0.0,
+        };
 
         let mut iter = 0;
         while iter < cfg.max_iterations {

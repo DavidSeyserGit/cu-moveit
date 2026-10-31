@@ -16,7 +16,7 @@ Common to all crates:
 
 | Before | After |
 |---|---|
-| `CuIkConfig`, `CuDiffIkConfig` | `CuIkParams`, `CuDiffIkParams` (+ `validate()`) |
+| `CuIkConfig`, `CuDiffIkConfig` | `CuIkParams`, `CuDiffIkParams` (+ `validate()`); `CuIkParams.solver: CuIkSolver` declares the algorithm (`damped_least_squares` default, `pseudoinverse`) |
 | `CuIkConfig::from_config`, keys `ik_config` / flat `*_m`, `*_rad` | node key `"ik": {...}` / `"diff_ik": {...}` |
 | `CuKinematicChain::new_with_tool(j, t)` | `CuKinematicChain::new(j).with_tool_offset(t)` |
 | `CuKinematicChain::from_config(cfg)` | `CuChainSpec<N>::resolve()`; RON `"chain": "igus_rebel"` or `{"joints": [...]}` |

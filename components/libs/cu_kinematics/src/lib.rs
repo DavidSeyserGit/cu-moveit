@@ -18,6 +18,7 @@ pub use chain::CuKinematicChain;
 pub use ik::CuDiffIkParams;
 pub use ik::CuDiffIkStatus;
 pub use ik::CuIkParams;
+pub use ik::CuIkSolver;
 pub use ik::CuIkStatus;
 pub use ik::CuTwist6D;
 pub use ik::CuTwistFrame;
@@ -48,6 +49,7 @@ mod tests {
     use crate::CuDiffIkParams;
     use crate::CuDiffIkStatus;
     use crate::CuIkParams;
+    use crate::CuIkSolver;
     use crate::CuInverseKinematicsTask;
     use crate::CuJointAxis;
     use crate::CuJointLimits;
@@ -380,6 +382,42 @@ mod tests {
         for r in 0..3 {
             assert!((tgt[r][3] - sol[r][3]).abs() < 1e-4);
         }
+    }
+
+    #[test]
+    fn test_pseudoinverse_solver_converges() {
+        let chain = igus_rebel_chain();
+        let q_goal = [
+            Angle64::new::<radian>(0.2).into(),
+            Angle64::new::<radian>(-0.1).into(),
+            Angle64::new::<radian>(0.0).into(),
+            Angle64::new::<radian>(-0.1).into(),
+            Angle64::new::<radian>(0.1).into(),
+            Angle64::new::<radian>(0.0).into(),
+        ];
+        let mut target_pose = Transform3D::<f64>::identity();
+        chain.forward_kinematics(&q_goal, &mut target_pose).unwrap();
+        let cfg = CuIkParams {
+            solver: CuIkSolver::Pseudoinverse,
+            ..CuIkParams::default()
+        };
+        // Non-singular seed (the zero pose is singular for the undamped solve).
+        let q_seed = [
+            Angle64::new::<radian>(0.1).into(),
+            Angle64::new::<radian>(0.2).into(),
+            Angle64::new::<radian>(-0.1).into(),
+            Angle64::new::<radian>(0.0).into(),
+            Angle64::new::<radian>(-0.1).into(),
+            Angle64::new::<radian>(0.1).into(),
+        ];
+        let mut q_sol = [CuJointPosition::default(); 6];
+        let status = chain
+            .inverse_kinematics_dls(&target_pose, &q_seed, &cfg, &mut q_sol)
+            .unwrap();
+        assert!(
+            status.is_converged(),
+            "pseudoinverse IK did not converge: {status:?}"
+        );
     }
 
     #[test]
