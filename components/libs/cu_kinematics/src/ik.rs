@@ -36,8 +36,9 @@ pub enum CuIkSolver {
 /// Parameters of the inverse kinematics solver selected by `solver`.
 ///
 /// RON (every field optional, SI values):
-/// `{"max_iterations": 64, "position_tolerance": 1e-4, "orientation_tolerance": 1e-3,
-///   "damping": 0.05, "max_step": 0.25, "max_linear_step": 0.025, "enforce_joint_limits": true}`
+/// `{"solver": "damped_least_squares", "max_iterations": 64, "position_tolerance": 1e-4,
+///   "orientation_tolerance": 1e-3, "damping": 0.05, "max_step": 0.25,
+///   "max_linear_step": 0.025, "enforce_joint_limits": true}`
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode, Reflect)]
 #[serde(default, deny_unknown_fields)]
 pub struct CuIkParams {
