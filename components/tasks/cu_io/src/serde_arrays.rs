@@ -1,13 +1,16 @@
 //! Serde support for const-generic `bool` arrays (serde's built-in array
 //! impls stop at 32 elements).
 
-pub mod bool_array {
+pub(crate) mod bool_array {
     use core::fmt;
     use serde::de::{Error as DeError, SeqAccess, Visitor};
     use serde::ser::SerializeTuple;
     use serde::{Deserializer, Serializer};
 
-    pub fn serialize<S, const N: usize>(value: &[bool; N], serializer: S) -> Result<S::Ok, S::Error>
+    pub(crate) fn serialize<S, const N: usize>(
+        value: &[bool; N],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
@@ -18,7 +21,9 @@ pub mod bool_array {
         tuple.end()
     }
 
-    pub fn deserialize<'de, D, const N: usize>(deserializer: D) -> Result<[bool; N], D::Error>
+    pub(crate) fn deserialize<'de, D, const N: usize>(
+        deserializer: D,
+    ) -> Result<[bool; N], D::Error>
     where
         D: Deserializer<'de>,
     {

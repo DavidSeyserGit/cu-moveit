@@ -19,16 +19,11 @@ pub struct CuSphere {
 }
 
 impl CuSphere {
-    /// Creates a sphere from SI base values (`meters`).
-    pub fn from_meters(center_m: [f64; 3], radius_m: f64) -> Self {
-        Self {
-            center: [
-                Length64::new::<meter>(center_m[0]),
-                Length64::new::<meter>(center_m[1]),
-                Length64::new::<meter>(center_m[2]),
-            ],
-            radius: Length64::new::<meter>(radius_m),
-        }
+    /// Creates a sphere, rejecting non-finite coordinates and negative or non-finite radii.
+    pub fn new(center: [Length64; 3], radius: Length64) -> CuResult<Self> {
+        let sphere = Self { center, radius };
+        CuCollisionShape::Sphere(sphere).validate()?;
+        Ok(sphere)
     }
 }
 
@@ -43,25 +38,18 @@ pub struct CuCapsule {
 }
 
 impl CuCapsule {
-    /// Creates a capsule from segment endpoints `a_m`, `b_m` and `radius_m` in `meters`.
-    pub fn from_meters(a_m: [f64; 3], b_m: [f64; 3], radius_m: f64) -> Self {
-        Self {
-            a: [
-                Length64::new::<meter>(a_m[0]),
-                Length64::new::<meter>(a_m[1]),
-                Length64::new::<meter>(a_m[2]),
-            ],
-            b: [
-                Length64::new::<meter>(b_m[0]),
-                Length64::new::<meter>(b_m[1]),
-                Length64::new::<meter>(b_m[2]),
-            ],
-            radius: Length64::new::<meter>(radius_m),
-        }
+    /// Creates a capsule, rejecting non-finite endpoints and negative or non-finite radii.
+    pub fn new(a: [Length64; 3], b: [Length64; 3], radius: Length64) -> CuResult<Self> {
+        let capsule = Self { a, b, radius };
+        CuCollisionShape::Capsule(capsule).validate()?;
+        Ok(capsule)
     }
 }
 
 /// Convex collision shape primitive (`Sphere` or `Capsule`).
+///
+/// RON: `{"sphere": {"center": [x, y, z], "radius": r}}` or
+/// `{"capsule": {"a": [x, y, z], "b": [x, y, z], "radius": r}}`, in meters.
 #[derive(Debug, Clone, Copy, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect)]
 #[serde(rename_all = "snake_case")]
 pub enum CuCollisionShape {
@@ -72,6 +60,50 @@ pub enum CuCollisionShape {
 impl Default for CuCollisionShape {
     fn default() -> Self {
         Self::Sphere(CuSphere::default())
+    }
+}
+
+impl CuCollisionShape {
+    /// Checks that all coordinates are finite and the radius is finite and non-negative.
+    pub fn validate(&self) -> CuResult<()> {
+        let finite3 = |p: &[Length64; 3]| p.iter().all(|v| v.get::<meter>().is_finite());
+        let (finite, radius) = match self {
+            Self::Sphere(s) => (finite3(&s.center), s.radius),
+            Self::Capsule(c) => (finite3(&c.a) && finite3(&c.b), c.radius),
+        };
+        let r = radius.get::<meter>();
+        if finite && r.is_finite() && r >= 0.0 {
+            Ok(())
+        } else {
+            Err(CuError::from(
+                "cu_collision: invalid or non-finite collision shape geometry",
+            ))
+        }
+    }
+}
+
+/// A robot collision shape and the frame it is expressed in.
+///
+/// `frame` is a joint-frame index (`0..N`, as produced by
+/// `CuKinematicChain::forward_frames`) or `None` for the robot base frame.
+///
+/// RON: `{"shape": {"sphere": {...}}, "frame": 2}`; omit `frame` for the base frame.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect,
+)]
+#[serde(deny_unknown_fields)]
+pub struct CuLinkShape {
+    /// Geometry in the local coordinates of `frame`.
+    pub shape: CuCollisionShape,
+    /// Joint-frame index, or `None` for the base frame.
+    #[serde(default)]
+    pub frame: Option<usize>,
+}
+
+impl CuLinkShape {
+    /// Creates a link shape on `frame` (`None` = base frame).
+    pub const fn new(shape: CuCollisionShape, frame: Option<usize>) -> Self {
+        Self { shape, frame }
     }
 }
 
@@ -250,4 +282,21 @@ fn segment_segment_distance(p1: [f64; 3], q1: [f64; 3], p2: [f64; 3], q2: [f64; 
     let c1 = [p1[0] + s * d1[0], p1[1] + s * d1[1], p1[2] + s * d1[2]];
     let c2 = [p2[0] + t * d2[0], p2[1] + t * d2[1], p2[2] + t * d2[2]];
     norm3(sub3(c1, c2))
+}
+
+/// Builds a sphere from meter values without validation (crate-internal presets and tests).
+pub(crate) fn sphere_m(center: [f64; 3], radius: f64) -> CuSphere {
+    CuSphere {
+        center: center.map(Length64::new::<meter>),
+        radius: Length64::new::<meter>(radius),
+    }
+}
+
+/// Builds a capsule from meter values without validation (crate-internal presets and tests).
+pub(crate) fn capsule_m(a: [f64; 3], b: [f64; 3], radius: f64) -> CuCapsule {
+    CuCapsule {
+        a: a.map(Length64::new::<meter>),
+        b: b.map(Length64::new::<meter>),
+        radius: Length64::new::<meter>(radius),
+    }
 }

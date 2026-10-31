@@ -5,7 +5,8 @@
 //! [`CuJointPlanner`], and runs inside one Copper task,
 //! [`CuJointPlannerTask`]. The task owns the anytime base/refine contract,
 //! publishing, seeding, and replay state, so a planner only has to answer:
-//! start a job ([`CuJointPlanner::begin`]), do a bounded quantum of work
+//! build itself from validated parameters ([`CuJointPlanner::new`]), start a
+//! job ([`CuJointPlanner::begin`]), do a bounded quantum of work
 //! ([`CuJointPlanner::step`]), and write its best path in place
 //! ([`CuJointPlanner::write_best`]).
 //!
@@ -15,62 +16,111 @@
 //! was planned against, and an explicit [`CuPlanStatus`] — failures such as an
 //! invalid start or an exhausted search are published, not silently dropped.
 //!
-//! Built-in planners:
-//! - Sampling: [`rrt_connect::CuJointRrtConnect`] (bidirectional,
-//!   feasibility-first) and [`prm::CuJointPrm`] (probabilistic roadmap,
-//!   improving).
-//! - Search: [`astar::CuJointAStar`] (A* on a joint-space lattice,
-//!   resolution-complete).
-//! - Optimization: [`optimizer::CuJointPathOptimizer`] (deterministic
-//!   gradient, CHOMP-style) and [`stomp::CuJointStomp`] (seeded stochastic
-//!   rollouts).
-//! - Direct: [`direct::CuJointDirectPlanner`] (straight joint line, one shot).
+//! Built-in planners, each with a `Cu<Planner>Params` struct and a task alias:
+//! - Sampling: [`CuJointRrtConnect`] ([`CuJointRrtConnectTask`];
+//!   bidirectional, feasibility-first) and [`CuJointPrm`] ([`CuJointPrmTask`];
+//!   probabilistic roadmap, improving).
+//! - Search: [`CuJointAStar`] ([`CuJointAStarTask`]; A* on a joint-space
+//!   lattice, resolution-complete).
+//! - Optimization: [`CuJointPathOptimizer`] ([`CuJointPathOptimizerTask`];
+//!   deterministic gradient, CHOMP-style) and [`CuJointStomp`]
+//!   ([`CuJointStompTask`]; seeded stochastic rollouts).
+//! - Direct: [`CuJointDirect`] ([`CuJointDirectTask`]; straight joint line,
+//!   one shot).
+//!
+//! Every planner task has the same node config, [`CuJointPlannerParams`];
+//! switching planners means changing the task type and the `params` block:
+//!
+//! ```ron
+//! (
+//!     id: "planner",
+//!     type: "cu_motion_planning::CuJointPrmTask<6>",
+//!     config: {
+//!         "chain": "igus_rebel",
+//!         "collision_model": "igus_rebel",
+//!         "params": {"connection_radius": 1.5, "max_nodes": 512},
+//!         "refine_budget": 16, // optional; default per planner
+//!     },
+//! )
+//! ```
+//!
+//! A plan-and-execute graph needs no application code:
+//!
+//! ```text
+//! joint state ─► CuJointGoalTask ─► CuJoint<Planner>Task ─► CuPlanToTrajectoryTask ─► follower
+//! ```
+//!
+//! [`CuJointGoalTask`] turns measured state and a configured goal into a
+//! request, and [`CuPlanToTrajectoryTask`] times each final path for
+//! `cu_trajectory::CuFollowTrajectoryTask`.
 //!
 //! RRT* lives in `cu-joint-rrt-star`. Every planner shares
-//! [`validity::CuSceneValidity`] for collision and clearance queries.
+//! [`CuSceneValidity`] for collision and clearance queries.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
-pub mod astar;
+mod astar;
 mod common;
-pub mod direct;
-pub mod optimizer;
-pub mod prm;
-pub mod rrt_connect;
-pub mod stomp;
-pub mod task;
-pub mod validity;
+mod direct;
+mod goal_task;
+mod optimizer;
+mod prm;
+mod rrt_connect;
+mod stomp;
+mod task;
+mod trajectory_task;
+mod validity;
 
+pub use astar::ASTAR_MAX_NODES;
 pub use astar::CuJointAStar;
 pub use astar::CuJointAStarParams;
-pub use direct::CuJointDirectPlanner;
-pub use optimizer::CuJointOptimizerParams;
+pub use astar::CuJointAStarTask;
+pub use direct::CuJointDirect;
+pub use direct::CuJointDirectParams;
+pub use direct::CuJointDirectTask;
+pub use goal_task::CuJointGoalParams;
+pub use goal_task::CuJointGoalTask;
 pub use optimizer::CuJointPathOptimizer;
+pub use optimizer::CuJointPathOptimizerParams;
+pub use optimizer::CuJointPathOptimizerTask;
 pub use prm::CuJointPrm;
 pub use prm::CuJointPrmParams;
+pub use prm::CuJointPrmTask;
+pub use prm::PRM_MAX_NEIGHBORS;
+pub use prm::PRM_MAX_NODES;
 pub use rrt_connect::CuJointRrtConnect;
 pub use rrt_connect::CuJointRrtConnectParams;
+pub use rrt_connect::CuJointRrtConnectTask;
+pub use rrt_connect::RRT_CONNECT_MAX_NODES;
 pub use stomp::CuJointStomp;
 pub use stomp::CuJointStompParams;
+pub use stomp::CuJointStompTask;
+pub use stomp::STOMP_MAX_ROLLOUTS;
 pub use task::CuJointPlannerDebugState;
+pub use task::CuJointPlannerParams;
 pub use task::CuJointPlannerTask;
+pub use task::planner_resources;
+pub use trajectory_task::CuPlanToTrajectoryTask;
 pub use validity::CuSceneValidity;
 pub use validity::joint_distance;
 
 use bincode::Decode;
 use bincode::Encode;
 use cu_collision::CuPlanningScene;
+use cu_collision::CuRobotCollisionModel;
 use cu_collision::CuSceneExclusions;
 use cu_collision::CuSceneRevision;
 use cu_kinematics::CuJointPosition;
 use cu_kinematics::CuJointPositionsPayload;
+use cu_kinematics::CuKinematicChain;
 use cu29::cutask_anytime::Quality;
 use cu29::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 /// Fixed capacity of waypoints in a published [`CuJointPlanPath`].
 pub const MAX_WAYPOINTS: usize = 32;
@@ -198,18 +248,33 @@ pub enum CuPlannerKind {
 
 /// A joint-space motion planner usable by [`CuJointPlannerTask`].
 ///
-/// Jobs are bounded and allocation-free: `begin` resets in place,
-/// `step(budget)` does at most `budget` units of work, and `write_best`
-/// copies the best path into a caller-owned payload. Deterministic planners
-/// ignore the seed; sampling planners must derive all randomness from it so
-/// replay reproduces every job.
-pub trait CuJointPlanner<const N: usize>: Sized {
+/// A planner is built once from robot models and its validated
+/// [`Params`](Self::Params) with [`new`](Self::new); invalid parameters fail
+/// there, not at the first job. Jobs are bounded and allocation-free: `begin`
+/// resets in place, `step(budget)` does at most `budget` units of work, and
+/// `write_best` copies the best path into a caller-owned payload.
+/// Deterministic planners ignore the seed; sampling planners must derive all
+/// randomness from it so replay reproduces every job.
+///
+/// `M` is the number of collision-model shapes (default `N`).
+pub trait CuJointPlanner<const N: usize, const M: usize = N>: Sized {
     /// Exploration family, for diagnostics and documentation.
     const KIND: CuPlannerKind;
 
-    /// Builds the planner from task RON configuration (robot models,
-    /// parameters).
-    fn from_config(config: Option<&ComponentConfig>) -> CuResult<Self>;
+    /// Default `(base_budget, refine_budget)` work units of
+    /// [`CuJointPlannerTask`] when the node config leaves them out.
+    const DEFAULT_BUDGETS: (u32, u32) = (64, 32);
+
+    /// The planner's parameter struct: the `params` block of the planner
+    /// task's node config (`serde(default, deny_unknown_fields)`).
+    type Params: Clone + Default + DeserializeOwned;
+
+    /// Builds the planner for explicit robot models, validating `params`.
+    fn new(
+        chain: CuKinematicChain<N>,
+        collision_model: CuRobotCollisionModel<N, M>,
+        params: Self::Params,
+    ) -> CuResult<Self>;
 
     /// Starts a new job for `request`, discarding the previous one.
     fn begin(&mut self, request: &CuJointPlanRequest<N>, seed: u64) -> CuResult<CuPlanStatus>;

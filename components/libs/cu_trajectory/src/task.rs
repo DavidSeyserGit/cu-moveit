@@ -5,6 +5,7 @@
 //! positions, velocities, and a [`CuFollowStatus`]. A differing trajectory
 //! preempts the running one; an empty trajectory cancels it.
 
+use crate::CuTrajectoryInterpolation;
 use crate::CuTrajectoryPayload;
 use crate::MAX_TRAJECTORY_POINTS;
 use bincode::Decode;
@@ -21,7 +22,7 @@ use cu29::units::si::time::second;
 use serde::Deserialize;
 use serde::Serialize;
 
-/// Follower outcome mirroring the [`CuIkStatus`](cu_kinematics::ik::CuIkStatus) derive style.
+/// Follower outcome mirroring the [`CuIkStatus`](cu_kinematics::CuIkStatus) derive style.
 #[derive(
     Default, Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode, Reflect,
 )]
@@ -62,22 +63,32 @@ impl<const N: usize> Default for CuTrajectoryFollowOutput<N> {
     }
 }
 
-/// Interpolation used by a trajectory follower.
-#[derive(
-    Default, Debug, Clone, Copy, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum CuTrajectoryInterpolation {
-    #[default]
-    Linear,
-    /// Position and velocity are reconstructed using cubic Hermite interpolation.
-    Cubic,
-    /// Position and velocity are reconstructed with the quintic Hermite motion
-    /// through the stored positions, velocities and accelerations.
-    Quintic,
+/// Parameters (node `config:`) of [`CuFollowTrajectoryTask`].
+///
+/// ```ron
+/// config: {}                          // use each trajectory's own interpolation
+/// config: {"interpolation": "cubic"}  // override it
+/// ```
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Reflect)]
+#[serde(default, deny_unknown_fields)]
+pub struct CuFollowTrajectoryParams {
+    /// Interpolation override; `None` samples each trajectory with its own
+    /// [`CuTrajectoryPayload::interpolation`].
+    pub interpolation: Option<CuTrajectoryInterpolation>,
+}
+
+impl CuFollowTrajectoryParams {
+    /// Always valid; present for the uniform params contract.
+    pub fn validate(&self) -> CuResult<()> {
+        Ok(())
+    }
 }
 
 /// `CuTask` sampling a stored joint trajectory against the message `Tov` clock.
+///
+/// Each trajectory is sampled with its own
+/// [`interpolation`](CuTrajectoryPayload::interpolation) unless
+/// [`CuFollowTrajectoryParams::interpolation`] overrides it.
 ///
 /// The trajectory clock is the input message's `Tov`: adoption records the
 /// `Tov::Time` of the adopting call and each call samples at `now - start`,
@@ -86,37 +97,40 @@ pub enum CuTrajectoryInterpolation {
 /// input.tov` propagation while keeping elapsed tracking on the
 /// measurement-time axis rather than processing time.
 #[derive(Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+#[reflect(no_field_bounds, from_reflect = false)]
 pub struct CuFollowTrajectoryTask<const N: usize, const MAX_POINTS: usize = MAX_TRAJECTORY_POINTS> {
     #[reflect(ignore)]
     trajectory: Option<CuTrajectoryPayload<N, MAX_POINTS>>,
     #[reflect(ignore)]
     start: CuTime,
-    interpolation: CuTrajectoryInterpolation,
+    params: CuFollowTrajectoryParams,
 }
 
 impl<const N: usize, const MAX_POINTS: usize> CuFollowTrajectoryTask<N, MAX_POINTS> {
     /// Creates an idle follower holding no trajectory.
-    pub const fn new() -> Self {
-        Self {
+    pub fn from_params(params: CuFollowTrajectoryParams) -> CuResult<Self> {
+        params.validate()?;
+        Ok(Self {
             trajectory: None,
             start: CuTime::MIN,
-            interpolation: CuTrajectoryInterpolation::Linear,
-        }
+            params,
+        })
     }
-    /// Creates an idle follower with an explicit interpolation method.
-    pub const fn new_with_interpolation(interpolation: CuTrajectoryInterpolation) -> Self {
-        Self {
-            trajectory: None,
-            start: CuTime::MIN,
-            interpolation,
-        }
+
+    /// The follower parameters.
+    pub const fn params(&self) -> &CuFollowTrajectoryParams {
+        &self.params
     }
 }
 
 impl<const N: usize, const MAX_POINTS: usize> Default for CuFollowTrajectoryTask<N, MAX_POINTS> {
+    /// Idle follower using each trajectory's own interpolation.
     fn default() -> Self {
-        Self::new()
+        Self {
+            trajectory: None,
+            start: CuTime::MIN,
+            params: CuFollowTrajectoryParams::default(),
+        }
     }
 }
 
@@ -124,13 +138,13 @@ impl<const N: usize, const MAX_POINTS: usize> Freezable for CuFollowTrajectoryTa
     fn freeze<E: Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {
         Encode::encode(&self.trajectory, encoder)?;
         Encode::encode(&self.start, encoder)?;
-        Encode::encode(&self.interpolation, encoder)
+        Encode::encode(&self.params.interpolation, encoder)
     }
 
     fn thaw<D: Decoder>(&mut self, decoder: &mut D) -> Result<(), DecodeError> {
         self.trajectory = Decode::decode(decoder)?;
         self.start = Decode::decode(decoder)?;
-        self.interpolation = Decode::decode(decoder)?;
+        self.params.interpolation = Decode::decode(decoder)?;
         Ok(())
     }
 }
@@ -144,13 +158,11 @@ impl<const N: usize, const MAX_POINTS: usize> CuTask for CuFollowTrajectoryTask<
     where
         Self: Sized,
     {
-        let interpolation = match cfg {
-            Some(cfg) => cfg
-                .get_value::<CuTrajectoryInterpolation>("interpolation")?
-                .unwrap_or_default(),
-            None => CuTrajectoryInterpolation::default(),
-        };
-        Ok(Self::new_with_interpolation(interpolation))
+        let params = cfg
+            .map(ComponentConfig::deserialize_into::<CuFollowTrajectoryParams>)
+            .transpose()?
+            .unwrap_or_default();
+        Self::from_params(params)
     }
 
     fn process<'i, 'o>(
@@ -189,23 +201,13 @@ impl<const N: usize, const MAX_POINTS: usize> CuTask for CuFollowTrajectoryTask<
         let elapsed_s = elapsed.as_nanos() as f64 / 1_000_000_000.0;
         let mut positions = [CuJointPosition::default(); N];
         let mut velocities = [CuJointVelocity::default(); N];
-        match self.interpolation {
-            CuTrajectoryInterpolation::Linear => stored.sample(
-                Time::new::<second>(elapsed_s),
-                &mut positions,
-                &mut velocities,
-            )?,
-            CuTrajectoryInterpolation::Cubic => stored.sample_cubic(
-                Time::new::<second>(elapsed_s),
-                &mut positions,
-                &mut velocities,
-            )?,
-            CuTrajectoryInterpolation::Quintic => stored.sample_quintic(
-                Time::new::<second>(elapsed_s),
-                &mut positions,
-                &mut velocities,
-            )?,
-        }
+        let interpolation = self.params.interpolation.unwrap_or(stored.interpolation);
+        stored.sample_with(
+            interpolation,
+            Time::new::<second>(elapsed_s),
+            &mut positions,
+            &mut velocities,
+        )?;
         let status = if elapsed_s >= stored.duration().get::<second>() {
             CuFollowStatus::Finished
         } else {
@@ -240,6 +242,12 @@ mod tests {
         }
     }
 
+    fn cubic() -> CuFollowTrajectoryParams {
+        CuFollowTrajectoryParams {
+            interpolation: Some(CuTrajectoryInterpolation::Cubic),
+        }
+    }
+
     fn two_point_traj() -> CuTrajectoryPayload<1> {
         let mut traj = CuTrajectoryPayload::new();
         traj.push(point(0.0, 0.0, 0.0)).unwrap();
@@ -256,7 +264,7 @@ mod tests {
     #[test]
     fn test_idle_before_any_trajectory() {
         let (ctx, _) = CuContext::new_mock_clock();
-        let mut task = CuFollowTrajectoryTask::<1>::new();
+        let mut task = CuFollowTrajectoryTask::<1>::default();
         let input = CuMsg::new(None);
         let mut output = CuMsg::new(None);
         task.process(&ctx, &input, &mut output).unwrap();
@@ -268,7 +276,7 @@ mod tests {
     #[test]
     fn test_midpoint_is_running() {
         let (ctx, _) = CuContext::new_mock_clock();
-        let mut task = CuFollowTrajectoryTask::<1>::new();
+        let mut task = CuFollowTrajectoryTask::<1>::default();
         let mut output = CuMsg::new(None);
         task.process(&ctx, &msg_at(Some(two_point_traj()), 100), &mut output)
             .unwrap();
@@ -284,8 +292,7 @@ mod tests {
     #[test]
     fn cubic_follower_samples_position_and_velocity_consistently() {
         let (ctx, _) = CuContext::new_mock_clock();
-        let mut task =
-            CuFollowTrajectoryTask::<1>::new_with_interpolation(CuTrajectoryInterpolation::Cubic);
+        let mut task = CuFollowTrajectoryTask::<1>::from_params(cubic()).unwrap();
         let mut output = CuMsg::new(None);
         task.process(&ctx, &msg_at(Some(two_point_traj()), 100), &mut output)
             .unwrap();
@@ -299,8 +306,7 @@ mod tests {
     #[test]
     fn freeze_thaw_preserves_cubic_mode_and_clock() {
         let (ctx, _) = CuContext::new_mock_clock();
-        let mut original =
-            CuFollowTrajectoryTask::<1>::new_with_interpolation(CuTrajectoryInterpolation::Cubic);
+        let mut original = CuFollowTrajectoryTask::<1>::from_params(cubic()).unwrap();
         let mut output = CuMsg::new(None);
         original
             .process(&ctx, &msg_at(Some(two_point_traj()), 100), &mut output)
@@ -317,7 +323,7 @@ mod tests {
             bincode::config::standard(),
             (),
         );
-        let mut restored = CuFollowTrajectoryTask::<1>::new();
+        let mut restored = CuFollowTrajectoryTask::<1>::default();
         restored.thaw(&mut decoder).unwrap();
         restored
             .process(&ctx, &msg_at(None, 101), &mut output)
@@ -330,7 +336,7 @@ mod tests {
     #[test]
     fn test_finished_holds_final_point() {
         let (ctx, _) = CuContext::new_mock_clock();
-        let mut task = CuFollowTrajectoryTask::<1>::new();
+        let mut task = CuFollowTrajectoryTask::<1>::default();
         let mut output = CuMsg::new(None);
         task.process(&ctx, &msg_at(Some(two_point_traj()), 100), &mut output)
             .unwrap();
@@ -348,7 +354,7 @@ mod tests {
     #[test]
     fn test_new_trajectory_preempts_and_resets_clock() {
         let (ctx, _) = CuContext::new_mock_clock();
-        let mut task = CuFollowTrajectoryTask::<1>::new();
+        let mut task = CuFollowTrajectoryTask::<1>::default();
         let mut output = CuMsg::new(None);
         task.process(&ctx, &msg_at(Some(two_point_traj()), 100), &mut output)
             .unwrap();
@@ -367,7 +373,7 @@ mod tests {
     #[test]
     fn test_empty_trajectory_reports_error() {
         let (ctx, _) = CuContext::new_mock_clock();
-        let mut task = CuFollowTrajectoryTask::<1>::new();
+        let mut task = CuFollowTrajectoryTask::<1>::default();
         let mut output = CuMsg::new(None);
         task.process(
             &ctx,
@@ -381,5 +387,54 @@ mod tests {
         );
         task.process(&ctx, &CuMsg::new(None), &mut output).unwrap();
         assert_eq!(output.payload().unwrap().status, CuFollowStatus::Idle);
+    }
+
+    #[test]
+    fn default_follower_uses_the_payload_interpolation() {
+        let (ctx, _) = CuContext::new_mock_clock();
+        let mut task = CuFollowTrajectoryTask::<1>::default();
+        let mut traj = two_point_traj();
+        traj.interpolation = CuTrajectoryInterpolation::Cubic;
+        let mut output = CuMsg::new(None);
+        task.process(&ctx, &msg_at(Some(traj.clone()), 100), &mut output)
+            .unwrap();
+        task.process(&ctx, &msg_at(Some(traj), 101), &mut output)
+            .unwrap();
+        let out = output.payload().unwrap();
+        assert!((out.positions[0].si_value() - 0.0).abs() < 1e-12);
+        assert!((out.velocities[0].si_value() - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn explicit_interpolation_overrides_the_payload() {
+        let (ctx, _) = CuContext::new_mock_clock();
+        let mut task = CuFollowTrajectoryTask::<1>::from_params(CuFollowTrajectoryParams {
+            interpolation: Some(CuTrajectoryInterpolation::Linear),
+        })
+        .unwrap();
+        let mut traj = two_point_traj();
+        traj.interpolation = CuTrajectoryInterpolation::Cubic;
+        let mut output = CuMsg::new(None);
+        task.process(&ctx, &msg_at(Some(traj.clone()), 100), &mut output)
+            .unwrap();
+        task.process(&ctx, &msg_at(Some(traj), 101), &mut output)
+            .unwrap();
+        let out = output.payload().unwrap();
+        assert!((out.positions[0].si_value() - 1.0).abs() < 1e-12);
+        assert!((out.velocities[0].si_value() - 2.0).abs() < 1e-12);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn reads_config() {
+        let cfg: ComponentConfig =
+            ron::from_str(r#"#![enable(unwrap_newtypes)] {"interpolation": "cubic"}"#).unwrap();
+        let task = CuFollowTrajectoryTask::<1>::new(Some(&cfg), ()).unwrap();
+        assert_eq!(task.params(), &cubic());
+        let task = CuFollowTrajectoryTask::<1>::new(None, ()).unwrap();
+        assert_eq!(task.params().interpolation, None);
+        let typo: ComponentConfig =
+            ron::from_str(r#"#![enable(unwrap_newtypes)] {"interpolaton": "cubic"}"#).unwrap();
+        assert!(CuFollowTrajectoryTask::<1>::new(Some(&typo), ()).is_err());
     }
 }

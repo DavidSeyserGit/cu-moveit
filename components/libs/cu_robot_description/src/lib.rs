@@ -9,3 +9,7 @@
 mod import;
 #[cfg(feature = "std")]
 pub use import::CuRobotDescription;
+#[cfg(feature = "std")]
+pub use import::CuSrdfImport;
+#[cfg(feature = "std")]
+pub use import::CuUrdfImport;

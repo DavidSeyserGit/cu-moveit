@@ -1,5 +1,7 @@
 use cu_collision::CuCapsule;
+use cu_collision::CuCollisionModelParams;
 use cu_collision::CuCollisionShape;
+use cu_collision::CuLinkShape;
 use cu_collision::CuRobotCollisionModel;
 use cu_collision::CuSphere;
 use cu_kinematics::CuJointAxis;
@@ -14,19 +16,95 @@ use cu29::units::si::angular_velocity::radian_per_second;
 use cu29::units::si::f64::Angle;
 use cu29::units::si::f64::AngularVelocity;
 use cu29::units::si::f64::Length;
+use cu29::units::si::f64::Velocity;
 use cu29::units::si::length::meter;
+use cu29::units::si::velocity::meter_per_second;
 use roxmltree::Document;
 use roxmltree::Node;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
+/// Collision parameters used when an import does not override them: zero safety margin and
+/// **no** adjacent-link skipping. URDF import relies on the SRDF `disable_collisions` list to
+/// disable pairs, so every pair of shapes on different frames starts enabled.
+fn default_import_collision() -> CuCollisionModelParams {
+    CuCollisionModelParams {
+        safety_margin: Length::new::<meter>(0.0),
+        skip_adjacent_links: false,
+    }
+}
+
+/// Named inputs of [`CuRobotDescription::from_urdf`].
+///
+/// ```ignore
+/// CuUrdfImport::new("base", "tool").with_collision(CuCollisionModelParams {
+///     safety_margin: Length::new::<meter>(0.005),
+///     skip_adjacent_links: false,
+/// })
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CuUrdfImport<'a> {
+    /// URDF link where the serial chain starts.
+    pub base_link: &'a str,
+    /// URDF link where the serial chain ends (the tool frame).
+    pub tip_link: &'a str,
+    /// Collision model parameters. Default: zero margin, `skip_adjacent_links: false`.
+    pub collision: CuCollisionModelParams,
+}
+
+impl<'a> CuUrdfImport<'a> {
+    /// Selects the `base_link` to `tip_link` path with default collision parameters.
+    pub fn new(base_link: &'a str, tip_link: &'a str) -> Self {
+        Self {
+            base_link,
+            tip_link,
+            collision: default_import_collision(),
+        }
+    }
+
+    /// Replaces the collision model parameters.
+    pub const fn with_collision(mut self, collision: CuCollisionModelParams) -> Self {
+        self.collision = collision;
+        self
+    }
+}
+
+/// Named inputs of [`CuRobotDescription::from_urdf_srdf`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CuSrdfImport<'a> {
+    /// SRDF planning group containing exactly one serial chain.
+    pub group: &'a str,
+    /// Collision model parameters. Default: zero margin, `skip_adjacent_links: false`.
+    pub collision: CuCollisionModelParams,
+}
+
+impl<'a> CuSrdfImport<'a> {
+    /// Selects SRDF `group` with default collision parameters.
+    pub fn new(group: &'a str) -> Self {
+        Self {
+            group,
+            collision: default_import_collision(),
+        }
+    }
+
+    /// Replaces the collision model parameters.
+    pub const fn with_collision(mut self, collision: CuCollisionModelParams) -> Self {
+        self.collision = collision;
+        self
+    }
+}
+
 /// A startup robot description for a single base-to-tip serial chain.
 /// `N` counts movable joints; `M` bounds collision shapes, including fixed and base links.
 /// Names and semantic state storage allocate only during import and lookup.
+///
+/// The runtime models are read through [`chain`](Self::chain) and
+/// [`collision_model`](Self::collision_model) (both `Copy`), or taken with
+/// [`into_parts`](Self::into_parts).
 #[derive(Debug)]
 pub struct CuRobotDescription<const N: usize, const M: usize> {
-    pub chain: CuKinematicChain<N>,
-    pub collision_model: CuRobotCollisionModel<N, M>,
+    chain: CuKinematicChain<N>,
+    collision_model: CuRobotCollisionModel<N, M>,
     joint_names: [String; N],
     shape_links: [String; M],
     links: BTreeSet<String>,
@@ -40,7 +118,13 @@ pub struct CuRobotDescription<const N: usize, const M: usize> {
 impl<const N: usize, const M: usize> CuRobotDescription<N, M> {
     /// Imports an explicit URDF base-to-tip path. Other branches are not part of this model.
     /// Rejects unsupported selected joints and geometry rather than silently omitting them.
-    pub fn from_urdf(xml: &str, base: &str, tip: &str, margin: Length) -> CuResult<Self> {
+    pub fn from_urdf(xml: &str, import: CuUrdfImport<'_>) -> CuResult<Self> {
+        let CuUrdfImport {
+            base_link: base,
+            tip_link: tip,
+            collision,
+        } = import;
+        collision.validate()?;
         let doc =
             Document::parse(xml).map_err(|e| CuError::from(format!("Invalid URDF XML: {e}")))?;
         let robot = robot_root(&doc)?;
@@ -155,13 +239,19 @@ impl<const N: usize, const M: usize> CuRobotDescription<N, M> {
                     return Err(CuError::from("URDF lower limit exceeds upper limit"));
                 }
                 let (xyz, rpy) = decompose(pending);
+                let xyz = xyz.map(Length::new::<meter>);
+                let rpy = rpy.map(Angle::new::<radian>);
                 let axis = CuJointAxis::Arbitrary(axis.map(|v| v / norm));
                 specs[count] = match kind {
                     "revolute" => CuJointSpec::revolute(
                         xyz,
                         rpy,
                         axis,
-                        CuJointLimits::from_radians(lower, upper, velocity),
+                        CuJointLimits::revolute(
+                            Angle::new::<radian>(lower),
+                            Angle::new::<radian>(upper),
+                            AngularVelocity::new::<radian_per_second>(velocity),
+                        ),
                     ),
                     "continuous" => CuJointSpec::revolute(
                         xyz,
@@ -175,7 +265,11 @@ impl<const N: usize, const M: usize> CuRobotDescription<N, M> {
                         xyz,
                         rpy,
                         axis,
-                        CuJointLimits::from_meters(lower, upper, velocity),
+                        CuJointLimits::prismatic(
+                            Length::new::<meter>(lower),
+                            Length::new::<meter>(upper),
+                            Velocity::new::<meter_per_second>(velocity),
+                        ),
                     ),
                     _ => {
                         return Err(CuError::from(
@@ -193,9 +287,8 @@ impl<const N: usize, const M: usize> CuRobotDescription<N, M> {
         if count != N {
             return Err(CuError::from("URDF movable joint count does not match N"));
         }
-        let chain = CuKinematicChain::new_with_tool(specs, pending);
-        let mut shapes = [CuCollisionShape::default(); M];
-        let mut frames = [None; M];
+        let chain = CuKinematicChain::new(specs).with_tool_offset(pending);
+        let mut shapes = [CuLinkShape::default(); M];
         let mut shape_links = core::array::from_fn(|_| String::new());
         let mut len = 0;
         for (link, frame, offset) in &link_frames {
@@ -216,34 +309,33 @@ impl<const N: usize, const M: usize> CuRobotDescription<N, M> {
                         "Expected exactly one URDF geometry primitive",
                     ));
                 }
-                let local = if shape.has_tag_name("sphere") {
+                let m = offset.compose(origin(collision)?).to_matrix();
+                let shape = if shape.has_tag_name("sphere") {
                     let radius = positive(attr(shape, "radius")?)?;
-                    CuCollisionShape::Sphere(CuSphere::from_meters([0.0; 3], radius))
+                    CuCollisionShape::Sphere(CuSphere::new(
+                        point(&m, [0.0; 3]),
+                        Length::new::<meter>(radius),
+                    )?)
                 } else if shape.has_tag_name("cylinder") {
                     let radius = positive(attr(shape, "radius")?)?;
                     let half = positive(attr(shape, "length")?)? * 0.5;
                     // Conservative capsule encloses the full cylinder, including its end faces.
-                    CuCollisionShape::Capsule(CuCapsule::from_meters(
-                        [0.0, 0.0, -half],
-                        [0.0, 0.0, half],
-                        radius,
-                    ))
+                    CuCollisionShape::Capsule(CuCapsule::new(
+                        point(&m, [0.0, 0.0, -half]),
+                        point(&m, [0.0, 0.0, half]),
+                        Length::new::<meter>(radius),
+                    )?)
                 } else {
                     return Err(CuError::from(
                         "Unsupported collision geometry: provide spheres/cylinders; preprocess boxes and meshes explicitly",
                     ));
                 };
-                cu_collision::transform_shape(
-                    &offset.compose(origin(collision)?),
-                    &local,
-                    &mut shapes[len],
-                );
-                frames[len] = *frame;
+                shapes[len] = CuLinkShape::new(shape, *frame);
                 shape_links[len] = (*link).to_owned();
                 len += 1;
             }
         }
-        let collision_model = CuRobotCollisionModel::new_attached(shapes, frames, len, margin)?;
+        let collision_model = CuRobotCollisionModel::new(&shapes[..len], collision)?;
         Ok(Self {
             chain,
             collision_model,
@@ -261,6 +353,18 @@ impl<const N: usize, const M: usize> CuRobotDescription<N, M> {
         })
     }
 
+    /// Serial kinematic chain from the base link to the tip link.
+    pub const fn chain(&self) -> &CuKinematicChain<N> {
+        &self.chain
+    }
+    /// Collision model (including SRDF-disabled pairs once applied).
+    pub const fn collision_model(&self) -> &CuRobotCollisionModel<N, M> {
+        &self.collision_model
+    }
+    /// Consumes the description and returns the runtime chain and collision model.
+    pub fn into_parts(self) -> (CuKinematicChain<N>, CuRobotCollisionModel<N, M>) {
+        (self.chain, self.collision_model)
+    }
     /// Joint names in the exact order used by runtime payloads.
     pub fn joint_names(&self) -> &[String; N] {
         &self.joint_names
@@ -271,7 +375,8 @@ impl<const N: usize, const M: usize> CuRobotDescription<N, M> {
     }
 
     /// Selects an SRDF group containing exactly one serial base-to-tip chain.
-    pub fn from_urdf_srdf(urdf: &str, srdf: &str, group: &str, margin: Length) -> CuResult<Self> {
+    pub fn from_urdf_srdf(urdf: &str, srdf: &str, import: CuSrdfImport<'_>) -> CuResult<Self> {
+        let CuSrdfImport { group, collision } = import;
         let doc =
             Document::parse(srdf).map_err(|e| CuError::from(format!("Invalid SRDF XML: {e}")))?;
         let robot = robot_root(&doc)?;
@@ -279,9 +384,8 @@ impl<const N: usize, const M: usize> CuRobotDescription<N, M> {
         let chain = serial_group(selected)?;
         let mut out = Self::from_urdf(
             urdf,
-            attr(chain, "base_link")?,
-            attr(chain, "tip_link")?,
-            margin,
+            CuUrdfImport::new(attr(chain, "base_link")?, attr(chain, "tip_link")?)
+                .with_collision(collision),
         )?;
         out.apply_srdf(srdf, group)?;
         Ok(out)
@@ -477,6 +581,11 @@ fn origin(node: Node<'_, '_>) -> CuResult<Transform3D<f64>> {
         xyz.map(Length::new::<meter>),
         rpy.map(Angle::new::<radian>),
     ))
+}
+fn point(m: &[[f64; 4]; 4], p: [f64; 3]) -> [Length; 3] {
+    core::array::from_fn(|r| {
+        Length::new::<meter>(m[r][0] * p[0] + m[r][1] * p[1] + m[r][2] * p[2] + m[r][3])
+    })
 }
 fn decompose(transform: Transform3D<f64>) -> ([f64; 3], [f64; 3]) {
     let m = transform.to_matrix();

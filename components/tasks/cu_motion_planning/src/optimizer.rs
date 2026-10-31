@@ -20,6 +20,7 @@
 use crate::CuJointPlanPath;
 use crate::CuJointPlanRequest;
 use crate::CuJointPlanner;
+use crate::CuJointPlannerTask;
 use crate::CuPlanStatus;
 use crate::CuPlannerKind;
 use crate::MAX_WAYPOINTS;
@@ -45,25 +46,30 @@ use serde::Serialize;
 
 /// Parameters of [`CuJointPathOptimizer`].
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode, Reflect)]
-pub struct CuJointOptimizerParams {
+#[serde(default, deny_unknown_fields)]
+pub struct CuJointPathOptimizerParams {
     /// Path waypoints including start and goal (`3..=MAX_WAYPOINTS`).
     pub waypoints: u32,
-    /// Gradient step in normalized joint units per unit of cost gradient.
+    /// Gradient step per unit of cost gradient (dimensionless, metric-scaled).
     pub learning_rate: f64,
     /// Clearance below which the obstacle term pushes the path away.
     pub clearance: Length,
+    /// Weight of the obstacle term (dimensionless, `>= 0`).
     pub obstacle_weight: f64,
+    /// Weight of the smoothness term (dimensionless, `>= 0`).
     pub smoothness_weight: f64,
-    /// Finite-difference step for the clearance gradient, normalized units.
+    /// Finite-difference step for the clearance gradient (dimensionless,
+    /// metric-scaled).
     pub gradient_step: f64,
     /// Iterations after which the job ends.
     pub max_iterations: u32,
     /// Resolution of the segment collision checks.
     pub collision_check_step: CuJointResolution,
+    /// Scaling of dimensionless joint-space distances and costs.
     pub metric: CuJointMetric,
 }
 
-impl Default for CuJointOptimizerParams {
+impl Default for CuJointPathOptimizerParams {
     fn default() -> Self {
         Self {
             waypoints: 12,
@@ -79,31 +85,41 @@ impl Default for CuJointOptimizerParams {
     }
 }
 
-impl CuJointOptimizerParams {
-    fn is_valid(&self) -> bool {
-        let positive = |v: f64| v.is_finite() && v > 0.0;
-        (3..=MAX_WAYPOINTS as u32).contains(&self.waypoints)
-            && positive(self.learning_rate)
-            && positive(self.clearance.get::<meter>())
-            && self.obstacle_weight.is_finite()
-            && self.obstacle_weight >= 0.0
-            && self.smoothness_weight.is_finite()
-            && self.smoothness_weight >= 0.0
-            && positive(self.gradient_step)
-            && self.max_iterations > 0
+impl CuJointPathOptimizerParams {
+    /// Checks every parameter, the metric, and the collision-check resolution.
+    pub fn validate(&self) -> CuResult<()> {
+        self.metric.validate()?;
+        self.collision_check_step.metric().validate()?;
+        let valid = {
+            let positive = |v: f64| v.is_finite() && v > 0.0;
+            (3..=MAX_WAYPOINTS as u32).contains(&self.waypoints)
+                && positive(self.learning_rate)
+                && positive(self.clearance.get::<meter>())
+                && self.obstacle_weight.is_finite()
+                && self.obstacle_weight >= 0.0
+                && self.smoothness_weight.is_finite()
+                && self.smoothness_weight >= 0.0
+                && positive(self.gradient_step)
+                && self.max_iterations > 0
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(CuError::from(
+                "cu-motion-planning: invalid path optimizer parameters",
+            ))
+        }
     }
 }
 
 /// Deterministic anytime joint-path optimizer.
 ///
-/// Config keys: `chain`, `collision_model`, and optional `waypoints`,
-/// `learning_rate`, `clearance` (`Length`), `obstacle_weight`,
-/// `smoothness_weight`, `gradient_step`, `max_iterations`,
-/// `collision_check_step`, `metric`.
+/// Built with [`CuJointPlanner::new`] from robot models and [`CuJointPathOptimizerParams`];
+/// runs in [`CuJointPathOptimizerTask`].
 #[derive(Clone)]
 pub struct CuJointPathOptimizer<const N: usize, const M: usize = N> {
     validity: CuSceneValidity<N, M>,
-    params: CuJointOptimizerParams,
+    params: CuJointPathOptimizerParams,
     path: [[CuJointPosition; N]; MAX_WAYPOINTS],
     best: [[CuJointPosition; N]; MAX_WAYPOINTS],
     count: usize,
@@ -113,12 +129,20 @@ pub struct CuJointPathOptimizer<const N: usize, const M: usize = N> {
     status: CuPlanStatus,
 }
 
+/// [`CuJointPlannerTask`] running [`CuJointPathOptimizer`].
+pub type CuJointPathOptimizerTask<const N: usize, const M: usize = N> =
+    CuJointPlannerTask<CuJointPathOptimizer<N, M>, N, M>;
+
 impl<const N: usize, const M: usize> CuJointPathOptimizer<N, M> {
-    /// Creates the optimizer for explicit robot models.
-    pub fn new(
+    /// The validated planner parameters.
+    pub const fn params(&self) -> &CuJointPathOptimizerParams {
+        &self.params
+    }
+
+    fn build(
         chain: CuKinematicChain<N>,
         model: CuRobotCollisionModel<N, M>,
-        params: CuJointOptimizerParams,
+        params: CuJointPathOptimizerParams,
     ) -> Self {
         Self {
             validity: CuSceneValidity::new(chain, model, params.collision_check_step),
@@ -219,48 +243,18 @@ impl<const N: usize, const M: usize> CuJointPathOptimizer<N, M> {
     }
 }
 
-impl<const N: usize, const M: usize> CuJointPlanner<N> for CuJointPathOptimizer<N, M> {
+impl<const N: usize, const M: usize> CuJointPlanner<N, M> for CuJointPathOptimizer<N, M> {
     const KIND: CuPlannerKind = CuPlannerKind::Optimization;
 
-    fn from_config(config: Option<&ComponentConfig>) -> CuResult<Self> {
-        let chain = CuKinematicChain::from_config(config)?;
-        let model = CuRobotCollisionModel::from_config(config)?;
-        let mut params = CuJointOptimizerParams::default();
-        if let Some(cfg) = config {
-            if let Some(v) = cfg.get::<u32>("waypoints")? {
-                params.waypoints = v;
-            }
-            if let Some(v) = cfg.get::<f64>("learning_rate")? {
-                params.learning_rate = v;
-            }
-            if let Some(v) = cfg.get_value::<Length>("clearance")? {
-                params.clearance = v;
-            }
-            if let Some(v) = cfg.get::<f64>("obstacle_weight")? {
-                params.obstacle_weight = v;
-            }
-            if let Some(v) = cfg.get::<f64>("smoothness_weight")? {
-                params.smoothness_weight = v;
-            }
-            if let Some(v) = cfg.get::<f64>("gradient_step")? {
-                params.gradient_step = v;
-            }
-            if let Some(v) = cfg.get::<u32>("max_iterations")? {
-                params.max_iterations = v;
-            }
-            if let Some(v) = cfg.get_value::<CuJointResolution>("collision_check_step")? {
-                params.collision_check_step = v;
-            }
-            if let Some(v) = cfg.get_value::<CuJointMetric>("metric")? {
-                params.metric = v;
-            }
-        }
-        if !params.is_valid() {
-            return Err(CuError::from(
-                "cu-motion-planning: invalid path optimizer parameters",
-            ));
-        }
-        Ok(Self::new(chain, model, params))
+    type Params = CuJointPathOptimizerParams;
+
+    fn new(
+        chain: CuKinematicChain<N>,
+        collision_model: CuRobotCollisionModel<N, M>,
+        params: CuJointPathOptimizerParams,
+    ) -> CuResult<Self> {
+        params.validate()?;
+        Ok(Self::build(chain, collision_model, params))
     }
 
     fn begin(&mut self, request: &CuJointPlanRequest<N>, _seed: u64) -> CuResult<CuPlanStatus> {
@@ -268,11 +262,7 @@ impl<const N: usize, const M: usize> CuJointPlanner<N> for CuJointPathOptimizer<
         self.best_cost = f64::INFINITY;
         self.count = self.params.waypoints as usize;
         self.straight_cost = joint_distance(&request.start, &request.goal, self.params.metric);
-        self.status = if self.params.is_valid() {
-            check_endpoints(&mut self.validity, request, self.params.metric)
-        } else {
-            CuPlanStatus::InvalidRequest
-        };
+        self.status = check_endpoints(&mut self.validity, request, self.params.metric);
         if self.status == CuPlanStatus::Searching {
             let last = (self.count - 1) as f64;
             for i in 0..self.count {

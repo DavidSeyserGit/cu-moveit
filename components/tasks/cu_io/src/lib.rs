@@ -22,6 +22,8 @@ use bincode::enc::Encoder;
 use bincode::error::DecodeError;
 use bincode::error::EncodeError;
 use cu29::prelude::*;
+use cu29::units::si::f64::Time;
+use cu29::units::si::time::second;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -125,54 +127,107 @@ pub struct CuGripperStatePayload {
     pub state: CuGripperState,
 }
 
-/// Wiring of a gripper to digital IO.
+/// Parameters of a gripper wired to digital IO; this is the gripper task's
+/// node `config:` block.
 ///
 /// `close_output` is required. `open_output` is set for double-acting
 /// actuators (two valves or an explicit open line); otherwise opening means
 /// releasing `close_output`. Without a sensor for the target position the
-/// motion counts as done after `settle_ns`; with one it must assert within
-/// `motion_timeout_ns`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CuGripperWiring {
-    pub close_output: usize,
+/// motion counts as done after `settle`; with one it must assert within
+/// `motion_timeout`. Indices count from 0 and must address the task's `IN`
+/// inputs / `OUT` outputs.
+///
+/// RON (times in seconds):
+///
+/// ```ron
+/// config: {
+///     "close_output": 0,
+///     "open_output": 1,      // optional
+///     "closed_input": 0,     // optional
+///     "open_input": 1,       // optional
+///     "settle": 0.3,         // default 0.3 s
+///     "motion_timeout": 2.0, // default 2 s
+/// }
+/// ```
+///
+/// ```
+/// use cu_io::{CuGripperParams, CuGripperTask};
+/// use cu29::units::si::f64::Time;
+/// use cu29::units::si::time::second;
+///
+/// let params = CuGripperParams {
+///     open_output: Some(1),
+///     motion_timeout: Time::new::<second>(1.0),
+///     ..CuGripperParams::single_acting(0)
+/// };
+/// let task = CuGripperTask::<2, 2>::from_params(params).unwrap();
+/// # let _ = task;
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Reflect)]
+#[serde(default, deny_unknown_fields)]
+pub struct CuGripperParams {
+    /// Output that closes the gripper (required).
+    pub close_output: Option<usize>,
+    /// Output that opens the gripper (double-acting actuators).
     pub open_output: Option<usize>,
+    /// Input asserted when the gripper is closed.
     pub closed_input: Option<usize>,
+    /// Input asserted when the gripper is open.
     pub open_input: Option<usize>,
-    pub settle_ns: u64,
-    pub motion_timeout_ns: u64,
+    /// Time after which a motion without a target sensor counts as done.
+    pub settle: Time,
+    /// Time within which a target sensor must assert.
+    pub motion_timeout: Time,
 }
 
-impl CuGripperWiring {
-    /// Wiring with only a close output and default timings (0.3 s settle,
-    /// 2 s sensor timeout).
-    pub const fn single_acting(close_output: usize) -> Self {
+impl Default for CuGripperParams {
+    /// No close output (rejected by [`validate`](Self::validate)), 0.3 s
+    /// settle, 2 s sensor timeout.
+    fn default() -> Self {
         Self {
-            close_output,
+            close_output: None,
             open_output: None,
             closed_input: None,
             open_input: None,
-            settle_ns: 300_000_000,
-            motion_timeout_ns: 2_000_000_000,
+            settle: Time::new::<second>(0.3),
+            motion_timeout: Time::new::<second>(2.0),
+        }
+    }
+}
+
+impl CuGripperParams {
+    /// Params with only a close output and default timings (0.3 s settle,
+    /// 2 s sensor timeout).
+    pub fn single_acting(close_output: usize) -> Self {
+        Self {
+            close_output: Some(close_output),
+            ..Self::default()
         }
     }
 
-    fn validate<const IN: usize, const OUT: usize>(&self) -> CuResult<()> {
+    /// Checks that `close_output` is set, indices fit `IN` inputs / `OUT`
+    /// outputs and are not shared, and timings are positive.
+    pub fn validate<const IN: usize, const OUT: usize>(&self) -> CuResult<()> {
+        let close_output = self
+            .close_output
+            .ok_or_else(|| CuError::from("cu-io: gripper needs 'close_output'"))?;
         let output_ok = |i: usize| i < OUT;
         let input_ok = |i: usize| i < IN;
-        if !output_ok(self.close_output)
+        let positive = |t: Time| t.get::<second>() > 0.0;
+        if !output_ok(close_output)
             || self
                 .open_output
-                .is_some_and(|o| !output_ok(o) || o == self.close_output)
+                .is_some_and(|o| !output_ok(o) || o == close_output)
             || self.closed_input.is_some_and(|i| !input_ok(i))
             || self.open_input.is_some_and(|i| !input_ok(i))
             || self
                 .closed_input
                 .is_some_and(|i| self.open_input == Some(i))
-            || self.settle_ns == 0
-            || self.motion_timeout_ns == 0
+            || !positive(self.settle)
+            || !positive(self.motion_timeout)
         {
             return Err(CuError::from(
-                "cu-io: gripper wiring indices out of range, shared, or zero timings",
+                "cu-io: gripper indices out of range, shared, or non-positive timings",
             ));
         }
         Ok(())
@@ -185,15 +240,18 @@ impl CuGripperWiring {
 /// Only the configured output bits are masked in the output command, so the
 /// task can share a bridge's `digital_out` with other IO users.
 ///
-/// Config keys (indices count from 0):
-/// - `close_output` (`u32`, required)
-/// - `open_output`, `closed_input`, `open_input` (`u32`, optional)
-/// - `settle_ns` (`u64`, default 0.3 s), `motion_timeout_ns` (`u64`, default 2 s)
+/// The node `config:` block is a [`CuGripperParams`].
 #[derive(Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+#[reflect(no_field_bounds, from_reflect = false)]
 pub struct CuGripperTask<const IN: usize, const OUT: usize> {
     #[reflect(ignore)]
-    wiring: CuGripperWiring,
+    params: CuGripperParams,
+    #[reflect(ignore)]
+    close_output: usize,
+    #[reflect(ignore)]
+    settle_ns: u64,
+    #[reflect(ignore)]
+    motion_timeout_ns: u64,
     #[reflect(ignore)]
     action: Option<CuGripperAction>,
     #[reflect(ignore)]
@@ -201,16 +259,31 @@ pub struct CuGripperTask<const IN: usize, const OUT: usize> {
     motion_start: Option<CuTime>,
 }
 
+/// Converts a positive time to nanoseconds, rounded to nearest and at
+/// least 1 ns.
+fn to_nanos(t: Time) -> u64 {
+    // `as` saturates for values beyond `u64::MAX`.
+    ((t.get::<second>() * 1e9 + 0.5) as u64).max(1)
+}
+
 impl<const IN: usize, const OUT: usize> CuGripperTask<IN, OUT> {
-    /// Creates a gripper task for the given wiring.
-    pub fn new_with_wiring(wiring: CuGripperWiring) -> CuResult<Self> {
-        wiring.validate::<IN, OUT>()?;
+    /// Creates a gripper task from validated params.
+    pub fn from_params(params: CuGripperParams) -> CuResult<Self> {
+        params.validate::<IN, OUT>()?;
         Ok(Self {
-            wiring,
+            close_output: params.close_output.unwrap_or_default(),
+            settle_ns: to_nanos(params.settle),
+            motion_timeout_ns: to_nanos(params.motion_timeout),
+            params,
             action: None,
             state: CuGripperState::Unknown,
             motion_start: None,
         })
+    }
+
+    /// Params this task was built from.
+    pub fn params(&self) -> &CuGripperParams {
+        &self.params
     }
 
     /// Current gripper state.
@@ -247,23 +320,11 @@ impl<const IN: usize, const OUT: usize> CuTask for CuGripperTask<IN, OUT> {
     where
         Self: Sized,
     {
-        let cfg = cfg.ok_or_else(|| CuError::from("cu-io: gripper needs 'close_output'"))?;
-        let index =
-            |key: &str| -> CuResult<Option<usize>> { Ok(cfg.get::<u32>(key)?.map(|v| v as usize)) };
-        let mut wiring = CuGripperWiring::single_acting(
-            index("close_output")?
-                .ok_or_else(|| CuError::from("cu-io: gripper needs 'close_output'"))?,
-        );
-        wiring.open_output = index("open_output")?;
-        wiring.closed_input = index("closed_input")?;
-        wiring.open_input = index("open_input")?;
-        if let Some(settle) = cfg.get::<u64>("settle_ns")? {
-            wiring.settle_ns = settle;
-        }
-        if let Some(timeout) = cfg.get::<u64>("motion_timeout_ns")? {
-            wiring.motion_timeout_ns = timeout;
-        }
-        Self::new_with_wiring(wiring)
+        let params = cfg
+            .map(ComponentConfig::deserialize_into::<CuGripperParams>)
+            .transpose()?
+            .unwrap_or_default();
+        Self::from_params(params)
     }
 
     fn process<'i, 'o>(
@@ -297,8 +358,8 @@ impl<const IN: usize, const OUT: usize> CuTask for CuGripperTask<IN, OUT> {
             // A fault latches until a new action is commanded.
             (Some(_), Some(_)) if self.state == CuGripperState::Fault => CuGripperState::Fault,
             (Some(action), Some(io)) => {
-                let closed = self.sensor(self.wiring.closed_input, &io.values);
-                let open = self.sensor(self.wiring.open_input, &io.values);
+                let closed = self.sensor(self.params.closed_input, &io.values);
+                let open = self.sensor(self.params.open_input, &io.values);
                 let (reached, other, done, moving) = match action {
                     CuGripperAction::Close => (
                         closed,
@@ -318,13 +379,11 @@ impl<const IN: usize, const OUT: usize> CuTask for CuGripperTask<IN, OUT> {
                 } else {
                     match reached {
                         Some(true) => done,
-                        Some(false) if elapsed >= self.wiring.motion_timeout_ns => {
-                            CuGripperState::Fault
-                        }
+                        Some(false) if elapsed >= self.motion_timeout_ns => CuGripperState::Fault,
                         Some(false) => moving,
                         // No target sensor: trust the settle time, but an
                         // opposite sensor still asserted after it is a jam.
-                        None if elapsed >= self.wiring.settle_ns => {
+                        None if elapsed >= self.settle_ns => {
                             if other == Some(true) {
                                 CuGripperState::Fault
                             } else {
@@ -342,9 +401,9 @@ impl<const IN: usize, const OUT: usize> CuTask for CuGripperTask<IN, OUT> {
             Some(action) => {
                 let close = action == CuGripperAction::Close;
                 let mut command = CuDigitalOutputPayload::<OUT>::default();
-                command.values[self.wiring.close_output] = close;
-                command.mask[self.wiring.close_output] = true;
-                if let Some(open_output) = self.wiring.open_output {
+                command.values[self.close_output] = close;
+                command.mask[self.close_output] = true;
+                if let Some(open_output) = self.params.open_output {
                     command.values[open_output] = !close;
                     command.mask[open_output] = true;
                 }
@@ -360,11 +419,11 @@ impl<const IN: usize, const OUT: usize> CuTask for CuGripperTask<IN, OUT> {
 mod tests {
     use super::*;
 
-    fn wiring() -> CuGripperWiring {
-        CuGripperWiring {
+    fn params() -> CuGripperParams {
+        CuGripperParams {
             open_output: Some(1),
             closed_input: Some(0),
-            ..CuGripperWiring::single_acting(0)
+            ..CuGripperParams::single_acting(0)
         }
     }
 
@@ -397,7 +456,7 @@ mod tests {
 
     #[test]
     fn close_drives_masked_outputs_until_sensor_confirms() {
-        let mut task = CuGripperTask::<2, 2>::new_with_wiring(wiring()).unwrap();
+        let mut task = CuGripperTask::<2, 2>::from_params(params()).unwrap();
         let (ctx, _clock) = CuContext::new_mock_clock();
         let (out, state) = step(&mut task, &ctx, None, ready(false));
         assert!(out.is_none());
@@ -413,9 +472,9 @@ mod tests {
 
     #[test]
     fn missing_sensor_times_out_and_io_fault_latches() {
-        let mut task = CuGripperTask::<2, 2>::new_with_wiring(CuGripperWiring {
-            motion_timeout_ns: 1_000,
-            ..wiring()
+        let mut task = CuGripperTask::<2, 2>::from_params(CuGripperParams {
+            motion_timeout: Time::new::<second>(1e-6),
+            ..params()
         })
         .unwrap();
         let (ctx, clock) = CuContext::new_mock_clock();
@@ -432,13 +491,33 @@ mod tests {
 
     #[test]
     fn rejects_out_of_range_wiring() {
-        assert!(CuGripperTask::<2, 2>::new_with_wiring(CuGripperWiring::single_acting(2)).is_err());
+        assert!(CuGripperTask::<2, 2>::from_params(CuGripperParams::single_acting(2)).is_err());
         assert!(
-            CuGripperTask::<2, 2>::new_with_wiring(CuGripperWiring {
+            CuGripperTask::<2, 2>::from_params(CuGripperParams {
                 open_output: Some(0),
-                ..CuGripperWiring::single_acting(0)
+                ..CuGripperParams::single_acting(0)
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn missing_close_output_is_rejected() {
+        assert!(CuGripperTask::<2, 2>::new(None, ()).is_err());
+        assert!(CuGripperParams::default().validate::<2, 2>().is_err());
+        assert!(
+            CuGripperTask::<2, 2>::from_params(CuGripperParams {
+                settle: Time::new::<second>(0.0),
+                ..CuGripperParams::single_acting(0)
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn default_timings_match_previous_nanoseconds() {
+        let task = CuGripperTask::<2, 2>::from_params(params()).unwrap();
+        assert_eq!(task.settle_ns, 300_000_000);
+        assert_eq!(task.motion_timeout_ns, 2_000_000_000);
     }
 }

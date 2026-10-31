@@ -6,13 +6,13 @@
 //! joint-space collision checks are applied at every generated point and edge.
 //!
 //! The path is geometry only. Time it with any profile through
-//! [`parameterize_cartesian_path`](crate::path_timing::parameterize_cartesian_path).
+//! [`parameterize_cartesian_path`](crate::parameterize_cartesian_path).
 
 use bincode::Decode;
 use bincode::Encode;
-use cu_collision::CuCollisionWorld;
+use cu_collision::CuCollisionEnv;
 use cu_collision::CuRobotCollisionModel;
-use cu_kinematics::CuIkConfig;
+use cu_kinematics::CuIkParams;
 use cu_kinematics::CuIkStatus;
 use cu_kinematics::CuJointPosition;
 use cu_kinematics::CuJointResolution;
@@ -25,6 +25,25 @@ use cu29::units::si::f64::Length;
 use cu29::units::si::length::meter;
 use serde::Deserialize;
 use serde::Serialize;
+
+/// A programmed joint waypoint and its TCP zone radius.
+///
+/// A zero `zone` is an exact stop; a positive `zone` is a fly-by zone around
+/// the waypoint's TCP position. The first and last waypoints of a path must
+/// be exact stops.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CuCartesianWaypoint<const N: usize> {
+    pub positions: [CuJointPosition; N],
+    /// TCP zone radius around the waypoint (zero = exact stop).
+    pub zone: Length,
+}
+
+impl<const N: usize> CuCartesianWaypoint<N> {
+    /// Waypoint at `positions` with TCP zone radius `zone` (zero = exact stop).
+    pub const fn new(positions: [CuJointPosition; N], zone: Length) -> Self {
+        Self { positions, zone }
+    }
+}
 
 /// Programmed TCP zone of one waypoint, in the chain base frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -78,25 +97,54 @@ impl<const N: usize, const CAP: usize> CuCartesianBlendPath<N, CAP> {
     }
 }
 
-/// Sampling bounds and IK configuration used during Cartesian path construction.
-#[derive(Debug, Clone, Copy, Encode, Decode, Serialize, Deserialize, Reflect)]
-pub struct CuCartesianBlendConfig {
+/// Sampling bounds and IK parameters of [`blend_cartesian_path`].
+///
+/// ```ron
+/// {
+///     "translation_step": 0.01,
+///     "rotation_step": 0.05,
+///     "collision_step": {"angular": 0.08, "linear": 0.01},
+///     "ik": {"max_iterations": 256},
+/// }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect)]
+#[serde(default, deny_unknown_fields)]
+pub struct CuCartesianBlendParams {
     /// Maximum TCP translation between Cartesian targets.
     pub translation_step: Length,
     /// Maximum tool rotation between Cartesian targets.
     pub rotation_step: Angle,
     /// Joint interpolation resolution for collision checks between IK solutions.
     pub collision_step: CuJointResolution,
-    pub ik: CuIkConfig,
+    pub ik: CuIkParams,
 }
-impl Default for CuCartesianBlendConfig {
+impl Default for CuCartesianBlendParams {
     fn default() -> Self {
         Self {
             translation_step: Length::new::<meter>(0.01),
             rotation_step: Angle::new::<radian>(0.05),
             collision_step: CuJointResolution::default(),
-            ik: CuIkConfig::default(),
+            ik: CuIkParams::default(),
         }
+    }
+}
+impl CuCartesianBlendParams {
+    /// Checks that both steps are positive and finite, the collision
+    /// resolution is valid, and the IK parameters are valid.
+    pub fn validate(&self) -> CuResult<()> {
+        let translation = self.translation_step.get::<meter>();
+        let rotation = self.rotation_step.get::<radian>();
+        if !translation.is_finite()
+            || translation <= 0.0
+            || !rotation.is_finite()
+            || rotation <= 0.0
+        {
+            return Err(CuError::from(
+                "Cartesian blend steps must be positive and finite",
+            ));
+        }
+        self.collision_step.metric().validate()?;
+        self.ik.validate()
     }
 }
 
@@ -250,14 +298,14 @@ struct Progress {
     steps: usize,
 }
 
-struct Builder<'a, const N: usize, const M: usize, const O: usize, const CAP: usize> {
+struct Builder<'a, const N: usize, const M: usize, const CAP: usize> {
     chain: &'a CuKinematicChain<N>,
     model: &'a CuRobotCollisionModel<N, M>,
-    world: Option<&'a CuCollisionWorld<O>>,
-    config: &'a CuCartesianBlendConfig,
+    env: &'a CuCollisionEnv<'a>,
+    config: &'a CuCartesianBlendParams,
     out: &'a mut CuCartesianBlendPath<N, CAP>,
 }
-impl<const N: usize, const M: usize, const O: usize, const CAP: usize> Builder<'_, N, M, O, CAP> {
+impl<const N: usize, const M: usize, const CAP: usize> Builder<'_, N, M, CAP> {
     fn append(
         &mut self,
         target: Pose,
@@ -292,13 +340,13 @@ impl<const N: usize, const M: usize, const O: usize, const CAP: usize> Builder<'
         }
         if !self
             .model
-            .is_configuration_collision_free(self.chain, &q, self.world)?
+            .is_configuration_collision_free(self.chain, &q, self.env)?
             || !self.model.is_segment_collision_free(
                 self.chain,
                 &previous,
                 &q,
                 self.config.collision_step,
-                self.world,
+                self.env,
             )?
         {
             return Ok(CuCartesianBlendStatus::Collision { waypoint });
@@ -381,55 +429,56 @@ impl<const N: usize, const M: usize, const O: usize, const CAP: usize> Builder<'
 
 /// Construct a Cartesian path through joint waypoints with per-waypoint TCP zones.
 ///
-/// `zones` has one radius per waypoint. First and last must be zero. A zero
-/// interior radius is an exact stop; a positive radius is a fly-by zone in
-/// meters. Trimming is capped to 49% of each adjacent straight segment to
-/// avoid overlapping zones. Degenerate corners and zones too small relative
-/// to IK tolerance are rejected. The input joint configurations define TCP
-/// position *and orientation* through FK. Collision checking is discrete,
-/// not swept-volume continuous collision detection;
-/// [`parameterize_cartesian_path`](crate::path_timing::parameterize_cartesian_path)
+/// Each waypoint carries its zone radius. First and last must be zero. A
+/// zero interior radius is an exact stop; a positive radius is a fly-by zone.
+/// Trimming is capped to 49% of each adjacent straight segment to avoid
+/// overlapping zones. Degenerate corners and zones too small relative to IK
+/// tolerance are rejected, as are invalid `params`. The input joint
+/// configurations define TCP position *and orientation* through FK.
+/// Collisions are checked against `env` (pass [`CuCollisionEnv::EMPTY`] for
+/// self-collision only); checking is discrete, not swept-volume continuous
+/// collision detection;
+/// [`parameterize_cartesian_path`](crate::parameterize_cartesian_path)
 /// rechecks the interpolated path when timing it.
 ///
 /// All output and scratch storage is const-sized; failure clears the output.
-pub fn blend_cartesian_path<const N: usize, const M: usize, const O: usize, const CAP: usize>(
+pub fn blend_cartesian_path<const N: usize, const M: usize, const CAP: usize>(
     chain: &CuKinematicChain<N>,
     model: &CuRobotCollisionModel<N, M>,
-    world: Option<&CuCollisionWorld<O>>,
-    waypoints: &[[CuJointPosition; N]],
-    zones: &[Length],
-    config: &CuCartesianBlendConfig,
+    env: &CuCollisionEnv<'_>,
+    waypoints: &[CuCartesianWaypoint<N>],
+    params: &CuCartesianBlendParams,
     out: &mut CuCartesianBlendPath<N, CAP>,
 ) -> CuResult<CuCartesianBlendStatus> {
     out.clear();
     if waypoints.len() < 2
         || waypoints.len() > CAP
-        || zones.len() != waypoints.len()
-        || zones.first().is_none_or(|r| r.get::<meter>() != 0.0)
-        || zones.last().is_none_or(|r| r.get::<meter>() != 0.0)
-        || !config.translation_step.get::<meter>().is_finite()
-        || config.translation_step.get::<meter>() <= 0.0
-        || !config.rotation_step.get::<radian>().is_finite()
-        || config.rotation_step.get::<radian>() <= 0.0
-        || config.collision_step.metric().validate().is_err()
+        || waypoints
+            .first()
+            .is_none_or(|w| w.zone.get::<meter>() != 0.0)
+        || waypoints
+            .last()
+            .is_none_or(|w| w.zone.get::<meter>() != 0.0)
+        || params.validate().is_err()
     {
         return Ok(CuCartesianBlendStatus::InvalidInput);
     }
+    let config = params;
     let mut poses = [Pose::default(); CAP];
     for i in 0..waypoints.len() {
-        let radius = zones[i].get::<meter>();
-        if !radius.is_finite() || radius < 0.0 || !chain.is_within_limits(&waypoints[i]) {
+        let radius = waypoints[i].zone.get::<meter>();
+        if !radius.is_finite() || radius < 0.0 || !chain.is_within_limits(&waypoints[i].positions) {
             return Ok(CuCartesianBlendStatus::InvalidInput);
         }
         let mut transform = Transform3D::<f64>::identity();
-        chain.forward_kinematics(&waypoints[i], &mut transform)?;
+        chain.forward_kinematics(&waypoints[i].positions, &mut transform)?;
         poses[i] = Pose::from_transform(transform);
     }
-    if !model.is_configuration_collision_free(chain, &waypoints[0], world)? {
+    if !model.is_configuration_collision_free(chain, &waypoints[0].positions, env)? {
         return Ok(CuCartesianBlendStatus::Collision { waypoint: 0 });
     }
     out.points[0] = CuCartesianPathPoint {
-        positions: waypoints[0],
+        positions: waypoints[0].positions,
         stop: true,
         zone: None,
     };
@@ -438,15 +487,15 @@ pub fn blend_cartesian_path<const N: usize, const M: usize, const O: usize, cons
         let mut builder = Builder {
             chain,
             model,
-            world,
+            env,
             config,
             out,
         };
         let mut current = poses[0];
         for i in 1..waypoints.len() - 1 {
-            let r = zones[i].get::<meter>();
+            let r = waypoints[i].zone.get::<meter>();
             if r == 0.0 {
-                let s = builder.line(current, poses[i], Some(waypoints[i]), true, i)?;
+                let s = builder.line(current, poses[i], Some(waypoints[i].positions), true, i)?;
                 if s != CuCartesianBlendStatus::Success {
                     return Ok(s);
                 }
@@ -499,12 +548,18 @@ pub fn blend_cartesian_path<const N: usize, const M: usize, const O: usize, cons
             current = exit;
         }
         let last = waypoints.len() - 1;
-        let status = builder.line(current, poses[last], Some(waypoints[last]), true, last)?;
+        let status = builder.line(
+            current,
+            poses[last],
+            Some(waypoints[last].positions),
+            true,
+            last,
+        )?;
         if status != CuCartesianBlendStatus::Success {
             return Ok(status);
         }
-        for (i, zone) in zones.iter().enumerate().take(last).skip(1) {
-            if zone.get::<meter>() > 0.0
+        for (i, waypoint) in waypoints.iter().enumerate().take(last).skip(1) {
+            if waypoint.zone.get::<meter>() > 0.0
                 && !builder
                     .out
                     .points()
@@ -525,29 +580,24 @@ pub fn blend_cartesian_path<const N: usize, const M: usize, const O: usize, cons
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::obstacle;
     use crate::test_support::q;
     use crate::test_support::robot;
-    use cu_collision::CuCollisionShape;
-    use cu_collision::CuSphere;
-
-    fn zones<const K: usize>(radii: [f64; K]) -> [Length; K] {
-        radii.map(Length::new::<meter>)
-    }
+    use crate::test_support::waypoints;
 
     #[test]
     fn zone_produces_a_corner_inside_tcp_radius() {
         let (chain, model) = robot();
         let points = [q(0.0, 0.0), q(0.3, 0.0), q(0.3, 0.3)];
-        let world = CuCollisionWorld::<1>::new();
+        let env = CuCollisionEnv::EMPTY;
         let mut path = CuCartesianBlendPath::<3, 256>::default();
         assert_eq!(
             blend_cartesian_path(
                 &chain,
                 &model,
-                Some(&world),
-                &points,
-                &zones([0.0, 0.1, 0.0]),
-                &CuCartesianBlendConfig::default(),
+                &env,
+                &waypoints(&points, [0.0, 0.1, 0.0]),
+                &CuCartesianBlendParams::default(),
                 &mut path
             )
             .unwrap(),
@@ -576,16 +626,15 @@ mod tests {
     fn zero_zone_stops_exactly_and_collision_fails_closed() {
         let (chain, model) = robot();
         let points = [q(0.0, 0.0), q(0.3, 0.0), q(0.3, 0.3)];
-        let mut world = CuCollisionWorld::<1>::new();
-        let config = CuCartesianBlendConfig::default();
+        let env = CuCollisionEnv::EMPTY;
+        let config = CuCartesianBlendParams::default();
         let mut path = CuCartesianBlendPath::<3, 256>::default();
         assert_eq!(
             blend_cartesian_path(
                 &chain,
                 &model,
-                Some(&world),
-                &points,
-                &zones([0.0; 3]),
+                &env,
+                &waypoints(&points, [0.0; 3]),
                 &config,
                 &mut path
             )
@@ -598,19 +647,14 @@ mod tests {
                 .any(|p| p.stop && p.positions == points[1])
         );
         assert!(path.points().iter().all(|p| p.zone.is_none()));
-        world
-            .add_obstacle(CuCollisionShape::Sphere(CuSphere::from_meters(
-                [0.2775, 0.0225, 0.0],
-                0.025,
-            )))
-            .unwrap();
+        let obstacles = [obstacle()];
+        let env = CuCollisionEnv::new(&obstacles);
         assert!(matches!(
             blend_cartesian_path(
                 &chain,
                 &model,
-                Some(&world),
-                &points,
-                &zones([0.0, 0.1, 0.0]),
+                &env,
+                &waypoints(&points, [0.0, 0.1, 0.0]),
                 &config,
                 &mut path
             )
@@ -623,21 +667,20 @@ mod tests {
     #[test]
     fn ik_failure_reports_the_move_and_progress() {
         let (chain, model) = robot();
-        let world = CuCollisionWorld::<0>::new();
+        let env = CuCollisionEnv::EMPTY;
         // 0.1 m samples need several 0.025 m-clamped IK iterations, so a
         // two-iteration budget fails on the first sample toward waypoint 1.
-        let mut config = CuCartesianBlendConfig {
+        let mut config = CuCartesianBlendParams {
             translation_step: Length::new::<meter>(0.1),
-            ..CuCartesianBlendConfig::default()
+            ..CuCartesianBlendParams::default()
         };
         config.ik.max_iterations = 2;
         let mut path = CuCartesianBlendPath::<3, 64>::default();
         let status = blend_cartesian_path(
             &chain,
             &model,
-            Some(&world),
-            &[q(0.0, 0.0), q(0.3, 0.0)],
-            &zones([0.0, 0.0]),
+            &env,
+            &waypoints(&[q(0.0, 0.0), q(0.3, 0.0)], [0.0, 0.0]),
             &config,
             &mut path,
         )
@@ -658,16 +701,15 @@ mod tests {
     fn invalid_and_capacity_cases_leave_no_partial_path() {
         let (chain, model) = robot();
         let points = [q(0.0, 0.0), q(0.3, 0.0), q(0.3, 0.3)];
-        let world = CuCollisionWorld::<0>::new();
-        let config = CuCartesianBlendConfig::default();
+        let env = CuCollisionEnv::EMPTY;
+        let config = CuCartesianBlendParams::default();
         let mut path = CuCartesianBlendPath::<3, 8>::default();
         assert_eq!(
             blend_cartesian_path(
                 &chain,
                 &model,
-                Some(&world),
-                &points,
-                &zones([0.0, 0.1, 0.0]),
+                &env,
+                &waypoints(&points, [0.0, 0.1, 0.0]),
                 &config,
                 &mut path
             )
@@ -679,9 +721,8 @@ mod tests {
             blend_cartesian_path(
                 &chain,
                 &model,
-                Some(&world),
-                &points,
-                &zones([0.0, -0.1, 0.0]),
+                &env,
+                &waypoints(&points, [0.0, -0.1, 0.0]),
                 &config,
                 &mut path
             )

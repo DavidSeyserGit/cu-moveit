@@ -1,41 +1,94 @@
-//! Copper `CuTask` wrapper for real-time self-collision, environment, and attached shape collision checking.
+//! Copper `CuTask` for real-time self-collision, environment, and attached-shape collision checking.
 
+use crate::env::CuCollisionEnv;
 use crate::model::CuCollisionReport;
-use crate::model::CuCollisionWorld;
 use crate::model::CuRobotCollisionModel;
+use crate::robots::CuCollisionModelSpec;
 use crate::scene::CuPlanningScene;
-use crate::scene::DEFAULT_MAX_ATTACHED_SHAPES;
-use crate::scene::DEFAULT_MAX_SCENE_OBSTACLES;
+use crate::scene::DEFAULT_MAX_ATTACHED;
+use crate::scene::DEFAULT_MAX_OBSTACLES;
 use crate::scene_exclusions::CuSceneExclusions;
-use crate::scene_exclusions::DEFAULT_MAX_SCENE_EXCLUSIONS;
-use crate::scene_query::CuSceneQueryExclusions;
-use crate::scene_query::check_attached_shapes;
-use crate::shapes::CuCollisionShape;
+use crate::scene_exclusions::DEFAULT_MAX_EXCLUSIONS;
+use cu_kinematics::CuChainSpec;
 use cu_kinematics::CuJointPosition;
 use cu_kinematics::CuJointPositionsPayload;
 use cu_kinematics::CuKinematicChain;
-use cu_spatial_payloads::Transform3D;
 use cu29::prelude::*;
-use cu29::units::si::f64::Length as Length64;
-use cu29::units::si::length::meter;
+use serde::Deserialize;
+use serde::Serialize;
 
-/// Default obstacle capacity for `CuCollisionCheckTask`.
-pub const DEFAULT_MAX_OBSTACLES: usize = DEFAULT_MAX_SCENE_OBSTACLES;
-/// Default attached shape capacity for `CuCollisionCheckTask`.
-pub const DEFAULT_MAX_ATTACHED: usize = DEFAULT_MAX_ATTACHED_SHAPES;
-/// Default contact capacity for `CuCollisionCheckTask`.
+/// Default contact capacity of [`CuCollisionCheckTask`].
 pub const DEFAULT_MAX_CONTACTS: usize = 16;
 
-/// Stateless `CuTask` evaluating self-collision, environment obstacles, and attached shapes in place.
-#[derive(Reflect)]
+/// Node config of [`CuCollisionCheckTask`].
+///
+/// ```ron
+/// config: {"chain": "igus_rebel", "collision_model": "igus_rebel"}
+/// ```
+///
+/// Both keys are required. `chain` is a [`CuChainSpec`] and `collision_model` a
+/// [`CuCollisionModelSpec`] (preset name or inline model).
+#[derive(Debug, Clone, Serialize, Deserialize, Reflect)]
 #[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+// Field-level defaults: serde does not support container `default` on const-generic structs.
+#[serde(deny_unknown_fields)]
+pub struct CuCollisionCheckParams<const N: usize, const M: usize = N> {
+    /// Required robot chain: a preset name (`"igus_rebel"`) or an inline chain.
+    #[serde(default)]
+    #[reflect(ignore)]
+    pub chain: Option<CuChainSpec<N>>,
+    /// Required collision model: a preset name (`"igus_rebel"`) or an inline model.
+    #[serde(default)]
+    #[reflect(ignore)]
+    pub collision_model: Option<CuCollisionModelSpec<M>>,
+}
+
+impl<const N: usize, const M: usize> Default for CuCollisionCheckParams<N, M> {
+    fn default() -> Self {
+        Self {
+            chain: None,
+            collision_model: None,
+        }
+    }
+}
+
+impl<const N: usize, const M: usize> CuCollisionCheckParams<N, M> {
+    /// Resolves and validates the configured chain.
+    pub fn resolve_chain(&self) -> CuResult<CuKinematicChain<N>> {
+        self.chain
+            .as_ref()
+            .ok_or_else(|| CuError::from("Missing required `chain` configuration"))?
+            .resolve()
+    }
+
+    /// Resolves and validates the configured collision model.
+    pub fn resolve_collision_model(&self) -> CuResult<CuRobotCollisionModel<N, M>> {
+        self.collision_model
+            .as_ref()
+            .ok_or_else(|| CuError::from("Missing required `collision_model` configuration"))?
+            .resolve()
+    }
+
+    /// Checks that both the chain and the collision model are present and valid.
+    pub fn validate(&self) -> CuResult<()> {
+        self.resolve_chain()?;
+        self.resolve_collision_model()?;
+        Ok(())
+    }
+}
+
+/// Stateless `CuTask` evaluating self-collision, environment obstacles, and attached shapes in place.
+///
+/// Node config: [`CuCollisionCheckParams`]. Inputs: joint positions, planning scene, exclusions.
+#[derive(Reflect)]
+#[reflect(no_field_bounds, from_reflect = false)]
 pub struct CuCollisionCheckTask<
     const N: usize,
+    const M: usize = N,
     const MAX_OBS: usize = DEFAULT_MAX_OBSTACLES,
     const MAX_ATTACHED: usize = DEFAULT_MAX_ATTACHED,
     const MAX_CONTACTS: usize = DEFAULT_MAX_CONTACTS,
-    const MAX_EXCL: usize = DEFAULT_MAX_SCENE_EXCLUSIONS,
-    const M: usize = N,
+    const MAX_EXCL: usize = DEFAULT_MAX_EXCLUSIONS,
 > {
     #[reflect(ignore)]
     chain: CuKinematicChain<N>,
@@ -45,19 +98,20 @@ pub struct CuCollisionCheckTask<
 
 impl<
     const N: usize,
+    const M: usize,
     const MAX_OBS: usize,
     const MAX_ATTACHED: usize,
     const MAX_CONTACTS: usize,
     const MAX_EXCL: usize,
-    const M: usize,
-> CuCollisionCheckTask<N, MAX_OBS, MAX_ATTACHED, MAX_CONTACTS, MAX_EXCL, M>
+> CuCollisionCheckTask<N, M, MAX_OBS, MAX_ATTACHED, MAX_CONTACTS, MAX_EXCL>
 {
-    /// Creates a collision check task from an explicit kinematic chain and robot collision model.
-    pub const fn new_with_model(
+    /// Creates a collision check task from a kinematic chain and robot collision model.
+    pub fn from_params(
         chain: CuKinematicChain<N>,
         model: CuRobotCollisionModel<N, M>,
-    ) -> Self {
-        Self { chain, model }
+    ) -> CuResult<Self> {
+        chain.validate()?;
+        Ok(Self { chain, model })
     }
 
     /// Borrows the kinematic chain.
@@ -73,7 +127,8 @@ impl<
     /// Checks self-collision, environment obstacles, and attached shapes for configuration `q`
     /// against an optional planning scene snapshot, populating `out_report` in place.
     ///
-    /// Stable-ID `exclusions` resolve against `scene`; invalid references fail the check.
+    /// Stable-ID `exclusions` are validated against `scene`; invalid references, or non-empty
+    /// exclusions without a scene, fail the check.
     pub fn check_configuration(
         &self,
         q: &[CuJointPosition; N],
@@ -81,29 +136,40 @@ impl<
         exclusions: Option<&CuSceneExclusions<MAX_EXCL>>,
         out_report: &mut CuCollisionReport<MAX_CONTACTS>,
     ) -> CuResult<()> {
-        check_scene_configuration(&self.chain, &self.model, q, scene, exclusions, out_report)
+        let env = match (scene, exclusions) {
+            (Some(scene), Some(exclusions)) => scene.collision_env().with_exclusions(exclusions),
+            (Some(scene), None) => scene.collision_env(),
+            (None, Some(exclusions)) if !exclusions.is_empty() => {
+                return Err(CuError::from(
+                    "cu_collision: scene exclusions require a planning scene snapshot",
+                ));
+            }
+            (None, _) => CuCollisionEnv::EMPTY,
+        };
+        self.model
+            .check_configuration(&self.chain, q, &env, out_report)
     }
 }
 
 impl<
     const N: usize,
+    const M: usize,
     const MAX_OBS: usize,
     const MAX_ATTACHED: usize,
     const MAX_CONTACTS: usize,
     const MAX_EXCL: usize,
-    const M: usize,
-> Freezable for CuCollisionCheckTask<N, MAX_OBS, MAX_ATTACHED, MAX_CONTACTS, MAX_EXCL, M>
+> Freezable for CuCollisionCheckTask<N, M, MAX_OBS, MAX_ATTACHED, MAX_CONTACTS, MAX_EXCL>
 {
 }
 
 impl<
     const N: usize,
+    const M: usize,
     const MAX_OBS: usize,
     const MAX_ATTACHED: usize,
     const MAX_CONTACTS: usize,
     const MAX_EXCL: usize,
-    const M: usize,
-> CuTask for CuCollisionCheckTask<N, MAX_OBS, MAX_ATTACHED, MAX_CONTACTS, MAX_EXCL, M>
+> CuTask for CuCollisionCheckTask<N, M, MAX_OBS, MAX_ATTACHED, MAX_CONTACTS, MAX_EXCL>
 {
     type Resources<'r> = ();
     type Input<'m> = input_msg!(
@@ -118,14 +184,12 @@ impl<
     where
         Self: Sized,
     {
-        let chain = CuKinematicChain::from_config(cfg)?;
-        let mut model = CuRobotCollisionModel::from_config(cfg)?;
-        if let Some(cfg) = cfg
-            && let Some(margin_m) = cfg.get::<f64>("safety_margin_m")?
-        {
-            model.set_safety_margin(Length64::new::<meter>(margin_m));
-        }
-        Ok(Self::new_with_model(chain, model))
+        let params: CuCollisionCheckParams<N, M> = cfg
+            .map(ComponentConfig::deserialize_into::<CuCollisionCheckParams<N, M>>)
+            .transpose()?
+            .unwrap_or_default();
+        params.validate()?;
+        Self::from_params(params.resolve_chain()?, params.resolve_collision_model()?)
     }
 
     fn process<'i, 'o>(
@@ -147,15 +211,11 @@ impl<
             return Ok(());
         };
 
-        let scene = input.1.payload();
-        let exclusions = input.2.payload();
         let mut report = CuCollisionReport::<MAX_CONTACTS>::default();
-        check_scene_configuration(
-            &self.chain,
-            &self.model,
+        self.check_configuration(
             &joints.positions,
-            scene,
-            exclusions,
+            input.1.payload(),
+            input.2.payload(),
             &mut report,
         )?;
         output.set_payload(report);
@@ -163,109 +223,45 @@ impl<
     }
 }
 
-/// Evaluates self-collision, environment obstacles, and attached shapes for a robot configuration
-/// against an optional planning scene snapshot, writing contacts and distance into `out_report`.
-fn check_scene_configuration<
-    const N: usize,
-    const M: usize,
-    const MAX_OBS: usize,
-    const MAX_ATTACHED: usize,
-    const MAX_CONTACTS: usize,
-    const MAX_EXCL: usize,
->(
-    chain: &CuKinematicChain<N>,
-    model: &CuRobotCollisionModel<N, M>,
-    q: &[CuJointPosition; N],
-    scene: Option<&CuPlanningScene<MAX_OBS, MAX_ATTACHED>>,
-    exclusions: Option<&CuSceneExclusions<MAX_EXCL>>,
-    out_report: &mut CuCollisionReport<MAX_CONTACTS>,
-) -> CuResult<()> {
-    let mut frames = [Transform3D::<f64>::identity(); N];
-    let mut ee = Transform3D::<f64>::identity();
-    chain.forward_frames(q, &mut frames, &mut ee)?;
-    check_scene_frames(model, &frames, scene, exclusions, out_report)
-}
-
-/// Evaluates self-collision, environment obstacles, and attached shapes for precomputed `link_frames`
-/// against an optional planning scene snapshot, writing contacts and distance into `out_report`.
-fn check_scene_frames<
-    const N: usize,
-    const M: usize,
-    const MAX_OBS: usize,
-    const MAX_ATTACHED: usize,
-    const MAX_CONTACTS: usize,
-    const MAX_EXCL: usize,
->(
-    model: &CuRobotCollisionModel<N, M>,
-    link_frames: &[Transform3D<f64>; N],
-    scene: Option<&CuPlanningScene<MAX_OBS, MAX_ATTACHED>>,
-    exclusions: Option<&CuSceneExclusions<MAX_EXCL>>,
-    out_report: &mut CuCollisionReport<MAX_CONTACTS>,
-) -> CuResult<()> {
-    match scene {
-        None => {
-            if exclusions.is_some_and(|e| !e.is_empty()) {
-                return Err(CuError::from(
-                    "cu_collision: scene exclusions require a planning scene snapshot",
-                ));
-            }
-            model.check_frames::<MAX_OBS, MAX_CONTACTS>(link_frames, None, out_report);
-            Ok(())
-        }
-        Some(scene) => {
-            let mut query_exclusions = CuSceneQueryExclusions::<MAX_EXCL>::new();
-            if let Some(exclusions) = exclusions {
-                exclusions.resolve(scene, model.shape_count(), &mut query_exclusions)?;
-            }
-            let mut world = CuCollisionWorld::<MAX_OBS>::new();
-            scene.write_collision_world(&mut world)?;
-            model.check_frames(link_frames, Some(&world), out_report);
-
-            let attached_len = scene.attached_count();
-            if attached_len > 0 {
-                let attached_slice = scene.attached_shapes();
-                let mut attached_shapes = [CuCollisionShape::default(); MAX_ATTACHED];
-                let mut attached_frames = [None; MAX_ATTACHED];
-                for (i, att) in attached_slice.iter().enumerate() {
-                    attached_shapes[i] = att.shape;
-                    attached_frames[i] = Some(att.link_index);
-                }
-
-                let mut out_attached_world_shapes = [CuCollisionShape::default(); MAX_ATTACHED];
-                let mut out_robot_world_shapes = [CuCollisionShape::default(); M];
-                check_attached_shapes(
-                    model,
-                    link_frames,
-                    &attached_shapes,
-                    &attached_frames,
-                    attached_len,
-                    Some(&world),
-                    &query_exclusions,
-                    &mut out_attached_world_shapes,
-                    &mut out_robot_world_shapes,
-                    out_report,
-                )?;
-            }
-            Ok(())
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cu29::units::si::length::meter;
+
+    const ONE_JOINT_CHAIN: &str = r#"{"joints": [{"joint_type": "revolute", "origin_translation": [0.0, 0.0, 0.0], "origin_rpy": [0.0, 0.0, 0.0], "axis": "pos_z", "limits": {"revolute": {"lower": -3.0, "upper": 3.0, "max_velocity": 1.0}}}]}"#;
+
+    fn config(body: &str) -> ComponentConfig {
+        ron::from_str(&alloc::format!("#![enable(unwrap_newtypes)]\n{{{body}}}")).unwrap()
+    }
 
     #[test]
     fn serial_collision_task_requires_matching_explicit_models() {
         assert!(CuCollisionCheckTask::<1>::new(None, ()).is_err());
-        let chain_only: ComponentConfig = ron::from_str(r#"#![enable(unwrap_newtypes)]
-{"chain": {"joints": [{"joint_type": "revolute", "origin_translation": [0.0, 0.0, 0.0], "origin_rpy": [0.0, 0.0, 0.0], "axis": "pos_z", "limits": {"revolute": {"lower": -3.0, "upper": 3.0, "max_velocity": 1.0}}}]}}"#).unwrap();
+        let chain_only = config(&alloc::format!(r#""chain": {ONE_JOINT_CHAIN}"#));
         assert!(CuCollisionCheckTask::<1>::new(Some(&chain_only), ()).is_err());
-        let cfg: ComponentConfig = ron::from_str(r#"#![enable(unwrap_newtypes)]
-{"chain": {"joints": [{"joint_type": "revolute", "origin_translation": [0.0, 0.0, 0.0], "origin_rpy": [0.0, 0.0, 0.0], "axis": "pos_z", "limits": {"revolute": {"lower": -3.0, "upper": 3.0, "max_velocity": 1.0}}}]}, "collision_model": {"link_shapes": [{"sphere": {"center": [0.0, 0.0, 0.0], "radius": 0.1}}], "safety_margin": 0.01}}"#).unwrap();
+        let model = r#"{"shapes": [{"shape": {"sphere": {"center": [0.0, 0.0, 0.0], "radius": 0.1}}, "frame": 0}], "safety_margin": 0.01}"#;
+        let cfg = config(&alloc::format!(
+            r#""chain": {ONE_JOINT_CHAIN}, "collision_model": {model}"#
+        ));
         let task = CuCollisionCheckTask::<1>::new(Some(&cfg), ()).unwrap();
         assert_eq!(task.model().link_shapes().len(), 1);
         assert_eq!(task.model().safety_margin().get::<meter>(), 0.01);
-        assert!(CuRobotCollisionModel::<2>::from_config(Some(&cfg)).is_err());
+        assert!(
+            cfg.deserialize_into::<CuCollisionCheckParams<1, 2>>()
+                .is_err()
+        );
+        // The old second spelling of the margin is rejected instead of silently ignored.
+        let typo = config(&alloc::format!(
+            r#""chain": {ONE_JOINT_CHAIN}, "collision_model": {model}, "safety_margin_m": 0.02"#
+        ));
+        assert!(CuCollisionCheckTask::<1>::new(Some(&typo), ()).is_err());
+    }
+
+    #[test]
+    fn collision_task_accepts_presets() {
+        let cfg = config(r#""chain": "igus_rebel", "collision_model": "igus_rebel""#);
+        let task = CuCollisionCheckTask::<6>::new(Some(&cfg), ()).unwrap();
+        assert_eq!(task.model(), &crate::igus_rebel_collision_model());
+        assert!(CuCollisionCheckTask::<6, 4>::new(Some(&cfg), ()).is_err());
     }
 }

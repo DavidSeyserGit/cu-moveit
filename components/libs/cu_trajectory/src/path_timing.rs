@@ -1,7 +1,7 @@
 //! Profile timing of sampled Cartesian paths.
 //!
 //! Geometry and timing are independent steps.
-//! [`blend_cartesian_path`](crate::cartesian_blend::blend_cartesian_path)
+//! [`blend_cartesian_path`](crate::blend_cartesian_path)
 //! turns waypoints and their per-point TCP zones into a joint-space path;
 //! [`parameterize_cartesian_path`] times that path with any
 //! [`CuTrajectoryProfile`]. A zone belongs to its waypoint, not to the
@@ -19,22 +19,23 @@
 //! Hermite for the S-curve, cubic Hermite for the others — and stretched uniformly when a peak
 //! exceeds a limit.
 
+use crate::CuTrajectoryInterpolation;
 use crate::CuTrajectoryPayload;
 use crate::CuTrajectoryPoint;
 use crate::cartesian_blend::CuCartesianBlendPath;
 use crate::cartesian_blend::CuCartesianPathPoint;
 use crate::parameterize::CuJointTrajectoryLimits;
+use crate::parameterize::CuTimingParams;
+use crate::parameterize::CuTimingStatus;
 use crate::parameterize::CuTrajectoryProfile;
 use crate::parameterize::cubic_eval;
 use crate::parameterize::quintic_eval;
 use crate::quintic::cubic_limit_ratio;
 use crate::quintic::polynomial_extrema;
-use crate::quintic::quintic_limit_ratio;
-use crate::quintic::stretch_time;
-use bincode::Decode;
-use bincode::Encode;
-use cu_collision::CuCollisionWorld;
+use cu_collision::CuCollisionEnv;
 use cu_collision::CuRobotCollisionModel;
+use cu_kinematics::CuJointAcceleration;
+use cu_kinematics::CuJointJerk;
 use cu_kinematics::CuJointPosition;
 use cu_kinematics::CuJointResolution;
 use cu_kinematics::CuJointVelocity;
@@ -47,72 +48,90 @@ use cu29::units::si::time::second;
 use serde::Deserialize;
 use serde::Serialize;
 
-/// Outcome of [`parameterize_cartesian_path`]. `out` is empty unless `Success`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect)]
-#[serde(rename_all = "snake_case")]
-pub enum CuPathTimingStatus {
-    Success,
-    InvalidInput,
-    CapacityExceeded,
-    /// The interpolated path collides between knots `sample` and `sample + 1`.
-    Collision {
-        sample: usize,
-    },
-    /// The interpolated path leaves this waypoint's TCP zone.
-    ZoneExceeded {
-        waypoint: usize,
-    },
-    /// The path cannot keep moving through this waypoint's zone.
-    NoContinuousMotion {
-        waypoint: usize,
-    },
-    /// Every joint reverses at this non-stop knot outside any zone.
-    UnexpectedStop {
-        sample: usize,
-    },
+/// Parameters of [`parameterize_cartesian_path`]: the shared joint timing
+/// plus the collision recheck resolution.
+///
+/// ```ron
+/// {
+///     "timing": {
+///         "limits": {
+///             "max_velocities": [{"revolute": 1.0}],
+///             "max_accelerations": [{"revolute": 2.0}],
+///             "max_jerks": [{"revolute": 10.0}],
+///         },
+///         "profile": "s_curve",
+///         "sample_period": 0.02,
+///     },
+///     "collision_step": {"angular": 0.08, "linear": 0.01},
+/// }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Reflect)]
+#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+// Field-level defaults: serde does not support container `default` on const-generic structs.
+#[serde(deny_unknown_fields)]
+pub struct CuPathTimingParams<const N: usize> {
+    /// Limits, path-speed profile of every move, and sample period.
+    pub timing: CuTimingParams<N>,
+    /// Joint resolution for the collision recheck of the interpolated path.
+    #[serde(default)]
+    pub collision_step: CuJointResolution,
 }
 
-/// Timing and validation settings for [`parameterize_cartesian_path`].
-#[derive(Debug, Clone, Copy)]
-pub struct CuPathTimingConfig<const N: usize> {
-    pub limits: CuJointTrajectoryLimits<N>,
-    /// Path-speed profile for every move along the path.
-    pub profile: CuTrajectoryProfile,
-    pub sample_period: Time,
-    /// Joint resolution for the collision recheck of the interpolated path.
-    pub collision_step: CuJointResolution,
+impl<const N: usize> Default for CuPathTimingParams<N> {
+    fn default() -> Self {
+        Self {
+            timing: CuTimingParams::default(),
+            collision_step: CuJointResolution::default(),
+        }
+    }
+}
+
+impl<const N: usize> CuPathTimingParams<N> {
+    /// Checks the timing parameters and the collision resolution.
+    pub fn validate(&self) -> CuResult<()> {
+        self.timing.validate()?;
+        self.collision_step.metric().validate()
+    }
 }
 
 /// Times a sampled Cartesian path with one profile along the whole path.
 ///
 /// Every move between an exact stop or zone corner and the next follows
-/// `config.profile` in the path parameter; zones are crossed at a constant
-/// corner speed. Joint velocity and acceleration stay within
-/// `config.limits`; S-curve additionally bounds joint jerk on the quintic
-/// reconstruction, including curvature contributions. The geometric spline
-/// is rechecked for collisions and zone containment with discrete
-/// samples, not swept-volume continuous collision detection. This check does
-/// not certify the reconstructed execution curve against geometry. Execute the
-/// S-curve result with `sample_quintic` (or a quintic follower) and the other
-/// profiles with `sample_cubic` (or the cubic follower) to preserve their
-/// validated position, velocity and acceleration. All scratch storage is const-sized.
+/// `params.timing.profile` in the path parameter; zones are crossed at a
+/// constant corner speed. Joint velocity and acceleration stay within
+/// `params.timing.limits`; S-curve additionally bounds joint jerk on the
+/// quintic reconstruction, including curvature contributions. The geometric
+/// spline is rechecked for collisions against `env` (pass
+/// [`CuCollisionEnv::EMPTY`] for self-collision only) and for zone
+/// containment with discrete samples, not swept-volume continuous collision
+/// detection. This check does not certify the reconstructed execution curve
+/// against geometry. `out.interpolation` is set to the reconstruction the
+/// limits were validated on: [`CuTrajectoryInterpolation::Quintic`] for the
+/// S-curve, [`CuTrajectoryInterpolation::Cubic`] for the other profiles, so
+/// [`CuTrajectoryPayload::sample`] (and the default follower) execute the
+/// validated position, velocity and acceleration. All scratch storage is
+/// const-sized; `out` is empty unless the status is `Success`.
 pub fn parameterize_cartesian_path<
     const N: usize,
     const M: usize,
-    const O: usize,
     const CAP: usize,
     const OUT: usize,
 >(
     chain: &CuKinematicChain<N>,
     model: &CuRobotCollisionModel<N, M>,
-    world: Option<&CuCollisionWorld<O>>,
+    env: &CuCollisionEnv<'_>,
     path: &CuCartesianBlendPath<N, CAP>,
-    config: &CuPathTimingConfig<N>,
+    params: &CuPathTimingParams<N>,
     out: &mut CuTrajectoryPayload<N, OUT>,
-) -> CuResult<CuPathTimingStatus> {
+) -> CuResult<CuTimingStatus> {
     out.clear();
-    let result = time_path(chain, model, world, path, config, out);
-    if !matches!(result, Ok(CuPathTimingStatus::Success)) {
+    out.interpolation = if params.timing.profile == CuTrajectoryProfile::SCurve {
+        CuTrajectoryInterpolation::Quintic
+    } else {
+        CuTrajectoryInterpolation::Cubic
+    };
+    let result = time_path(chain, model, env, path, params, out);
+    if !matches!(result, Ok(CuTimingStatus::Success)) {
         out.clear();
     }
     result
@@ -155,17 +174,18 @@ enum Motion {
     Phased { v0: f64, phases: [Phase; 7] },
 }
 
-fn time_path<const N: usize, const M: usize, const O: usize, const CAP: usize, const OUT: usize>(
+fn time_path<const N: usize, const M: usize, const CAP: usize, const OUT: usize>(
     chain: &CuKinematicChain<N>,
     model: &CuRobotCollisionModel<N, M>,
-    world: Option<&CuCollisionWorld<O>>,
+    env: &CuCollisionEnv<'_>,
     path: &CuCartesianBlendPath<N, CAP>,
-    config: &CuPathTimingConfig<N>,
+    config: &CuPathTimingParams<N>,
     out: &mut CuTrajectoryPayload<N, OUT>,
-) -> CuResult<CuPathTimingStatus> {
-    let limits = &config.limits;
+) -> CuResult<CuTimingStatus> {
+    let limits = &config.timing.limits;
+    let profile = config.timing.profile;
     let count = path.len;
-    let dt = config.sample_period.get::<second>();
+    let dt = config.timing.sample_period.get::<second>();
     if count < 2
         || count > CAP
         || !path.points[0].stop
@@ -174,7 +194,7 @@ fn time_path<const N: usize, const M: usize, const O: usize, const CAP: usize, c
         || dt <= 0.0
         || config.collision_step.metric().validate().is_err()
     {
-        return Ok(CuPathTimingStatus::InvalidInput);
+        return Ok(CuTimingStatus::InvalidInput);
     }
     let first = path.points[0].positions;
     for (j, &joint) in first.iter().enumerate() {
@@ -183,23 +203,30 @@ fn time_path<const N: usize, const M: usize, const O: usize, const CAP: usize, c
             (CuJointPosition::Revolute(_), CuJointVelocity::Revolute(_))
                 | (CuJointPosition::Prismatic(_), CuJointVelocity::Prismatic(_))
                 | (CuJointPosition::Fixed, CuJointVelocity::Fixed)
-        );
+        ) && core::mem::discriminant(&limits.max_accelerations[j])
+            == core::mem::discriminant(&CuJointAcceleration::from_coordinate(joint, 0.0))
+            && (profile != CuTrajectoryProfile::SCurve
+                || matches!(joint, CuJointPosition::Fixed)
+                || limits.max_jerks.is_none_or(|jerks| {
+                    core::mem::discriminant(&jerks[j])
+                        == core::mem::discriminant(&CuJointJerk::from_coordinate(joint, 0.0))
+                }));
         if !valid_kind {
-            return Ok(CuPathTimingStatus::InvalidInput);
+            return Ok(CuTimingStatus::InvalidInput);
         }
         if matches!(joint, CuJointPosition::Fixed) {
             continue;
         }
         let v = limits.max_velocities[j].si_value();
-        let a = limits.max_accelerations[j];
-        let jerk = limits.max_jerks[j];
+        let a = limits.acc(j);
+        let jerk = limits.jerk(j);
         if !v.is_finite()
             || v <= 0.0
             || !a.is_finite()
             || a <= 0.0
-            || (config.profile == CuTrajectoryProfile::SCurve && (jerk.is_nan() || jerk <= 0.0))
+            || (profile == CuTrajectoryProfile::SCurve && (jerk.is_nan() || jerk <= 0.0))
         {
-            return Ok(CuPathTimingStatus::InvalidInput);
+            return Ok(CuTimingStatus::InvalidInput);
         }
     }
 
@@ -211,12 +238,12 @@ fn time_path<const N: usize, const M: usize, const O: usize, const CAP: usize, c
         if !chain.is_within_limits(&q)
             || (0..N).any(|j| core::mem::discriminant(&q[j]) != core::mem::discriminant(&first[j]))
         {
-            return Ok(CuPathTimingStatus::InvalidInput);
+            return Ok(CuTimingStatus::InvalidInput);
         }
         if i > 0 {
             let h = step(&points[i - 1].positions, &q, limits);
             if !h.is_finite() || h <= 1e-15 {
-                return Ok(CuPathTimingStatus::InvalidInput);
+                return Ok(CuTimingStatus::InvalidInput);
             }
             s[i] = s[i - 1] + h;
         }
@@ -238,10 +265,10 @@ fn time_path<const N: usize, const M: usize, const O: usize, const CAP: usize, c
         let (_, slope, _) = curve.eval(i, 0.0);
         if slope.iter().all(|m| libm::fabs(*m) <= 1e-12) {
             return Ok(match points[i].zone {
-                Some(zone) => CuPathTimingStatus::NoContinuousMotion {
+                Some(zone) => CuTimingStatus::NoContinuousMotion {
                     waypoint: zone.waypoint,
                 },
-                None => CuPathTimingStatus::UnexpectedStop { sample: i },
+                None => CuTimingStatus::UnexpectedStop { sample: i },
             });
         }
     }
@@ -256,25 +283,25 @@ fn time_path<const N: usize, const M: usize, const O: usize, const CAP: usize, c
             checks = checks.max(libm::ceil(peak * h / metric.scale(first[j])));
         }
         if !checks.is_finite() || checks > 100_000.0 {
-            return Ok(CuPathTimingStatus::InvalidInput);
+            return Ok(CuTimingStatus::InvalidInput);
         }
         let zone = points[i + 1].zone;
         let mut previous = points[i].positions;
         for k in 1..=checks as usize {
             let (q, _, _) = curve.eval(i, h * k as f64 / checks);
             if !chain.is_within_limits(&q) {
-                return Ok(CuPathTimingStatus::InvalidInput);
+                return Ok(CuTimingStatus::InvalidInput);
             }
-            if !model.is_configuration_collision_free(chain, &q, world)?
+            if !model.is_configuration_collision_free(chain, &q, env)?
                 || !model.is_segment_collision_free(
                     chain,
                     &previous,
                     &q,
                     config.collision_step,
-                    world,
+                    env,
                 )?
             {
-                return Ok(CuPathTimingStatus::Collision { sample: i });
+                return Ok(CuTimingStatus::Collision { sample: i });
             }
             if let Some(zone) = zone {
                 let mut pose = Transform3D::<f64>::identity();
@@ -284,7 +311,7 @@ fn time_path<const N: usize, const M: usize, const O: usize, const CAP: usize, c
                 let d = [m[0][3] - c[0], m[1][3] - c[1], m[2][3] - c[2]];
                 if libm::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]) > zone.radius.get::<meter>()
                 {
-                    return Ok(CuPathTimingStatus::ZoneExceeded {
+                    return Ok(CuTimingStatus::ZoneExceeded {
                         waypoint: zone.waypoint,
                     });
                 }
@@ -312,7 +339,7 @@ fn time_path<const N: usize, const M: usize, const O: usize, const CAP: usize, c
         }
     }
     let spans = &mut spans[..nspans];
-    let scurve = config.profile == CuTrajectoryProfile::SCurve;
+    let scurve = profile == CuTrajectoryProfile::SCurve;
     // Moves keep half the acceleration budget for curvature; corners spend
     // all of it there because their path speed is constant. Joint jerk is
     // `q3·v³ + 3·q2·v·a + q1·j` in the path derivatives `q1..q3` and the
@@ -331,7 +358,7 @@ fn time_path<const N: usize, const M: usize, const O: usize, const CAP: usize, c
             corner_vel = corner_vel.min(corner_cap);
         }
         if !vel.is_finite() || vel <= 0.0 {
-            return Ok(CuPathTimingStatus::InvalidInput);
+            return Ok(CuTimingStatus::InvalidInput);
         }
         let mut acc = f64::INFINITY;
         for i in span.start..span.end {
@@ -342,9 +369,9 @@ fn time_path<const N: usize, const M: usize, const O: usize, const CAP: usize, c
                 if matches!(first[j], CuJointPosition::Fixed) {
                     continue;
                 }
-                let jmax = limits.max_jerks[j];
+                let jmax = limits.jerk(j);
                 if slope[j] > 1e-300 {
-                    acc = acc.min((limits.max_accelerations[j] - curvature[j] * v * v) / slope[j]);
+                    acc = acc.min((limits.acc(j) - curvature[j] * v * v) / slope[j]);
                 }
                 if scurve && jmax.is_finite() && curvature[j] > 1e-300 {
                     acc = acc.min(jmax / (9.0 * curvature[j] * v));
@@ -352,7 +379,7 @@ fn time_path<const N: usize, const M: usize, const O: usize, const CAP: usize, c
             }
         }
         if !acc.is_finite() || acc <= 0.0 {
-            return Ok(CuPathTimingStatus::InvalidInput);
+            return Ok(CuTimingStatus::InvalidInput);
         }
         let mut jerk = f64::INFINITY;
         if scurve {
@@ -361,7 +388,7 @@ fn time_path<const N: usize, const M: usize, const O: usize, const CAP: usize, c
                 let (slope, curvature, third) = bounds;
                 let v = vel.min(speed_caps(&bounds, limits, &first, scurve).0);
                 for j in 0..N {
-                    let jmax = limits.max_jerks[j];
+                    let jmax = limits.jerk(j);
                     if matches!(first[j], CuJointPosition::Fixed)
                         || slope[j] <= 1e-300
                         || !jmax.is_finite()
@@ -373,7 +400,7 @@ fn time_path<const N: usize, const M: usize, const O: usize, const CAP: usize, c
                 }
             }
             if jerk.is_nan() || jerk <= 0.0 {
-                return Ok(CuPathTimingStatus::InvalidInput);
+                return Ok(CuTimingStatus::InvalidInput);
             }
         }
         span.limits = SpeedLimits { vel, acc, jerk };
@@ -398,7 +425,7 @@ fn time_path<const N: usize, const M: usize, const O: usize, const CAP: usize, c
             || points[spans[first_corner].start].stop
             || points[spans[p].end].stop
         {
-            return Ok(CuPathTimingStatus::InvalidInput);
+            return Ok(CuTimingStatus::InvalidInput);
         }
         let speed = spans[first_corner..=p]
             .iter()
@@ -435,7 +462,7 @@ fn time_path<const N: usize, const M: usize, const O: usize, const CAP: usize, c
                     }
                 }
                 (Some(corner), None) | (None, Some(corner)) => corner,
-                (None, None) => return Ok(CuPathTimingStatus::InvalidInput),
+                (None, None) => return Ok(CuTimingStatus::InvalidInput),
             };
             set_run_speed(spans, lower, spans[lower].speed * 0.9);
             blocked = spans[lower].corner;
@@ -446,19 +473,19 @@ fn time_path<const N: usize, const M: usize, const O: usize, const CAP: usize, c
     }
     if !settled {
         return Ok(match blocked {
-            Some(waypoint) => CuPathTimingStatus::NoContinuousMotion { waypoint },
-            None => CuPathTimingStatus::InvalidInput,
+            Some(waypoint) => CuTimingStatus::NoContinuousMotion { waypoint },
+            None => CuTimingStatus::InvalidInput,
         });
     }
 
     if OUT == 0 {
-        return Ok(CuPathTimingStatus::CapacityExceeded);
+        return Ok(CuTimingStatus::CapacityExceeded);
     }
     out.push(CuTrajectoryPoint {
         time_from_start: Time::default(),
         positions: first,
         velocities: first.map(|q| CuJointVelocity::from_coordinate(q, 0.0)),
-        accelerations: [0.0; N],
+        accelerations: first.map(|q| CuJointAcceleration::from_coordinate(q, 0.0)),
     })?;
     let mut elapsed = 0.0;
     for p in 0..spans.len() {
@@ -470,7 +497,7 @@ fn time_path<const N: usize, const M: usize, const O: usize, const CAP: usize, c
         } else {
             match plan_span(&curve, &s, spans, p, (v0, v1), config) {
                 Some(planned) => planned,
-                None => return Ok(CuPathTimingStatus::InvalidInput),
+                None => return Ok(CuTimingStatus::InvalidInput),
             }
         };
         let steps = libm::ceil(duration / dt).max(1.0);
@@ -501,7 +528,7 @@ fn time_path<const N: usize, const M: usize, const O: usize, const CAP: usize, c
         if !steps.is_finite()
             || steps + (phase_count + knot_count) as f64 > OUT.saturating_sub(out.len()) as f64
         {
-            return Ok(CuPathTimingStatus::CapacityExceeded);
+            return Ok(CuTimingStatus::CapacityExceeded);
         }
         let steps = steps as usize;
         let (mut k, mut next_phase, mut next_knot) = (1, 0, 0);
@@ -586,19 +613,19 @@ fn time_path<const N: usize, const M: usize, const O: usize, const CAP: usize, c
     // to limit makes every peak fit: velocity, acceleration and jerk scale by
     // 1/k, 1/k^2 and 1/k^3, keeping the shape.
     let ratio = if scurve {
-        quintic_limit_ratio(out, limits)
+        out.quintic_limit_ratio(limits)
     } else {
         cubic_limit_ratio(out, limits)
     };
     match ratio {
         Some(ratio) if ratio.is_finite() => {
             if ratio > 1.0 {
-                stretch_time(out, ratio * (1.0 + 1e-9))?;
+                out.stretch_time(ratio * (1.0 + 1e-9))?;
             }
         }
-        _ => return Ok(CuPathTimingStatus::InvalidInput),
+        _ => return Ok(CuTimingStatus::InvalidInput),
     }
-    Ok(CuPathTimingStatus::Success)
+    Ok(CuTimingStatus::Success)
 }
 
 /// Time at which `motion` reaches path offset `target`; the motion's offset
@@ -642,8 +669,8 @@ fn speed_caps<const N: usize>(
             continue;
         }
         let v = limits.max_velocities[j].si_value();
-        let a = limits.max_accelerations[j];
-        let jmax = limits.max_jerks[j];
+        let a = limits.acc(j);
+        let jmax = limits.jerk(j);
         if slope[j] > 1e-300 {
             move_cap = move_cap.min(v / slope[j]);
             corner_cap = corner_cap.min(v / slope[j]);
@@ -745,7 +772,11 @@ fn step<const N: usize>(
 }
 
 /// Joint state of one sample: positions, velocities and accelerations.
-type JointState<const N: usize> = ([CuJointPosition; N], [CuJointVelocity; N], [f64; N]);
+type JointState<const N: usize> = (
+    [CuJointPosition; N],
+    [CuJointVelocity; N],
+    [CuJointAcceleration; N],
+);
 
 /// Joint state from path derivatives: `v = q'·ds/dt`, `a = q''·(ds/dt)² + q'·d2s/dt2`.
 fn joint_state<const N: usize>(
@@ -758,7 +789,12 @@ fn joint_state<const N: usize>(
     (
         q,
         core::array::from_fn(|j| CuJointVelocity::from_coordinate(q[j], slope[j] * speed)),
-        core::array::from_fn(|j| curvature[j] * speed * speed + slope[j] * acc),
+        core::array::from_fn(|j| {
+            CuJointAcceleration::from_coordinate(
+                q[j],
+                curvature[j] * speed * speed + slope[j] * acc,
+            )
+        }),
     )
 }
 
@@ -939,17 +975,17 @@ fn plan_span<const N: usize, const CAP: usize>(
     spans: &[Span],
     p: usize,
     (v0, v1): (f64, f64),
-    config: &CuPathTimingConfig<N>,
+    config: &CuPathTimingParams<N>,
 ) -> Option<(Motion, f64)> {
     let span = spans[p];
     let length = s[span.end] - s[span.start];
-    let (motion, duration) = plan(config.profile, length, v0, v1, &span.limits)?;
+    let (motion, duration) = plan(config.timing.profile, length, v0, v1, &span.limits)?;
     let (lo, hi) = interior(spans, p);
     if (lo, hi) == (span.start, span.end) {
         return Some((motion, duration));
     }
-    let limits = &config.limits;
-    let jerk_limited = config.profile == CuTrajectoryProfile::SCurve;
+    let limits = &config.timing.limits;
+    let jerk_limited = config.timing.profile == CuTrajectoryProfile::SCurve;
     let mut piece = span.start;
     // Dense samples of the planned motion; pieces inside the interior are
     // already covered by the span limits.
@@ -974,8 +1010,8 @@ fn plan_span<const N: usize, const CAP: usize>(
             );
             let tolerance = 1.0 + 1e-9;
             if velocity > limits.max_velocities[j].si_value() * tolerance
-                || acceleration > limits.max_accelerations[j] * tolerance
-                || (jerk_limited && joint_jerk > limits.max_jerks[j] * tolerance)
+                || acceleration > limits.acc(j) * tolerance
+                || (jerk_limited && joint_jerk > limits.jerk(j) * tolerance)
             {
                 return None;
             }
@@ -1142,17 +1178,18 @@ fn plan_polynomial(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cartesian_blend::CuCartesianBlendConfig;
-    use crate::cartesian_blend::CuCartesianBlendStatus;
-    use crate::cartesian_blend::CuCartesianPathPoint;
-    use crate::cartesian_blend::CuTcpZone;
-    use crate::cartesian_blend::blend_cartesian_path;
+    use crate::CuCartesianBlendParams;
+    use crate::CuCartesianBlendStatus;
+    use crate::CuCartesianWaypoint;
+    use crate::CuTcpZone;
+    use crate::blend_cartesian_path;
     use crate::test_support::limits;
+    use crate::test_support::obstacle;
     use crate::test_support::q;
     use crate::test_support::robot;
-    use cu_collision::CuCollisionShape;
-    use cu_collision::CuSphere;
+    use crate::test_support::waypoints;
     use cu29::units::si::f64::Length;
+    use cu29::units::si::length::meter;
 
     const PROFILES: [CuTrajectoryProfile; 4] = [
         CuTrajectoryProfile::Trapezoidal,
@@ -1161,50 +1198,42 @@ mod tests {
         CuTrajectoryProfile::Cubic,
     ];
 
-    fn zones<const K: usize>(radii: [f64; K]) -> [Length; K] {
-        radii.map(Length::new::<meter>)
-    }
-
-    fn timing(profile: CuTrajectoryProfile) -> CuPathTimingConfig<3> {
-        CuPathTimingConfig {
-            limits: limits().with_max_jerks([4.0; 3]),
-            profile,
-            sample_period: Time::new::<second>(0.02),
-            collision_step: CuCartesianBlendConfig::default().collision_step,
+    fn timing(profile: CuTrajectoryProfile) -> CuPathTimingParams<3> {
+        let jerk = CuJointJerk::from_coordinate(q(0.0, 0.0)[0], 4.0);
+        CuPathTimingParams {
+            timing: CuTimingParams {
+                limits: limits().with_jerks([jerk; 3]),
+                profile,
+                sample_period: Time::new::<second>(0.02),
+            },
+            collision_step: CuCartesianBlendParams::default().collision_step,
         }
     }
 
-    fn timed(
-        points: &[[CuJointPosition; 3]],
-        zones: &[Length],
+    fn timed<const K: usize>(
+        points: &[[CuJointPosition; 3]; K],
+        zones: [f64; K],
         profile: CuTrajectoryProfile,
-    ) -> (CuPathTimingStatus, CuTrajectoryPayload<3, 512>) {
+    ) -> (CuTimingStatus, CuTrajectoryPayload<3, 512>) {
         let (chain, model) = robot();
-        let world = CuCollisionWorld::<0>::new();
+        let env = CuCollisionEnv::EMPTY;
         let mut path = CuCartesianBlendPath::<3, 256>::default();
         assert_eq!(
             blend_cartesian_path(
                 &chain,
                 &model,
-                Some(&world),
-                points,
-                zones,
-                &CuCartesianBlendConfig::default(),
+                &env,
+                &waypoints(points, zones),
+                &CuCartesianBlendParams::default(),
                 &mut path
             )
             .unwrap(),
             CuCartesianBlendStatus::Success
         );
         let mut out = CuTrajectoryPayload::<3, 512>::new();
-        let status = parameterize_cartesian_path(
-            &chain,
-            &model,
-            Some(&world),
-            &path,
-            &timing(profile),
-            &mut out,
-        )
-        .unwrap();
+        let status =
+            parameterize_cartesian_path(&chain, &model, &env, &path, &timing(profile), &mut out)
+                .unwrap();
         (status, out)
     }
 
@@ -1236,8 +1265,8 @@ mod tests {
     fn every_profile_flies_through_a_positive_zone() {
         let points = [q(0.0, 0.0), q(0.3, 0.0), q(0.3, 0.3)];
         for profile in PROFILES {
-            let (status, out) = timed(&points, &zones([0.0, 0.1, 0.0]), profile);
-            assert_eq!(status, CuPathTimingStatus::Success, "{profile:?}");
+            let (status, out) = timed(&points, [0.0, 0.1, 0.0], profile);
+            assert_eq!(status, CuTimingStatus::Success, "{profile:?}");
             assert_within_limits(&out);
             assert!(at_rest(&out.points()[0], 0.0, 0.0));
             assert!(at_rest(out.points().last().unwrap(), 0.3, 0.3));
@@ -1255,8 +1284,8 @@ mod tests {
     fn every_profile_stops_exactly_at_a_zero_zone() {
         let points = [q(0.0, 0.0), q(0.3, 0.0), q(0.3, 0.3)];
         for profile in PROFILES {
-            let (status, out) = timed(&points, &zones([0.0; 3]), profile);
-            assert_eq!(status, CuPathTimingStatus::Success, "{profile:?}");
+            let (status, out) = timed(&points, [0.0; 3], profile);
+            assert_eq!(status, CuTimingStatus::Success, "{profile:?}");
             assert_within_limits(&out);
             assert!(out.points().iter().any(|p| at_rest(p, 0.3, 0.0)));
         }
@@ -1266,8 +1295,8 @@ mod tests {
     fn flying_through_a_zone_is_faster_than_stopping() {
         let points = [q(0.0, 0.0), q(0.3, 0.0), q(0.3, 0.3)];
         for profile in PROFILES {
-            let (_, blended) = timed(&points, &zones([0.0, 0.1, 0.0]), profile);
-            let (_, stopped) = timed(&points, &zones([0.0; 3]), profile);
+            let (_, blended) = timed(&points, [0.0, 0.1, 0.0], profile);
+            let (_, stopped) = timed(&points, [0.0; 3], profile);
             assert!(
                 duration(&blended) < duration(&stopped),
                 "{profile:?}: {} >= {}",
@@ -1281,8 +1310,8 @@ mod tests {
     fn zones_are_per_waypoint_on_one_path() {
         let points = [q(0.0, 0.0), q(0.3, 0.0), q(0.3, 0.3), q(0.0, 0.3)];
         for profile in PROFILES {
-            let (status, out) = timed(&points, &zones([0.0, 0.1, 0.0, 0.0]), profile);
-            assert_eq!(status, CuPathTimingStatus::Success, "{profile:?}");
+            let (status, out) = timed(&points, [0.0, 0.1, 0.0, 0.0], profile);
+            assert_eq!(status, CuTimingStatus::Success, "{profile:?}");
             assert_within_limits(&out);
             assert!(!out.points().iter().any(|p| at_rest(p, 0.3, 0.0)));
             assert!(out.points().iter().any(|p| at_rest(p, 0.3, 0.3)));
@@ -1293,8 +1322,8 @@ mod tests {
     #[test]
     fn sample_cubic_is_continuous_across_stored_points() {
         let points = [q(0.0, 0.0), q(0.3, 0.0), q(0.3, 0.3)];
-        let (status, out) = timed(&points, &zones([0.0, 0.1, 0.0]), CuTrajectoryProfile::Cubic);
-        assert_eq!(status, CuPathTimingStatus::Success);
+        let (status, out) = timed(&points, [0.0, 0.1, 0.0], CuTrajectoryProfile::Cubic);
+        assert_eq!(status, CuTimingStatus::Success);
         for p in &out.points()[1..out.len() - 1] {
             let t = p.time_from_start.get::<second>();
             let mut before = (q(0.0, 0.0), [CuJointVelocity::default(); 3]);
@@ -1313,13 +1342,13 @@ mod tests {
     #[test]
     fn scurve_path_acceleration_is_continuous() {
         let points = [q(0.0, 0.0), q(0.3, 0.0)];
-        let (status, out) = timed(&points, &zones([0.0, 0.0]), CuTrajectoryProfile::SCurve);
-        assert_eq!(status, CuPathTimingStatus::Success);
+        let (status, out) = timed(&points, [0.0, 0.0], CuTrajectoryProfile::SCurve);
+        assert_eq!(status, CuTimingStatus::Success);
         // Straight line: joint 0 carries the path motion, so the change of
         // its stored acceleration between knots is bounded by the jerk limit.
         for w in out.points().windows(2) {
             let dt = (w[1].time_from_start - w[0].time_from_start).get::<second>();
-            let jerk = (w[1].accelerations[0] - w[0].accelerations[0]) / dt;
+            let jerk = (w[1].accelerations[0].si_value() - w[0].accelerations[0].si_value()) / dt;
             assert!(jerk.abs() <= 4.0 * (1.0 + 1e-6), "jerk {jerk}");
         }
     }
@@ -1328,43 +1357,36 @@ mod tests {
     fn interpolated_path_is_rechecked_for_collisions() {
         let (chain, model) = robot();
         let points = [q(0.0, 0.0), q(0.3, 0.0), q(0.3, 0.3)];
-        let radii = zones([0.0, 0.1, 0.0]);
-        let mut world = CuCollisionWorld::<1>::new();
         let mut path = CuCartesianBlendPath::<3, 256>::default();
         blend_cartesian_path(
             &chain,
             &model,
-            Some(&world),
-            &points,
-            &radii,
-            &CuCartesianBlendConfig::default(),
+            &CuCollisionEnv::EMPTY,
+            &waypoints(&points, [0.0, 0.1, 0.0]),
+            &CuCartesianBlendParams::default(),
             &mut path,
         )
         .unwrap();
-        world
-            .add_obstacle(CuCollisionShape::Sphere(CuSphere::from_meters(
-                [0.2775, 0.0225, 0.0],
-                0.025,
-            )))
-            .unwrap();
+        let obstacles = [obstacle()];
+        let env = CuCollisionEnv::new(&obstacles);
         let mut out = CuTrajectoryPayload::<3, 512>::new();
         let status = parameterize_cartesian_path(
             &chain,
             &model,
-            Some(&world),
+            &env,
             &path,
             &timing(CuTrajectoryProfile::Cubic),
             &mut out,
         )
         .unwrap();
-        assert!(matches!(status, CuPathTimingStatus::Collision { .. }));
+        assert!(matches!(status, CuTimingStatus::Collision { .. }));
         assert!(out.is_empty());
     }
 
     #[test]
     fn reversal_inside_a_zone_cannot_keep_moving() {
         let (chain, model) = robot();
-        let world = CuCollisionWorld::<0>::new();
+        let env = CuCollisionEnv::EMPTY;
         let zone = CuTcpZone {
             waypoint: 1,
             center: [0.3, 0.0, 0.0].map(Length::new::<meter>),
@@ -1391,42 +1413,37 @@ mod tests {
         let status = parameterize_cartesian_path(
             &chain,
             &model,
-            Some(&world),
+            &env,
             &path,
             &timing(CuTrajectoryProfile::Trapezoidal),
             &mut out,
         )
         .unwrap();
-        assert_eq!(
-            status,
-            CuPathTimingStatus::NoContinuousMotion { waypoint: 1 }
-        );
+        assert_eq!(status, CuTimingStatus::NoContinuousMotion { waypoint: 1 });
         assert!(out.is_empty());
     }
 
     #[test]
     fn invalid_period_and_small_capacity_leave_no_output() {
         let (chain, model) = robot();
-        let world = CuCollisionWorld::<0>::new();
+        let env = CuCollisionEnv::EMPTY;
         let points = [q(0.0, 0.0), q(0.3, 0.0), q(0.3, 0.3)];
         let mut path = CuCartesianBlendPath::<3, 256>::default();
         blend_cartesian_path(
             &chain,
             &model,
-            Some(&world),
-            &points,
-            &zones([0.0, 0.1, 0.0]),
-            &CuCartesianBlendConfig::default(),
+            &env,
+            &waypoints(&points, [0.0, 0.1, 0.0]),
+            &CuCartesianBlendParams::default(),
             &mut path,
         )
         .unwrap();
         let mut config = timing(CuTrajectoryProfile::Cubic);
-        config.sample_period = Time::new::<second>(0.0);
+        config.timing.sample_period = Time::new::<second>(0.0);
         let mut out = CuTrajectoryPayload::<3, 512>::new();
         assert_eq!(
-            parameterize_cartesian_path(&chain, &model, Some(&world), &path, &config, &mut out)
-                .unwrap(),
-            CuPathTimingStatus::InvalidInput
+            parameterize_cartesian_path(&chain, &model, &env, &path, &config, &mut out).unwrap(),
+            CuTimingStatus::InvalidInput
         );
         assert!(out.is_empty());
         let mut small = CuTrajectoryPayload::<3, 8>::new();
@@ -1434,13 +1451,13 @@ mod tests {
             parameterize_cartesian_path(
                 &chain,
                 &model,
-                Some(&world),
+                &env,
                 &path,
                 &timing(CuTrajectoryProfile::Cubic),
                 &mut small
             )
             .unwrap(),
-            CuPathTimingStatus::CapacityExceeded
+            CuTimingStatus::CapacityExceeded
         );
         assert!(small.is_empty());
     }
@@ -1453,42 +1470,57 @@ mod tests {
         use cu29::units::si::f64::AngularVelocity;
         let chain = cu_kinematics::igus_rebel_chain();
         let model = cu_collision::igus_rebel_collision_model();
-        let world = CuCollisionWorld::<0>::new();
+        let env = CuCollisionEnv::EMPTY;
         let to_q =
             |j1: f64| [j1, 0.75, -0.25, 0.0, -0.3, 0.0].map(|v| Angle::new::<radian>(v).into());
         let points = [to_q(-0.75), to_q(0.0), to_q(0.75)];
         let zones = [0.0, 0.03, 0.0].map(Length::new::<meter>);
-        let mut blend = CuCartesianBlendConfig::default();
+        let waypoints: [CuCartesianWaypoint<6>; 3] =
+            core::array::from_fn(|i| CuCartesianWaypoint::new(points[i], zones[i]));
+        let mut blend = CuCartesianBlendParams::default();
         blend.ik.max_iterations = 256;
         let mut path = CuCartesianBlendPath::<6, 256>::default();
         assert_eq!(
-            blend_cartesian_path(
-                &chain,
-                &model,
-                Some(&world),
-                &points,
-                &zones,
-                &blend,
-                &mut path
-            )
-            .unwrap(),
+            blend_cartesian_path(&chain, &model, &env, &waypoints, &blend, &mut path).unwrap(),
             CuCartesianBlendStatus::Success
         );
         let velocity = CuJointVelocity::Revolute(AngularVelocity::new::<radian_per_second>(1.0));
         for profile in PROFILES {
-            let config = CuPathTimingConfig {
-                limits: CuJointTrajectoryLimits::new_with_jerks([velocity; 6], [2.0; 6], [10.0; 6]),
-                profile,
-                sample_period: Time::new::<second>(0.02),
+            let rev = points[0][0];
+            let config = CuPathTimingParams {
+                timing: CuTimingParams {
+                    limits: CuJointTrajectoryLimits::new(
+                        [velocity; 6],
+                        [CuJointAcceleration::from_coordinate(rev, 2.0); 6],
+                    )
+                    .with_jerks([CuJointJerk::from_coordinate(rev, 10.0); 6]),
+                    profile,
+                    sample_period: Time::new::<second>(0.02),
+                },
                 collision_step: blend.collision_step,
             };
             let mut out = CuTrajectoryPayload::<6, 1024>::new();
             assert_eq!(
-                parameterize_cartesian_path(&chain, &model, Some(&world), &path, &config, &mut out)
+                parameterize_cartesian_path(&chain, &model, &env, &path, &config, &mut out)
                     .unwrap(),
-                CuPathTimingStatus::Success,
+                CuTimingStatus::Success,
                 "{profile:?}"
             );
+        }
+    }
+
+    #[test]
+    fn output_interpolation_matches_the_validated_reconstruction() {
+        let points = [q(0.0, 0.0), q(0.3, 0.0)];
+        for profile in PROFILES {
+            let (status, out) = timed(&points, [0.0, 0.0], profile);
+            assert_eq!(status, CuTimingStatus::Success);
+            let expected = if profile == CuTrajectoryProfile::SCurve {
+                CuTrajectoryInterpolation::Quintic
+            } else {
+                CuTrajectoryInterpolation::Cubic
+            };
+            assert_eq!(out.interpolation, expected, "{profile:?}");
         }
     }
 }

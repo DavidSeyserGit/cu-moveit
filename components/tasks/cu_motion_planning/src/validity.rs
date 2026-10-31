@@ -8,15 +8,12 @@
 use crate::MAX_ATTACHED_SHAPES;
 use crate::MAX_EXCLUSIONS;
 use crate::MAX_OBSTACLES;
+use cu_collision::CuCollisionEnv;
 use cu_collision::CuCollisionReport;
-use cu_collision::CuCollisionShape;
-use cu_collision::CuCollisionWorld;
 use cu_collision::CuPlanningScene;
 use cu_collision::CuRobotCollisionModel;
 use cu_collision::CuSceneExclusions;
 use cu_collision::CuSceneRevision;
-use cu_collision::scene_query::CuSceneQueryExclusions;
-use cu_collision::scene_query::check_attached_configuration;
 use cu_kinematics::CuJointMetric;
 use cu_kinematics::CuJointPosition;
 use cu_kinematics::CuJointResolution;
@@ -24,18 +21,19 @@ use cu_kinematics::CuKinematicChain;
 use cu29::units::si::length::meter;
 
 /// Collision queries against one captured planning-scene snapshot.
+///
+/// Every query checks the robot against itself, the scene obstacles, and the
+/// scene's attached shapes in one pass, honouring the captured stable-ID
+/// exclusions.
 #[derive(Clone)]
 pub struct CuSceneValidity<const N: usize, const M: usize = N> {
     chain: CuKinematicChain<N>,
     model: CuRobotCollisionModel<N, M>,
     resolution: CuJointResolution,
     scene: CuPlanningScene<MAX_OBSTACLES, MAX_ATTACHED_SHAPES>,
-    world: CuCollisionWorld<MAX_OBSTACLES>,
-    attached_shapes: [CuCollisionShape; MAX_ATTACHED_SHAPES],
-    attached_frames: [Option<usize>; MAX_ATTACHED_SHAPES],
-    attached_len: usize,
-    query_exclusions: CuSceneQueryExclusions<MAX_EXCLUSIONS>,
     exclusions: CuSceneExclusions<MAX_EXCLUSIONS>,
+    /// `false` until a valid scene has been captured.
+    captured: bool,
 }
 
 impl<const N: usize, const M: usize> CuSceneValidity<N, M> {
@@ -51,12 +49,8 @@ impl<const N: usize, const M: usize> CuSceneValidity<N, M> {
             model,
             resolution,
             scene: CuPlanningScene::new(),
-            world: CuCollisionWorld::new(),
-            attached_shapes: [CuCollisionShape::default(); MAX_ATTACHED_SHAPES],
-            attached_frames: [None; MAX_ATTACHED_SHAPES],
-            attached_len: 0,
-            query_exclusions: CuSceneQueryExclusions::new(),
             exclusions: CuSceneExclusions::new(),
+            captured: true,
         }
     }
 
@@ -80,9 +74,10 @@ impl<const N: usize, const M: usize> CuSceneValidity<N, M> {
         &self.exclusions
     }
 
-    /// Captures a scene snapshot for the next job. Returns `false` (and keeps
-    /// no attached shapes) when the scene, its attached shapes, or the
-    /// stable-ID exclusions are invalid for this robot.
+    /// Captures a scene snapshot for the next job. Returns `false` (and
+    /// treats every configuration as blocked) when the resolution, the
+    /// scene's attached shapes, or the stable-ID exclusions are invalid for
+    /// this robot.
     pub fn capture(
         &mut self,
         scene: &CuPlanningScene<MAX_OBSTACLES, MAX_ATTACHED_SHAPES>,
@@ -90,55 +85,31 @@ impl<const N: usize, const M: usize> CuSceneValidity<N, M> {
     ) -> bool {
         self.scene = scene.clone();
         self.exclusions = exclusions.clone();
-        self.attached_len = 0;
-        if self.resolution.metric().validate().is_err()
-            || self.scene.write_collision_world(&mut self.world).is_err()
-        {
-            return false;
-        }
-        let attached = self.scene.attached_shapes();
-        if attached.len() > MAX_ATTACHED_SHAPES || attached.iter().any(|a| a.link_index >= N) {
-            return false;
-        }
-        for i in 0..MAX_ATTACHED_SHAPES {
-            match attached.get(i) {
-                Some(shape) => {
-                    self.attached_shapes[i] = shape.shape;
-                    self.attached_frames[i] = Some(shape.link_index);
-                }
-                None => {
-                    self.attached_shapes[i] = CuCollisionShape::default();
-                    self.attached_frames[i] = None;
-                }
-            }
-        }
-        let mut resolved = CuSceneQueryExclusions::new();
-        if exclusions
-            .resolve(&self.scene, self.model.shape_count(), &mut resolved)
-            .is_err()
-        {
-            return false;
-        }
-        self.query_exclusions = resolved;
-        self.attached_len = attached.len();
-        true
+        self.captured = self.resolution.metric().validate().is_ok()
+            && self
+                .scene
+                .attached_shapes()
+                .iter()
+                .all(|a| a.frame.is_none_or(|frame| frame < N))
+            && exclusions
+                .validate(&self.scene, self.model.shape_count())
+                .is_ok();
+        self.captured
+    }
+
+    /// Obstacles, attached shapes, and exclusions of the captured scene.
+    fn env(&self) -> CuCollisionEnv<'_> {
+        self.scene.collision_env().with_exclusions(&self.exclusions)
     }
 
     /// `true` when `q` is within joint limits and free of self, environment,
     /// and attached-object collisions.
     pub fn is_configuration_free(&self, q: &[CuJointPosition; N]) -> bool {
-        if !self
-            .model
-            .is_configuration_collision_free(&self.chain, q, Some(&self.world))
-            .unwrap_or(false)
-        {
-            return false;
-        }
-        if self.attached_len == 0 {
-            return true;
-        }
-        let mut report = CuCollisionReport::<0>::default();
-        self.check_attached(q, &mut report) && report.is_collision_free()
+        self.captured
+            && self
+                .model
+                .is_configuration_collision_free(&self.chain, q, &self.env())
+                .unwrap_or(false)
     }
 
     /// `true` when the joint-space line from `a` to `b` is free at the
@@ -180,42 +151,18 @@ impl<const N: usize, const M: usize> CuSceneValidity<N, M> {
     /// attached objects) and itself or the scene; negative means penetration.
     /// `None` when `q` cannot be evaluated.
     pub fn clearance(&self, q: &[CuJointPosition; N]) -> Option<f64> {
+        if !self.captured {
+            return None;
+        }
         let mut report = CuCollisionReport::<0>::default();
         self.model
-            .check_configuration(&self.chain, q, Some(&self.world), &mut report)
+            .check_configuration(&self.chain, q, &self.env(), &mut report)
             .ok()?;
-        let mut clearance = report.min_signed_distance.get::<meter>();
-        if self.attached_len > 0 {
-            let mut attached = CuCollisionReport::<0>::default();
-            if !self.check_attached(q, &mut attached) {
-                return None;
-            }
-            clearance = clearance.min(attached.min_signed_distance.get::<meter>());
-        }
-        Some(clearance)
-    }
-
-    fn check_attached(&self, q: &[CuJointPosition; N], report: &mut CuCollisionReport<0>) -> bool {
-        let mut attached_world = [CuCollisionShape::default(); MAX_ATTACHED_SHAPES];
-        let mut robot_world = [CuCollisionShape::default(); M];
-        check_attached_configuration(
-            &self.model,
-            &self.chain,
-            q,
-            &self.attached_shapes,
-            &self.attached_frames,
-            self.attached_len,
-            Some(&self.world),
-            &self.query_exclusions,
-            &mut attached_world,
-            &mut robot_world,
-            report,
-        )
-        .is_ok()
+        Some(report.min_signed_distance().get::<meter>())
     }
 }
 
-/// Dimensionless joint-space L2 distance under `metric`.
+/// Joint-space L2 distance under `metric` (dimensionless, metric-scaled).
 pub fn joint_distance<const N: usize>(
     a: &[CuJointPosition; N],
     b: &[CuJointPosition; N],

@@ -57,65 +57,71 @@ pub enum CuJointType {
     Fixed,
 }
 
-pub use crate::joint::CuJointLimits;
+use crate::joint::CuJointLimits;
 use crate::joint::CuJointPosition;
 
 /// Static kinematic specification of a single joint following URDF conventions.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, Encode, Decode, Reflect,
 )]
+#[serde(deny_unknown_fields)]
 pub struct CuJointSpec {
+    /// Actuation mechanism.
     pub joint_type: CuJointType,
+    /// Parent-to-joint translation (URDF `origin xyz`).
     pub origin_translation: [Length64; 3],
+    /// Parent-to-joint roll-pitch-yaw (URDF `origin rpy`).
     pub origin_rpy: [Angle64; 3],
+    /// Actuation axis in the joint frame.
     pub axis: CuJointAxis,
+    /// Position and velocity bounds.
     pub limits: CuJointLimits,
 }
 
 impl CuJointSpec {
-    /// Creates a revolute joint from SI base arrays (`meters` and `radians`).
-    pub fn revolute(
-        xyz_m: [f64; 3],
-        rpy_rad: [f64; 3],
+    /// Creates a revolute joint from its parent-frame origin (URDF `xyz`, `rpy`).
+    pub const fn revolute(
+        origin_translation: [Length64; 3],
+        origin_rpy: [Angle64; 3],
         axis: CuJointAxis,
         limits: CuJointLimits,
     ) -> Self {
-        Self {
-            joint_type: CuJointType::Revolute,
-            origin_translation: [
-                Length64::new::<meter>(xyz_m[0]),
-                Length64::new::<meter>(xyz_m[1]),
-                Length64::new::<meter>(xyz_m[2]),
-            ],
-            origin_rpy: [
-                Angle64::new::<radian>(rpy_rad[0]),
-                Angle64::new::<radian>(rpy_rad[1]),
-                Angle64::new::<radian>(rpy_rad[2]),
-            ],
+        Self::actuated(
+            CuJointType::Revolute,
+            origin_translation,
+            origin_rpy,
             axis,
             limits,
-        }
+        )
     }
 
-    /// Creates a prismatic joint from SI base arrays (`meters` and `radians`).
-    pub fn prismatic(
-        xyz_m: [f64; 3],
-        rpy_rad: [f64; 3],
+    /// Creates a prismatic joint from its parent-frame origin (URDF `xyz`, `rpy`).
+    pub const fn prismatic(
+        origin_translation: [Length64; 3],
+        origin_rpy: [Angle64; 3],
+        axis: CuJointAxis,
+        limits: CuJointLimits,
+    ) -> Self {
+        Self::actuated(
+            CuJointType::Prismatic,
+            origin_translation,
+            origin_rpy,
+            axis,
+            limits,
+        )
+    }
+
+    const fn actuated(
+        joint_type: CuJointType,
+        origin_translation: [Length64; 3],
+        origin_rpy: [Angle64; 3],
         axis: CuJointAxis,
         limits: CuJointLimits,
     ) -> Self {
         Self {
-            joint_type: CuJointType::Prismatic,
-            origin_translation: [
-                Length64::new::<meter>(xyz_m[0]),
-                Length64::new::<meter>(xyz_m[1]),
-                Length64::new::<meter>(xyz_m[2]),
-            ],
-            origin_rpy: [
-                Angle64::new::<radian>(rpy_rad[0]),
-                Angle64::new::<radian>(rpy_rad[1]),
-                Angle64::new::<radian>(rpy_rad[2]),
-            ],
+            joint_type,
+            origin_translation,
+            origin_rpy,
             axis,
             limits,
         }
@@ -180,22 +186,31 @@ impl CuJointSpec {
 /// use cu_kinematics::{CuJointAxis, CuJointLimits, CuJointSpec, CuKinematicChain};
 /// use cu_spatial_payloads::Transform3D;
 /// use cu29::units::si::angle::radian;
-/// use cu29::units::si::f64::Angle;
+/// use cu29::units::si::angular_velocity::radian_per_second;
+/// use cu29::units::si::f64::{Angle, AngularVelocity, Length};
+/// use cu29::units::si::length::meter;
 ///
-/// let chain = CuKinematicChain::new([
-///     CuJointSpec::revolute(
-///         [0.0, 0.0, 0.1],
-///         [0.0, 0.0, 0.0],
-///         CuJointAxis::PosZ,
-///         CuJointLimits::from_radians(-core::f64::consts::PI, core::f64::consts::PI, 2.0),
+/// let m = Length::new::<meter>;
+/// let rad = Angle::new::<radian>;
+/// let chain = CuKinematicChain::new([CuJointSpec::revolute(
+///     [m(0.0), m(0.0), m(0.1)],
+///     [rad(0.0); 3],
+///     CuJointAxis::PosZ,
+///     CuJointLimits::revolute(
+///         rad(-core::f64::consts::PI),
+///         rad(core::f64::consts::PI),
+///         AngularVelocity::new::<radian_per_second>(2.0),
 ///     ),
-/// ]);
+/// )])
+/// .with_tool_offset(Transform3D::<f64>::from_translation_euler_xyz([m(0.0), m(0.0), m(0.05)], [rad(0.0); 3]));
+/// chain.validate().unwrap();
 /// let mut ee = Transform3D::<f64>::identity();
 /// chain.forward_kinematics(&[Angle::new::<radian>(0.0).into()], &mut ee).unwrap();
-/// assert!((ee.to_matrix()[2][3] - 0.1).abs() < 1e-12);
+/// assert!((ee.to_matrix()[2][3] - 0.15).abs() < 1e-12);
 /// ```
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Reflect)]
 #[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+#[serde(deny_unknown_fields)]
 pub struct CuKinematicChain<const N: usize> {
     #[serde(with = "crate::serde_arrays::joint_spec_array")]
     joints: [CuJointSpec; N],
@@ -218,25 +233,27 @@ impl<const N: usize> CuKinematicChain<N> {
         }
     }
 
-    /// Creates a serial kinematic chain with an explicit flange-to-tool transform.
-    pub const fn new_with_tool(joints: [CuJointSpec; N], tool_offset: Transform3D<f64>) -> Self {
-        Self {
-            joints,
-            tool_offset,
-        }
+    /// Replaces the flange-to-tool transform (builder form of [`Self::set_tool_offset`]).
+    pub const fn with_tool_offset(mut self, tool_offset: Transform3D<f64>) -> Self {
+        self.tool_offset = tool_offset;
+        self
     }
 
-    /// Loads an explicitly configured serial chain. Missing `chain` configuration is an error.
-    /// The number of configured joints must match the compile-time joint count `N`.
-    pub fn from_config(cfg: Option<&ComponentConfig>) -> CuResult<Self> {
-        let cfg = cfg.ok_or_else(|| CuError::from("Missing serial chain configuration"))?;
-        let mut chain = cfg
-            .get_value::<Self>("chain")?
-            .ok_or_else(|| CuError::from("Missing required chain configuration"))?;
-        if let Some(tool_offset) = cfg.get_value::<Transform3D<f64>>("tool_offset")? {
-            chain.tool_offset = tool_offset;
+    /// Checks that every joint has finite origins, a valid axis, and well-formed limits.
+    pub fn validate(&self) -> CuResult<()> {
+        for joint in &self.joints {
+            joint.validate_coordinate(joint.limits.lower())?;
         }
-        Ok(chain)
+        if self
+            .tool_offset
+            .to_matrix()
+            .iter()
+            .flatten()
+            .any(|v| !v.is_finite())
+        {
+            return Err(CuError::from("Non-finite chain tool offset"));
+        }
+        Ok(())
     }
 
     /// Borrows the static joint specifications.

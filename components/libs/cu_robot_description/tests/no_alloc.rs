@@ -1,23 +1,32 @@
 #![cfg(feature = "std")]
 
+use cu_collision::CuCollisionEnv;
+use cu_collision::CuCollisionModelParams;
 use cu_collision::CuCollisionReport;
-use cu_collision::CuCollisionWorld;
 use cu_collision::CuPlanningScene;
 use cu_collision::CuSceneExclusions;
-use cu_joint_rrt_star::CuJointPlanRequest;
-use cu_joint_rrt_star::CuJointRrtParams;
+use cu_joint_rrt_star::CuJointRrtStar;
+use cu_joint_rrt_star::CuJointRrtStarParams;
 use cu_joint_rrt_star::CuJointRrtStarTask;
-use cu_kinematics::CuDiffIkConfig;
-use cu_kinematics::CuIkConfig;
+use cu_kinematics::CuDiffIkParams;
+use cu_kinematics::CuIkParams;
 use cu_kinematics::CuJointPosition;
 use cu_kinematics::CuJointVelocity;
 use cu_kinematics::CuTwist6D;
+use cu_kinematics::CuTwistFrame;
+use cu_motion_planning::CuJointPlanRequest;
+use cu_motion_planning::CuJointPlanner;
 use cu_robot_description::CuRobotDescription;
+use cu_robot_description::CuSrdfImport;
 use cu_spatial_payloads::Transform3D;
 use cu29::cutask_anytime::CuAnytimeTask;
 use cu29::prelude::*;
+use cu29::units::si::angular_velocity::radian_per_second;
+use cu29::units::si::f64::AngularVelocity;
 use cu29::units::si::f64::Length;
+use cu29::units::si::f64::Velocity;
 use cu29::units::si::length::meter;
+use cu29::units::si::velocity::meter_per_second;
 use std::alloc::GlobalAlloc;
 use std::alloc::Layout;
 use std::alloc::System;
@@ -63,24 +72,28 @@ fn imported_models_execute_without_heap_allocation() {
     let robot = CuRobotDescription::<2, 6>::from_urdf_srdf(
         include_str!("fixtures/serial.urdf"),
         include_str!("fixtures/serial.srdf"),
-        "manipulator",
-        Length::new::<meter>(0.005),
+        CuSrdfImport::new("manipulator").with_collision(CuCollisionModelParams {
+            safety_margin: Length::new::<meter>(0.005),
+            skip_adjacent_links: false,
+        }),
     )
     .unwrap();
     let mut start = [CuJointPosition::default(); 2];
     let mut goal = start;
     robot.write_named_state("home", &mut start).unwrap();
     robot.write_named_state("reach", &mut goal).unwrap();
-    let mut planner = CuJointRrtStarTask::new_with_planner(
-        cu_joint_rrt_star::CuJointRrtStar::new(
-            robot.chain,
-            robot.collision_model,
-            CuJointRrtParams::default(),
-        ),
+    let mut planner = CuJointRrtStarTask::from_planner(
+        CuJointRrtStar::new(
+            *robot.chain(),
+            *robot.collision_model(),
+            CuJointRrtStarParams::default(),
+        )
+        .unwrap(),
         64,
         32,
         7,
-    );
+    )
+    .unwrap();
     let (ctx, _) = CuContext::new_mock_clock();
     let request = CuMsg::new(Some(CuJointPlanRequest {
         scene: CuPlanningScene::new(),
@@ -94,23 +107,27 @@ fn imported_models_execute_without_heap_allocation() {
     let mut solution = start;
     let mut velocity = [CuJointVelocity::default(); 2];
     let mut report = CuCollisionReport::<8>::default();
-    let world = CuCollisionWorld::<1>::new();
-    let twist = CuTwist6D::from_base_mps_radps([0.0, 0.01, 0.0], [0.0; 3]);
+    let env = CuCollisionEnv::EMPTY;
+    let twist = CuTwist6D::new(
+        [0.0, 0.01, 0.0].map(Velocity::new::<meter_per_second>),
+        [AngularVelocity::new::<radian_per_second>(0.0); 3],
+        CuTwistFrame::Base,
+    );
     ALLOCATIONS.with(|count| count.set(0));
     TRACK.with(|track| track.set(true));
-    robot.chain.forward_kinematics(&goal, &mut pose).unwrap();
-    robot.chain.geometric_jacobian(&start, &mut jac).unwrap();
+    robot.chain().forward_kinematics(&goal, &mut pose).unwrap();
+    robot.chain().geometric_jacobian(&start, &mut jac).unwrap();
     robot
-        .chain
-        .inverse_kinematics_dls(&pose, &start, &CuIkConfig::default(), &mut solution)
+        .chain()
+        .inverse_kinematics_dls(&pose, &start, &CuIkParams::default(), &mut solution)
         .unwrap();
     robot
-        .chain
-        .differential_ik(&start, &twist, &CuDiffIkConfig::default(), &mut velocity)
+        .chain()
+        .differential_ik(&start, &twist, &CuDiffIkParams::default(), &mut velocity)
         .unwrap();
     robot
-        .collision_model
-        .check_configuration(&robot.chain, &start, Some(&world), &mut report)
+        .collision_model()
+        .check_configuration(robot.chain(), &start, &env, &mut report)
         .unwrap();
     planner.base(&ctx, &request, &mut output).unwrap();
     planner.refine(&ctx, &mut output).unwrap();

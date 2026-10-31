@@ -19,26 +19,31 @@ use cu29::units::si::velocity::meter_per_second;
 use serde::Deserialize;
 use serde::Serialize;
 
-/// Configuration for the Damped Least-Squares (DLS) inverse kinematics solver.
+/// Parameters of the Damped Least-Squares (DLS) inverse kinematics solver.
+///
+/// RON (every field optional, SI values):
+/// `{"max_iterations": 64, "position_tolerance": 1e-4, "orientation_tolerance": 1e-3,
+///   "damping": 0.05, "max_step": 0.25, "max_linear_step": 0.025, "enforce_joint_limits": true}`
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode, Reflect)]
-pub struct CuIkConfig {
+#[serde(default, deny_unknown_fields)]
+pub struct CuIkParams {
     /// Maximum solver iterations per call.
     pub max_iterations: u32,
     /// Position convergence threshold.
     pub position_tolerance: Length64,
     /// Orientation convergence threshold.
     pub orientation_tolerance: Angle64,
-    /// Damping factor $\lambda$ stabilizing near-singular configurations.
+    /// Damping factor $\lambda > 0$ stabilizing near-singular configurations (dimensionless).
     pub damping: f64,
-    /// Maximum per-iteration joint step magnitude.
+    /// Maximum per-iteration revolute joint step.
     pub max_step: Angle64,
     /// Maximum per-iteration prismatic displacement.
     pub max_linear_step: Length64,
-    /// Whether to clamp joint angles to joint limits at each step.
+    /// Whether to clamp joint coordinates to joint limits at each step.
     pub enforce_joint_limits: bool,
 }
 
-impl Default for CuIkConfig {
+impl Default for CuIkParams {
     fn default() -> Self {
         Self {
             max_iterations: 64,
@@ -52,38 +57,25 @@ impl Default for CuIkConfig {
     }
 }
 
-impl CuIkConfig {
-    /// Extracts solver configuration from an optional RON `ComponentConfig`.
-    pub fn from_config(cfg: Option<&ComponentConfig>) -> CuResult<Self> {
-        let Some(cfg) = cfg else {
-            return Ok(Self::default());
-        };
-        if let Some(full) = cfg.get_value::<Self>("ik_config")? {
-            return Ok(full);
+impl CuIkParams {
+    /// Rejects non-positive or non-finite damping, tolerances, and step sizes.
+    pub fn validate(&self) -> CuResult<()> {
+        if self.damping <= 0.0 || !self.damping.is_finite() {
+            return Err(CuError::from(
+                "cu_kinematics: IK damping must be positive and finite",
+            ));
         }
-        let mut out = Self::default();
-        if let Some(v) = cfg.get::<u32>("max_iterations")? {
-            out.max_iterations = v;
+        let positive = |v: f64| v.is_finite() && v > 0.0;
+        if !positive(self.position_tolerance.get::<meter>())
+            || !positive(self.orientation_tolerance.get::<radian>())
+            || !positive(self.max_step.get::<radian>())
+            || !positive(self.max_linear_step.get::<meter>())
+        {
+            return Err(CuError::from(
+                "cu_kinematics: IK tolerances and max_step must be positive",
+            ));
         }
-        if let Some(v) = cfg.get::<f64>("position_tolerance_m")? {
-            out.position_tolerance = Length64::new::<meter>(v);
-        }
-        if let Some(v) = cfg.get::<f64>("orientation_tolerance_rad")? {
-            out.orientation_tolerance = Angle64::new::<radian>(v);
-        }
-        if let Some(v) = cfg.get::<f64>("damping")? {
-            out.damping = v;
-        }
-        if let Some(v) = cfg.get::<f64>("max_step_rad")? {
-            out.max_step = Angle64::new::<radian>(v);
-        }
-        if let Some(v) = cfg.get::<f64>("max_linear_step_m")? {
-            out.max_linear_step = Length64::new::<meter>(v);
-        }
-        if let Some(v) = cfg.get::<bool>("enforce_joint_limits")? {
-            out.enforce_joint_limits = v;
-        }
-        Ok(out)
+        Ok(())
     }
 }
 
@@ -135,48 +127,31 @@ pub enum CuTwistFrame {
     Default, Debug, Clone, Copy, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect,
 )]
 pub struct CuTwist6D {
+    /// Linear velocity of the tool origin.
     pub linear: [Velocity64; 3],
+    /// Angular velocity.
     pub angular: [AngularVelocity64; 3],
+    /// Frame both vectors are expressed in.
     pub frame: CuTwistFrame,
 }
 
 impl CuTwist6D {
-    /// Creates a twist expressed in the robot base frame from SI base values (`m/s` and `rad/s`).
-    pub fn from_base_mps_radps(linear_mps: [f64; 3], angular_radps: [f64; 3]) -> Self {
+    /// Creates a twist from linear `[vx, vy, vz]` and angular `[wx, wy, wz]` velocities
+    /// expressed in `frame`.
+    pub const fn new(
+        linear: [Velocity64; 3],
+        angular: [AngularVelocity64; 3],
+        frame: CuTwistFrame,
+    ) -> Self {
         Self {
-            linear: [
-                Velocity64::new::<meter_per_second>(linear_mps[0]),
-                Velocity64::new::<meter_per_second>(linear_mps[1]),
-                Velocity64::new::<meter_per_second>(linear_mps[2]),
-            ],
-            angular: [
-                AngularVelocity64::new::<radian_per_second>(angular_radps[0]),
-                AngularVelocity64::new::<radian_per_second>(angular_radps[1]),
-                AngularVelocity64::new::<radian_per_second>(angular_radps[2]),
-            ],
-            frame: CuTwistFrame::Base,
-        }
-    }
-
-    /// Creates a twist expressed in the end-effector body frame from SI base values (`m/s` and `rad/s`).
-    pub fn from_body_mps_radps(linear_mps: [f64; 3], angular_radps: [f64; 3]) -> Self {
-        Self {
-            linear: [
-                Velocity64::new::<meter_per_second>(linear_mps[0]),
-                Velocity64::new::<meter_per_second>(linear_mps[1]),
-                Velocity64::new::<meter_per_second>(linear_mps[2]),
-            ],
-            angular: [
-                AngularVelocity64::new::<radian_per_second>(angular_radps[0]),
-                AngularVelocity64::new::<radian_per_second>(angular_radps[1]),
-                AngularVelocity64::new::<radian_per_second>(angular_radps[2]),
-            ],
-            frame: CuTwistFrame::Body,
+            linear,
+            angular,
+            frame,
         }
     }
 
     /// Extracts the raw 6-vector `[vx, vy, vz, wx, wy, wz]` in `m/s` and `rad/s`.
-    pub fn to_raw_array(&self) -> [f64; 6] {
+    pub(crate) fn to_raw_array(self) -> [f64; 6] {
         [
             self.linear[0].get::<meter_per_second>(),
             self.linear[1].get::<meter_per_second>(),
@@ -188,17 +163,22 @@ impl CuTwist6D {
     }
 }
 
-/// Configuration for velocity/twist differential inverse kinematics (Jacobian servoing).
+/// Parameters of velocity/twist differential inverse kinematics (Jacobian servoing).
+///
+/// RON (every field optional, SI values):
+/// `{"base_damping": 0.02, "max_singularity_damping": 0.25, "singularity_threshold_sq": 1e-4,
+///   "limit_margin": 0.15, "linear_limit_margin": 0.015, "enforce_velocity_limits": true}`
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode, Reflect)]
-pub struct CuDiffIkConfig {
-    /// Baseline damping factor $\lambda_0 > 0$ used far from singularities.
+#[serde(default, deny_unknown_fields)]
+pub struct CuDiffIkParams {
+    /// Baseline damping factor $\lambda_0 > 0$ used far from singularities (dimensionless).
     pub base_damping: f64,
-    /// Maximum additional damping $\lambda_{\max} \ge 0$ added at exact singularity.
+    /// Maximum additional damping $\lambda_{\max} \ge 0$ added at exact singularity (dimensionless).
     pub max_singularity_damping: f64,
     /// Yoshikawa manipulability squared threshold $w_{\text{thresh}}^2$ below which adaptive
-    /// singularity damping ramps up smoothly.
+    /// singularity damping ramps up smoothly (dimensionless; `0` disables it).
     pub singularity_threshold_sq: f64,
-    /// Joint-limit proximity margin within which motion toward a limit is smoothly damped.
+    /// Revolute joint-limit proximity margin within which motion toward a limit is smoothly damped.
     pub limit_margin: Angle64,
     /// Prismatic joint-limit damping distance.
     pub linear_limit_margin: Length64,
@@ -206,7 +186,7 @@ pub struct CuDiffIkConfig {
     pub enforce_velocity_limits: bool,
 }
 
-impl Default for CuDiffIkConfig {
+impl Default for CuDiffIkParams {
     fn default() -> Self {
         Self {
             base_damping: 0.02,
@@ -219,35 +199,30 @@ impl Default for CuDiffIkConfig {
     }
 }
 
-impl CuDiffIkConfig {
-    /// Extracts differential IK configuration from an optional RON `ComponentConfig`.
-    pub fn from_config(cfg: Option<&ComponentConfig>) -> CuResult<Self> {
-        let Some(cfg) = cfg else {
-            return Ok(Self::default());
-        };
-        if let Some(full) = cfg.get_value::<Self>("diff_ik_config")? {
-            return Ok(full);
+impl CuDiffIkParams {
+    /// Rejects invalid damping parameters and negative or non-finite limit margins.
+    pub fn validate(&self) -> CuResult<()> {
+        if self.base_damping <= 0.0
+            || !self.base_damping.is_finite()
+            || self.max_singularity_damping < 0.0
+            || !self.max_singularity_damping.is_finite()
+            || self.singularity_threshold_sq < 0.0
+            || !self.singularity_threshold_sq.is_finite()
+        {
+            return Err(CuError::from(
+                "cu_kinematics: differential IK damping parameters must be valid finite numbers",
+            ));
         }
-        let mut out = Self::default();
-        if let Some(v) = cfg.get::<f64>("base_damping")? {
-            out.base_damping = v;
+        if !self.limit_margin.get::<radian>().is_finite()
+            || self.limit_margin.get::<radian>() < 0.0
+            || !self.linear_limit_margin.get::<meter>().is_finite()
+            || self.linear_limit_margin.get::<meter>() < 0.0
+        {
+            return Err(CuError::from(
+                "Joint-limit damping margins must be finite and nonnegative",
+            ));
         }
-        if let Some(v) = cfg.get::<f64>("max_singularity_damping")? {
-            out.max_singularity_damping = v;
-        }
-        if let Some(v) = cfg.get::<f64>("singularity_threshold_sq")? {
-            out.singularity_threshold_sq = v;
-        }
-        if let Some(v) = cfg.get::<f64>("limit_margin_rad")? {
-            out.limit_margin = Angle64::new::<radian>(v);
-        }
-        if let Some(v) = cfg.get::<f64>("linear_limit_margin_m")? {
-            out.linear_limit_margin = Length64::new::<meter>(v);
-        }
-        if let Some(v) = cfg.get::<bool>("enforce_velocity_limits")? {
-            out.enforce_velocity_limits = v;
-        }
-        Ok(out)
+        Ok(())
     }
 }
 
@@ -288,30 +263,10 @@ impl<const N: usize> CuKinematicChain<N> {
         &self,
         q: &[CuJointPosition; N],
         twist: &CuTwist6D,
-        cfg: &CuDiffIkConfig,
+        cfg: &CuDiffIkParams,
         out_qd: &mut [CuJointVelocity; N],
     ) -> CuResult<CuDiffIkStatus> {
-        if cfg.base_damping <= 0.0
-            || !cfg.base_damping.is_finite()
-            || cfg.max_singularity_damping < 0.0
-            || !cfg.max_singularity_damping.is_finite()
-            || cfg.singularity_threshold_sq < 0.0
-            || !cfg.singularity_threshold_sq.is_finite()
-        {
-            return Err(CuError::from(
-                "cu_kinematics: differential IK damping parameters must be valid finite numbers",
-            ));
-        }
-
-        if !cfg.limit_margin.get::<radian>().is_finite()
-            || cfg.limit_margin.get::<radian>() < 0.0
-            || !cfg.linear_limit_margin.get::<meter>().is_finite()
-            || cfg.linear_limit_margin.get::<meter>() < 0.0
-        {
-            return Err(CuError::from(
-                "Joint-limit damping margins must be finite and nonnegative",
-            ));
-        }
+        cfg.validate()?;
         let v_raw = twist.to_raw_array();
         let mut idx_v = 0;
         while idx_v < 6 {
@@ -450,30 +405,13 @@ impl<const N: usize> CuKinematicChain<N> {
         &self,
         target: &Transform3D<f64>,
         seed: &[CuJointPosition; N],
-        cfg: &CuIkConfig,
+        cfg: &CuIkParams,
         out_q: &mut [CuJointPosition; N],
     ) -> CuResult<CuIkStatus> {
-        if cfg.damping <= 0.0 || !cfg.damping.is_finite() {
-            return Err(CuError::from(
-                "cu_kinematics: IK damping must be positive and finite",
-            ));
-        }
+        cfg.validate()?;
         let pos_tol = cfg.position_tolerance.get::<meter>();
         let ori_tol = cfg.orientation_tolerance.get::<radian>();
         let max_step = cfg.max_step.get::<radian>();
-        if !pos_tol.is_finite()
-            || !ori_tol.is_finite()
-            || !max_step.is_finite()
-            || !cfg.max_linear_step.get::<meter>().is_finite()
-            || cfg.max_linear_step.get::<meter>() <= 0.0
-            || pos_tol <= 0.0
-            || ori_tol <= 0.0
-            || max_step <= 0.0
-        {
-            return Err(CuError::from(
-                "cu_kinematics: IK tolerances and max_step must be positive",
-            ));
-        }
 
         for (joint, &position) in self.joints().iter().zip(seed) {
             joint.validate_coordinate(position)?;

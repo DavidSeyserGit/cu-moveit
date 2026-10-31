@@ -2,44 +2,52 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
-#[cfg(not(feature = "std"))]
 extern crate alloc;
 
-pub mod chain;
-pub mod ik;
-pub mod joint;
+mod chain;
+mod ik;
+mod joint;
+mod robots;
+pub mod serde_arrays;
+mod task;
+
+pub use chain::CuJointAxis;
+pub use chain::CuJointSpec;
+pub use chain::CuJointType;
+pub use chain::CuKinematicChain;
+pub use ik::CuDiffIkParams;
+pub use ik::CuDiffIkStatus;
+pub use ik::CuIkParams;
+pub use ik::CuIkStatus;
+pub use ik::CuTwist6D;
+pub use ik::CuTwistFrame;
+pub use joint::CuJointAcceleration;
+pub use joint::CuJointJerk;
+pub use joint::CuJointLimits;
 pub use joint::CuJointMetric;
 pub use joint::CuJointPosition;
 pub use joint::CuJointResolution;
 pub use joint::CuJointVelocity;
-pub mod robots;
-pub mod serde_arrays;
-pub mod task;
-
-pub use chain::CuJointAxis;
-pub use chain::CuJointLimits;
-pub use chain::CuJointSpec;
-pub use chain::CuJointType;
-pub use chain::CuKinematicChain;
-pub use ik::CuDiffIkConfig;
-pub use ik::CuDiffIkStatus;
-pub use ik::CuIkConfig;
-pub use ik::CuIkStatus;
-pub use ik::CuTwist6D;
-pub use ik::CuTwistFrame;
+pub use robots::CuChainSpec;
+pub use robots::CuRobotPreset;
 pub use robots::igus_rebel_chain;
+pub use task::CuForwardKinematicsParams;
 pub use task::CuForwardKinematicsTask;
 pub use task::CuIkSolutionPayload;
+pub use task::CuInverseKinematicsParams;
 pub use task::CuInverseKinematicsTask;
 pub use task::CuJointPositionsPayload;
+pub use task::CuJointStatePayload;
 pub use task::CuJointVelocitiesPayload;
+pub use task::CuRobotStatus;
+pub use task::CuServoParams;
 pub use task::CuServoTask;
 
 #[cfg(test)]
 mod tests {
-    use crate::CuDiffIkConfig;
+    use crate::CuDiffIkParams;
     use crate::CuDiffIkStatus;
-    use crate::CuIkConfig;
+    use crate::CuIkParams;
     use crate::CuInverseKinematicsTask;
     use crate::CuJointAxis;
     use crate::CuJointLimits;
@@ -50,30 +58,62 @@ mod tests {
     use crate::CuKinematicChain;
     use crate::CuServoTask;
     use crate::CuTwist6D;
+    use crate::CuTwistFrame;
     use crate::igus_rebel_chain;
     use cu_spatial_payloads::Transform3D;
     use cu29::prelude::*;
     use cu29::units::si::angle::radian;
+    use cu29::units::si::angular_velocity::radian_per_second;
     use cu29::units::si::f64::Angle as Angle64;
+    use cu29::units::si::f64::AngularVelocity;
+    use cu29::units::si::f64::Length;
+    use cu29::units::si::f64::Velocity;
+    use cu29::units::si::length::meter;
+    use cu29::units::si::velocity::meter_per_second;
+
+    fn m3(v: [f64; 3]) -> [Length; 3] {
+        v.map(Length::new::<meter>)
+    }
+    fn rad3(v: [f64; 3]) -> [Angle64; 3] {
+        v.map(Angle64::new::<radian>)
+    }
+    fn rad_limits(lo: f64, hi: f64, v: f64) -> CuJointLimits {
+        CuJointLimits::revolute(
+            Angle64::new::<radian>(lo),
+            Angle64::new::<radian>(hi),
+            AngularVelocity::new::<radian_per_second>(v),
+        )
+    }
+    fn mk_twist(lin: [f64; 3], ang: [f64; 3], frame: CuTwistFrame) -> CuTwist6D {
+        CuTwist6D::new(
+            lin.map(Velocity::new::<meter_per_second>),
+            ang.map(AngularVelocity::new::<radian_per_second>),
+            frame,
+        )
+    }
 
     #[test]
     fn mixed_joint_units_fixed_slots_and_metric_are_preserved() {
         let chain = CuKinematicChain::new([
             CuJointSpec::revolute(
-                [0.0; 3],
-                [0.0; 3],
+                m3([0.0; 3]),
+                rad3([0.0; 3]),
                 CuJointAxis::PosZ,
-                CuJointLimits::from_radians(-3.0, 3.0, 1.0),
+                rad_limits(-3.0, 3.0, 1.0),
             ),
             CuJointSpec {
                 joint_type: crate::CuJointType::Fixed,
                 ..Default::default()
             },
             CuJointSpec::prismatic(
-                [0.0; 3],
-                [0.0; 3],
+                m3([0.0; 3]),
+                rad3([0.0; 3]),
                 CuJointAxis::Arbitrary([2.0, 0.0, 0.0]),
-                CuJointLimits::from_meters(0.0, 1.0, 0.2),
+                CuJointLimits::prismatic(
+                    Length::new::<meter>(0.0),
+                    Length::new::<meter>(1.0),
+                    Velocity::new::<meter_per_second>(0.2),
+                ),
             ),
         ]);
         let q = [
@@ -220,7 +260,7 @@ mod tests {
             Angle64::new::<radian>(0.2).into(),
         ];
 
-        let cfg = CuDiffIkConfig {
+        let cfg = CuDiffIkParams {
             base_damping: 1e-4,
             max_singularity_damping: 0.0,
             singularity_threshold_sq: 0.0,
@@ -229,7 +269,7 @@ mod tests {
             enforce_velocity_limits: true,
         };
 
-        let twist_base = CuTwist6D::from_base_mps_radps([0.05, -0.03, 0.04], [0.1, -0.05, 0.08]);
+        let twist_base = mk_twist([0.05, -0.03, 0.04], [0.1, -0.05, 0.08], CuTwistFrame::Base);
         let mut qd = [CuJointVelocity::default(); 6];
         let status = chain
             .differential_ik(&q, &twist_base, &cfg, &mut qd)
@@ -249,7 +289,7 @@ mod tests {
         }
 
         // Verify body-frame twist tracking
-        let twist_body = CuTwist6D::from_body_mps_radps([0.04, 0.02, -0.03], [-0.05, 0.06, 0.04]);
+        let twist_body = mk_twist([0.04, 0.02, -0.03], [-0.05, 0.06, 0.04], CuTwistFrame::Body);
         let mut qd_body = [CuJointVelocity::default(); 6];
         chain
             .differential_ik(&q, &twist_body, &cfg, &mut qd_body)
@@ -275,8 +315,8 @@ mod tests {
         let w_sq = chain.manipulability_squared(&q_singular).unwrap();
         assert!(w_sq < 1e-6);
 
-        let cfg = CuDiffIkConfig::default();
-        let twist = CuTwist6D::from_base_mps_radps([0.05, 0.0, 0.0], [0.0, 0.0, 0.0]);
+        let cfg = CuDiffIkParams::default();
+        let twist = mk_twist([0.05, 0.0, 0.0], [0.0, 0.0, 0.0], CuTwistFrame::Base);
         let mut qd = [CuJointVelocity::default(); 6];
         let status = chain
             .differential_ik(&q_singular, &twist, &cfg, &mut qd)
@@ -284,7 +324,7 @@ mod tests {
         assert!(matches!(status, CuDiffIkStatus::SingularityDamped { .. }));
 
         // High twist triggers uniform velocity scaling
-        let fast_twist = CuTwist6D::from_base_mps_radps([5.0, 5.0, 5.0], [5.0, 5.0, 5.0]);
+        let fast_twist = mk_twist([5.0, 5.0, 5.0], [5.0, 5.0, 5.0], CuTwistFrame::Base);
         let status_scaled = chain
             .differential_ik(&q_singular, &fast_twist, &cfg, &mut qd)
             .unwrap();
@@ -323,7 +363,7 @@ mod tests {
             Angle64::new::<radian>(0.1).into(),
         ];
 
-        let cfg = CuIkConfig::default();
+        let cfg = CuIkParams::default();
         let mut q_sol = [CuJointPosition::default(); 6];
         let status = chain
             .inverse_kinematics_dls(&target_pose, &q_seed, &cfg, &mut q_sol)
@@ -346,9 +386,10 @@ mod tests {
     fn test_ik_and_servo_tasks() {
         let (ctx, _mock) = CuContext::new_mock_clock();
         let mut ik_task =
-            CuInverseKinematicsTask::<6>::new_with_chain(igus_rebel_chain(), CuIkConfig::default());
+            CuInverseKinematicsTask::<6>::from_params(igus_rebel_chain(), CuIkParams::default())
+                .unwrap();
         let mut servo_task =
-            CuServoTask::<6>::new_with_chain(igus_rebel_chain(), CuDiffIkConfig::default());
+            CuServoTask::<6>::from_params(igus_rebel_chain(), CuDiffIkParams::default()).unwrap();
 
         let q_goal = [
             Angle64::new::<radian>(0.2).into(),
@@ -376,9 +417,10 @@ mod tests {
         let sol = ik_out.payload().unwrap();
         assert!(sol.status.is_converged());
 
-        let twist_msg = CuMsg::new(Some(CuTwist6D::from_base_mps_radps(
+        let twist_msg = CuMsg::new(Some(mk_twist(
             [0.02, 0.0, -0.01],
             [0.0, 0.05, 0.0],
+            CuTwistFrame::Base,
         )));
         let joints_msg = CuMsg::new(Some(CuJointPositionsPayload { positions: q_goal }));
         let mut servo_out = CuMsg::new(None);
@@ -392,16 +434,16 @@ mod tests {
     fn test_two_link_planar_arm() {
         let chain = CuKinematicChain::new([
             CuJointSpec::revolute(
-                [0.0, 0.0, 0.0],
-                [0.0, 0.0, 0.0],
+                m3([0.0, 0.0, 0.0]),
+                rad3([0.0, 0.0, 0.0]),
                 CuJointAxis::PosZ,
-                CuJointLimits::from_radians(-core::f64::consts::PI, core::f64::consts::PI, 1.0),
+                rad_limits(-core::f64::consts::PI, core::f64::consts::PI, 1.0),
             ),
             CuJointSpec::revolute(
-                [1.0, 0.0, 0.0],
-                [0.0, 0.0, 0.0],
+                m3([1.0, 0.0, 0.0]),
+                rad3([0.0, 0.0, 0.0]),
                 CuJointAxis::PosZ,
-                CuJointLimits::from_radians(-core::f64::consts::PI, core::f64::consts::PI, 1.0),
+                rad_limits(-core::f64::consts::PI, core::f64::consts::PI, 1.0),
             ),
         ]);
         let mut ee = Transform3D::<f64>::identity();

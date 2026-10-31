@@ -10,6 +10,7 @@
 use crate::CuJointPlanPath;
 use crate::CuJointPlanRequest;
 use crate::CuJointPlanner;
+use crate::CuJointPlannerTask;
 use crate::CuPlanStatus;
 use crate::CuPlannerKind;
 use crate::common::check_endpoints;
@@ -38,12 +39,15 @@ pub const RRT_CONNECT_MAX_NODES: usize = 256;
 
 /// Parameters of [`CuJointRrtConnect`].
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode, Reflect)]
+#[serde(default, deny_unknown_fields)]
 pub struct CuJointRrtConnectParams {
-    /// Maximum normalized joint-space step per extension.
+    /// Maximum joint-space step per extension (dimensionless, metric-scaled).
     pub step_size: f64,
     /// Node capacity per tree (`2..=RRT_CONNECT_MAX_NODES`).
     pub max_nodes: u32,
+    /// Resolution of the segment collision checks.
     pub collision_check_step: CuJointResolution,
+    /// Scaling of dimensionless joint-space distances and costs.
     pub metric: CuJointMetric,
 }
 
@@ -59,10 +63,22 @@ impl Default for CuJointRrtConnectParams {
 }
 
 impl CuJointRrtConnectParams {
-    fn is_valid(&self) -> bool {
-        self.step_size.is_finite()
-            && self.step_size > 0.0
-            && (2..=RRT_CONNECT_MAX_NODES as u32).contains(&self.max_nodes)
+    /// Checks every parameter, the metric, and the collision-check resolution.
+    pub fn validate(&self) -> CuResult<()> {
+        self.metric.validate()?;
+        self.collision_check_step.metric().validate()?;
+        let valid = {
+            self.step_size.is_finite()
+                && self.step_size > 0.0
+                && (2..=RRT_CONNECT_MAX_NODES as u32).contains(&self.max_nodes)
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(CuError::from(
+                "cu-motion-planning: invalid RRT-Connect parameters",
+            ))
+        }
     }
 }
 
@@ -164,8 +180,8 @@ impl<const N: usize> Tree<N> {
 
 /// Bidirectional RRT-Connect planner.
 ///
-/// Config keys: `chain`, `collision_model`, and optional `step_size`,
-/// `max_nodes`, `collision_check_step`, `metric`.
+/// Built with [`CuJointPlanner::new`] from robot models and [`CuJointRrtConnectParams`];
+/// runs in [`CuJointRrtConnectTask`].
 pub struct CuJointRrtConnect<const N: usize, const M: usize = N> {
     validity: CuSceneValidity<N, M>,
     params: CuJointRrtConnectParams,
@@ -179,9 +195,17 @@ pub struct CuJointRrtConnect<const N: usize, const M: usize = N> {
     best: CuJointPlanPath<N>,
 }
 
+/// [`CuJointPlannerTask`] running [`CuJointRrtConnect`].
+pub type CuJointRrtConnectTask<const N: usize, const M: usize = N> =
+    CuJointPlannerTask<CuJointRrtConnect<N, M>, N, M>;
+
 impl<const N: usize, const M: usize> CuJointRrtConnect<N, M> {
-    /// Creates the planner for explicit robot models.
-    pub fn new(
+    /// The validated planner parameters.
+    pub const fn params(&self) -> &CuJointRrtConnectParams {
+        &self.params
+    }
+
+    fn build(
         chain: CuKinematicChain<N>,
         model: CuRobotCollisionModel<N, M>,
         params: CuJointRrtConnectParams,
@@ -219,33 +243,18 @@ impl<const N: usize, const M: usize> CuJointRrtConnect<N, M> {
     }
 }
 
-impl<const N: usize, const M: usize> CuJointPlanner<N> for CuJointRrtConnect<N, M> {
+impl<const N: usize, const M: usize> CuJointPlanner<N, M> for CuJointRrtConnect<N, M> {
     const KIND: CuPlannerKind = CuPlannerKind::Sampling;
 
-    fn from_config(config: Option<&ComponentConfig>) -> CuResult<Self> {
-        let chain = CuKinematicChain::from_config(config)?;
-        let model = CuRobotCollisionModel::from_config(config)?;
-        let mut params = CuJointRrtConnectParams::default();
-        if let Some(cfg) = config {
-            if let Some(v) = cfg.get::<f64>("step_size")? {
-                params.step_size = v;
-            }
-            if let Some(v) = cfg.get::<u32>("max_nodes")? {
-                params.max_nodes = v;
-            }
-            if let Some(v) = cfg.get_value::<CuJointResolution>("collision_check_step")? {
-                params.collision_check_step = v;
-            }
-            if let Some(v) = cfg.get_value::<CuJointMetric>("metric")? {
-                params.metric = v;
-            }
-        }
-        if !params.is_valid() {
-            return Err(CuError::from(
-                "cu-motion-planning: invalid RRT-Connect parameters",
-            ));
-        }
-        Ok(Self::new(chain, model, params))
+    type Params = CuJointRrtConnectParams;
+
+    fn new(
+        chain: CuKinematicChain<N>,
+        collision_model: CuRobotCollisionModel<N, M>,
+        params: CuJointRrtConnectParams,
+    ) -> CuResult<Self> {
+        params.validate()?;
+        Ok(Self::build(chain, collision_model, params))
     }
 
     fn begin(&mut self, request: &CuJointPlanRequest<N>, seed: u64) -> CuResult<CuPlanStatus> {
@@ -254,11 +263,7 @@ impl<const N: usize, const M: usize> CuJointPlanner<N> for CuJointRrtConnect<N, 
         self.active = 0;
         self.best = CuJointPlanPath::default();
         self.straight_cost = joint_distance(&request.start, &request.goal, self.params.metric);
-        self.status = if self.params.is_valid() {
-            check_endpoints(&mut self.validity, request, self.params.metric)
-        } else {
-            CuPlanStatus::InvalidRequest
-        };
+        self.status = check_endpoints(&mut self.validity, request, self.params.metric);
         if self.status != CuPlanStatus::Searching {
             return Ok(self.status);
         }

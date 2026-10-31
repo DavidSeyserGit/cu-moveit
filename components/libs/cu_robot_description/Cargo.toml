@@ -14,14 +14,15 @@ domains = ["algorithm/manipulation"]
 environments = ["host"]
 
 [dependencies]
-cu-kinematics = { version = "0.4.1", path = "../cu_kinematics", default-features = false }
-cu-collision = { version = "0.4.1", path = "../cu_collision", default-features = false }
+cu-kinematics = { version = "0.5.0", path = "../cu_kinematics", default-features = false }
+cu-collision = { version = "0.5.0", path = "../cu_collision", default-features = false }
 cu-spatial-payloads = { workspace = true }
 cu29 = { workspace = true }
 roxmltree = { version = "0.21", optional = true }
 
 [dev-dependencies]
 cu-joint-rrt-star = { path = "../../tasks/cu_joint_rrt_star", default-features = false }
+cu-motion-planning = { path = "../../tasks/cu_motion_planning", default-features = false }
 
 [features]
 default = ["std"]
@@ -29,4 +30,8 @@ std = ["dep:roxmltree", "cu29/std", "cu-kinematics/std", "cu-collision/std"]
 
 [[example]]
 name = "serial_robot"
+required-features = ["std"]
+
+[[test]]
+name = "planning"
 required-features = ["std"]

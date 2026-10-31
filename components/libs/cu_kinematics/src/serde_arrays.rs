@@ -1,7 +1,24 @@
 //! Serde helpers for const-generic fixed-size arrays.
+//!
+//! This is the one shared set of fixed-array serde helpers for the workspace. Use a module with
+//! `#[serde(with = "cu_kinematics::serde_arrays::<module>")]` on a `[T; N]` field; each module
+//! provides `serialize` and `deserialize`, encodes the array as a tuple of exactly `N` elements,
+//! and rejects sequences of any other length.
+//!
+//! ```rust
+//! use cu_kinematics::CuJointPosition;
+//! use serde::{Deserialize, Serialize};
+//!
+//! #[derive(Serialize, Deserialize)]
+//! struct Goal<const N: usize> {
+//!     #[serde(with = "cu_kinematics::serde_arrays::position_array")]
+//!     positions: [CuJointPosition; N],
+//! }
+//! ```
 
 macro_rules! impl_const_array_serde {
     ($mod_name:ident, $elem_ty:ty, $label:literal) => {
+        #[doc = concat!("Serde `with` module for `[", $label, "; N]` arrays.")]
         pub mod $mod_name {
             use serde::Deserializer;
             use serde::Serializer;
@@ -10,6 +27,7 @@ macro_rules! impl_const_array_serde {
             use serde::de::Visitor;
             use serde::ser::SerializeTuple;
 
+            /// Serializes the array as an `N`-element tuple.
             pub fn serialize<S, const N: usize>(
                 values: &[$elem_ty; N],
                 serializer: S,
@@ -26,6 +44,7 @@ macro_rules! impl_const_array_serde {
                 seq.end()
             }
 
+            /// Deserializes exactly `N` elements, rejecting shorter or longer sequences.
             pub fn deserialize<'de, D, const N: usize>(
                 deserializer: D,
             ) -> Result<[$elem_ty; N], D::Error>
@@ -80,10 +99,16 @@ impl_const_array_serde!(
 impl_const_array_serde!(
     position_array,
     crate::joint::CuJointPosition,
-    "joint coordinate"
+    "CuJointPosition"
 );
 impl_const_array_serde!(
     velocity_array,
     crate::joint::CuJointVelocity,
-    "joint velocity"
+    "CuJointVelocity"
 );
+impl_const_array_serde!(
+    acceleration_array,
+    crate::joint::CuJointAcceleration,
+    "CuJointAcceleration"
+);
+impl_const_array_serde!(jerk_array, crate::joint::CuJointJerk, "CuJointJerk");

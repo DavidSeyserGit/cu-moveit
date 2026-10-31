@@ -14,7 +14,7 @@
 //! - Setpoint + fresh state: command mirrors the setpoint; status maps the
 //!   follower status (`Running` → `Running`, `Finished` → `Holding`,
 //!   `ErrorEmptyTrajectory` → `Fault`).
-//! - Tracking error above `tracking_error_limit_rad`: `Fault`, command
+//! - Tracking error above `tracking_error_limit`: `Fault`, command
 //!   holds the measured state instead of chasing the setpoint.
 //! - Setpoint without any measured state: `Fault`, holding the last command.
 //!
@@ -30,12 +30,15 @@ use bincode::enc::Encoder;
 use bincode::error::DecodeError;
 use bincode::error::EncodeError;
 use cu_kinematics::CuJointPosition;
+use cu_kinematics::CuJointStatePayload;
 use cu_kinematics::CuJointVelocity;
+use cu_kinematics::CuRobotStatus;
 use cu_trajectory::CuFollowStatus;
 use cu_trajectory::CuTrajectoryFollowOutput;
 use cu29::prelude::*;
-use cu29::units::si::f64::{Force, Torque};
+use cu29::units::si::f64::{Force, Time, Torque};
 use cu29::units::si::force::newton;
+use cu29::units::si::time::second;
 use cu29::units::si::torque::newton_meter;
 use serde::Deserialize;
 use serde::Serialize;
@@ -84,7 +87,7 @@ impl CuJointEffort {
             CuJointPosition::Fixed => Self::Fixed,
         }
     }
-    #[doc(hidden)]
+    /// Returns the effort in its joint's SI unit (N m or N; `0.0` for fixed).
     pub fn si_value(self) -> f64 {
         match self {
             Self::Revolute(v) => v.get::<newton_meter>(),
@@ -110,45 +113,6 @@ pub enum CuControllerStatus {
     /// Tracking error exceeded the limit, the follower reported an error,
     /// or a setpoint arrived without measured state.
     Fault,
-}
-
-/// Health reported by the robot or simulator bridge.
-#[derive(
-    Default, Debug, Clone, Copy, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum CuRobotStatus {
-    /// The bridge has not confirmed readiness.
-    #[default]
-    NotReady,
-    /// The robot is ready to accept commands.
-    Ready,
-    /// The robot reports a device-specific fault code.
-    Fault(u32),
-    /// An emergency stop is active.
-    EmergencyStop,
-}
-
-/// Measured joint state: the only state payload a bridge has to produce.
-#[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
-pub struct CuJointStatePayload<const N: usize> {
-    /// Current health reported by the bridge.
-    pub status: CuRobotStatus,
-    #[serde(with = "cu_kinematics::serde_arrays::position_array")]
-    pub positions: [CuJointPosition; N],
-    #[serde(with = "cu_kinematics::serde_arrays::velocity_array")]
-    pub velocities: [CuJointVelocity; N],
-}
-
-impl<const N: usize> Default for CuJointStatePayload<N> {
-    fn default() -> Self {
-        Self {
-            positions: [CuJointPosition::default(); N],
-            velocities: [CuJointVelocity::default(); N],
-            status: CuRobotStatus::NotReady,
-        }
-    }
 }
 
 /// Unified joint command: the only command payload a bridge has to carry.
@@ -182,116 +146,271 @@ impl<const N: usize> Default for CuJointCommandPayload<N> {
     }
 }
 
+/// Effort-mode PD gains.
+///
+/// Both gains are dimensionless SI multipliers applied per joint kind:
+/// `kp` is N m/rad (revolute) or N/m (prismatic), `kv` is N m s/rad
+/// (revolute) or N s/m (prismatic). Both must be finite and `>= 0`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Reflect)]
+#[serde(default, deny_unknown_fields)]
+pub struct CuEffortGains {
+    /// Proportional gain (dimensionless SI, see type docs).
+    pub kp: f64,
+    /// Derivative gain (dimensionless SI, see type docs).
+    pub kv: f64,
+}
+
+impl Default for CuEffortGains {
+    /// `kp = 20.0`, `kv = 0.8`.
+    fn default() -> Self {
+        Self { kp: 20.0, kv: 0.8 }
+    }
+}
+
+impl CuEffortGains {
+    /// Checks that both gains are finite and non-negative.
+    pub fn validate(&self) -> CuResult<()> {
+        if !self.kp.is_finite() || self.kp < 0.0 || !self.kv.is_finite() || self.kv < 0.0 {
+            return Err(CuError::from(
+                "cu-controller: effort gains 'kp'/'kv' must be finite and >= 0",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Per-joint command rate limit (position mode only).
+///
+/// Both limits are scalars applied to every joint in that joint's SI unit
+/// (dimensionless SI magnitude): `max_speed` is rad/s for revolute and m/s
+/// for prismatic joints, `max_acceleration` is rad/s² resp. m/s². Both must
+/// be positive and finite.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Reflect)]
+#[serde(deny_unknown_fields)]
+pub struct CuRateLimit {
+    /// Max joint speed (dimensionless SI magnitude, see type docs).
+    pub max_speed: f64,
+    /// Max joint acceleration (dimensionless SI magnitude, see type docs).
+    pub max_acceleration: f64,
+}
+
+impl CuRateLimit {
+    /// Checks that both limits are positive and finite.
+    pub fn validate(&self) -> CuResult<()> {
+        let ok = |v: f64| v.is_finite() && v > 0.0;
+        if !ok(self.max_speed) || !ok(self.max_acceleration) {
+            return Err(CuError::from(
+                "cu-controller: rate limit 'max_speed'/'max_acceleration' must be positive and finite",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Parameters of [`CuControllerTask`]; the node `config:` block.
+///
+/// ```ron
+/// config: {
+///     "mode": "position",            // position | velocity | effort
+///     "tracking_error_limit": 0.5,   // SI per joint kind (rad / m)
+///     "state_timeout": 0.2,          // s; omit to disable the watchdog
+///     "rate_limit": {"max_speed": 1.5, "max_acceleration": 6.0},
+///     "effort_gains": {"kp": 20.0, "kv": 0.8},
+/// }
+/// ```
+///
+/// ```rust
+/// use cu_controller::{CuControllerParams, CuControllerTask, CuRateLimit};
+///
+/// let params = CuControllerParams {
+///     rate_limit: Some(CuRateLimit { max_speed: 1.5, max_acceleration: 6.0 }),
+///     ..CuControllerParams::default()
+/// };
+/// let task = CuControllerTask::<6>::from_params(params).unwrap();
+/// assert_eq!(task.params().tracking_error_limit, 0.5);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Reflect)]
+#[serde(default, deny_unknown_fields)]
+pub struct CuControllerParams {
+    /// Command level: `position`, `velocity`, or `effort`.
+    pub mode: CuControllerMode,
+    /// Max allowed absolute joint error (setpoint − measured) before the
+    /// controller faults and holds the measured state. Dimensionless SI
+    /// magnitude compared per joint in that joint's unit: radians for
+    /// revolute, meters for prismatic joints. Positive and finite.
+    pub tracking_error_limit: f64,
+    /// State watchdog: a joint state whose `Tov` is older than this (or in
+    /// the future, or missing a time) faults the controller. `None`
+    /// disables the watchdog.
+    pub state_timeout: Option<Time>,
+    /// Command rate limit; requires `mode: position`. `None` disables it.
+    pub rate_limit: Option<CuRateLimit>,
+    /// Effort-mode PD gains. In effort mode, hold/fault paths apply a
+    /// damping brake (`-kv * measured velocity`); with no measured state
+    /// the effort is zero and the bridge's gravity compensation is all that
+    /// holds the arm.
+    pub effort_gains: CuEffortGains,
+}
+
+impl Default for CuControllerParams {
+    /// Position mode, 0.5 tracking-error limit, no watchdog, no rate limit,
+    /// effort gains `kp = 20.0`, `kv = 0.8`.
+    fn default() -> Self {
+        Self {
+            mode: CuControllerMode::Position,
+            tracking_error_limit: 0.5,
+            state_timeout: None,
+            rate_limit: None,
+            effort_gains: CuEffortGains::default(),
+        }
+    }
+}
+
+impl CuControllerParams {
+    /// Checks the limit, watchdog, rate limit (position mode only) and gains.
+    pub fn validate(&self) -> CuResult<()> {
+        if !self.tracking_error_limit.is_finite() || self.tracking_error_limit <= 0.0 {
+            return Err(CuError::from(
+                "cu-controller: 'tracking_error_limit' must be positive and finite",
+            ));
+        }
+        if let Some(timeout) = self.state_timeout {
+            let s = timeout.get::<second>();
+            if !s.is_finite() || s <= 0.0 {
+                return Err(CuError::from(
+                    "cu-controller: 'state_timeout' must be positive and finite",
+                ));
+            }
+        }
+        if let Some(rate_limit) = self.rate_limit {
+            rate_limit.validate()?;
+            if self.mode != CuControllerMode::Position {
+                return Err(CuError::from(
+                    "cu-controller: 'rate_limit' requires 'mode: position'",
+                ));
+            }
+        }
+        self.effort_gains.validate()
+    }
+}
+
+/// Converts a positive time to nanoseconds, rounded to nearest and at least
+/// 1 ns (`as` saturates beyond `u64::MAX`).
+fn to_nanos(t: Time) -> u64 {
+    ((t.get::<second>() * 1e9 + 0.5) as u64).max(1)
+}
+
 /// Unified robot-agnostic joint controller task.
 ///
 /// Inputs are `(setpoint, state)`: a `CuTrajectoryFollowOutput<N>` and a
-/// [`CuJointStatePayload<N>`]. Output is a [`CuJointCommandPayload<N>`]
-/// addressed to any bridge exposing a `joint_command` channel.
-///
-/// Config keys:
-/// - `tracking_error_limit_rad` (`f64`, default `0.5`): max allowed absolute
-///   joint error in radians before the controller faults and holds the
-///   measured state.
-/// - `mode` (`CuControllerMode`, default `position`): command level —
-///   `position`, `velocity`, or `effort`.
-/// - `effort_kp` / `effort_kv` (`f64`, defaults `20.0` / `0.8`): PD gains
-///   for effort mode, per joint kind (N m/rad resp. N/m proportional).
-///   In effort mode, hold/fault paths apply a damping brake
-///   (`-effort_kv * measured velocity`); with no measured state the effort
-///   is zero and the bridge's gravity compensation is all that holds the arm.
+/// `cu_kinematics::CuJointStatePayload<N>`. Output is a
+/// [`CuJointCommandPayload<N>`] addressed to any bridge exposing a
+/// `joint_command` channel. The node `config:` block is a
+/// [`CuControllerParams`].
 #[derive(Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+#[reflect(no_field_bounds, from_reflect = false)]
 pub struct CuControllerTask<const N: usize> {
-    tracking_error_limit_rad: f64,
-    mode: CuControllerMode,
-    effort_kp: f64,
-    effort_kv: f64,
+    #[reflect(ignore)]
+    params: CuControllerParams,
+    #[reflect(ignore)]
+    state_timeout_ns: Option<u64>,
     #[reflect(ignore)]
     last_command: [CuJointPosition; N],
     #[reflect(ignore)]
     last_status: CuControllerStatus,
     has_command: bool,
-    state_timeout_ns: Option<u64>,
-    max_speed: Option<f64>,
-    max_acceleration: Option<f64>,
     last_time: Option<CuTime>,
     #[reflect(ignore)]
     last_velocity: [CuJointVelocity; N],
 }
 
 impl<const N: usize> CuControllerTask<N> {
-    /// Creates a controller with an explicit tracking-error limit (radians).
-    pub fn new_with_limit(tracking_error_limit_rad: f64) -> Self {
+    /// Creates a controller from validated params.
+    pub fn from_params(params: CuControllerParams) -> CuResult<Self> {
+        params.validate()?;
+        Ok(Self::with_valid_params(params))
+    }
+
+    fn with_valid_params(params: CuControllerParams) -> Self {
         Self {
-            tracking_error_limit_rad,
-            mode: CuControllerMode::default(),
-            effort_kp: 20.0,
-            effort_kv: 0.8,
+            state_timeout_ns: params.state_timeout.map(to_nanos),
+            params,
             last_command: [CuJointPosition::default(); N],
             last_status: CuControllerStatus::Idle,
             has_command: false,
-            state_timeout_ns: None,
-            max_speed: None,
-            max_acceleration: None,
             last_time: None,
             last_velocity: [CuJointVelocity::default(); N],
         }
     }
 
+    /// Params this task runs with (including `set_mode`/`set_effort_gains`
+    /// changes).
+    pub fn params(&self) -> &CuControllerParams {
+        &self.params
+    }
+
     /// Sets the command level (takes effect on the next cycle).
     pub fn set_mode(&mut self, mode: CuControllerMode) {
-        self.mode = mode;
+        self.params.mode = mode;
     }
 
     /// Returns the active command level.
     pub fn mode(&self) -> CuControllerMode {
-        self.mode
+        self.params.mode
     }
 
-    /// Sets the effort-mode PD gains (proportional, derivative). Units are
-    /// per joint kind: N m/rad and N m s/rad for revolute joints, N/m and
-    /// N s/m for prismatic joints. Non-finite or negative values are ignored.
-    pub fn set_effort_gains(&mut self, kp: f64, kv: f64) {
-        if kp.is_finite() && kp >= 0.0 && kv.is_finite() && kv >= 0.0 {
-            self.effort_kp = kp;
-            self.effort_kv = kv;
-        }
+    /// Sets the effort-mode PD gains. Invalid gains (non-finite or negative)
+    /// are rejected and leave the current gains unchanged.
+    pub fn set_effort_gains(&mut self, gains: CuEffortGains) -> CuResult<()> {
+        gains.validate()?;
+        self.params.effort_gains = gains;
+        Ok(())
     }
 }
 
 impl<const N: usize> Default for CuControllerTask<N> {
     fn default() -> Self {
-        Self::new_with_limit(0.5)
+        Self::with_valid_params(CuControllerParams::default())
     }
 }
 
 impl<const N: usize> Freezable for CuControllerTask<N> {
     fn freeze<E: Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {
-        Encode::encode(&self.tracking_error_limit_rad, encoder)?;
-        Encode::encode(&self.mode, encoder)?;
-        Encode::encode(&self.effort_kp, encoder)?;
-        Encode::encode(&self.effort_kv, encoder)?;
+        let p = &self.params;
+        Encode::encode(&p.tracking_error_limit, encoder)?;
+        Encode::encode(&p.mode, encoder)?;
+        Encode::encode(&p.effort_gains.kp, encoder)?;
+        Encode::encode(&p.effort_gains.kv, encoder)?;
         Encode::encode(&self.last_command, encoder)?;
         Encode::encode(&self.last_status, encoder)?;
         Encode::encode(&self.has_command, encoder)?;
         Encode::encode(&self.state_timeout_ns, encoder)?;
-        Encode::encode(&self.max_speed, encoder)?;
-        Encode::encode(&self.max_acceleration, encoder)?;
+        Encode::encode(&p.state_timeout.map(|t| t.get::<second>()), encoder)?;
+        Encode::encode(&p.rate_limit.map(|r| r.max_speed), encoder)?;
+        Encode::encode(&p.rate_limit.map(|r| r.max_acceleration), encoder)?;
         Encode::encode(&self.last_time, encoder)?;
         Encode::encode(&self.last_velocity, encoder)
     }
 
     fn thaw<D: Decoder>(&mut self, decoder: &mut D) -> Result<(), DecodeError> {
-        self.tracking_error_limit_rad = Decode::decode(decoder)?;
-        self.mode = Decode::decode(decoder)?;
-        self.effort_kp = Decode::decode(decoder)?;
-        self.effort_kv = Decode::decode(decoder)?;
+        self.params.tracking_error_limit = Decode::decode(decoder)?;
+        self.params.mode = Decode::decode(decoder)?;
+        self.params.effort_gains.kp = Decode::decode(decoder)?;
+        self.params.effort_gains.kv = Decode::decode(decoder)?;
         self.last_command = Decode::decode(decoder)?;
         self.last_status = Decode::decode(decoder)?;
         self.has_command = Decode::decode(decoder)?;
         self.state_timeout_ns = Decode::decode(decoder)?;
-        self.max_speed = Decode::decode(decoder)?;
-        self.max_acceleration = Decode::decode(decoder)?;
+        let timeout: Option<f64> = Decode::decode(decoder)?;
+        self.params.state_timeout = timeout.map(Time::new::<second>);
+        let speed: Option<f64> = Decode::decode(decoder)?;
+        let acceleration: Option<f64> = Decode::decode(decoder)?;
+        self.params.rate_limit = speed
+            .zip(acceleration)
+            .map(|(max_speed, max_acceleration)| CuRateLimit {
+                max_speed,
+                max_acceleration,
+            });
         self.last_time = Decode::decode(decoder)?;
         self.last_velocity = Decode::decode(decoder)?;
         Ok(())
@@ -307,57 +426,11 @@ impl<const N: usize> CuTask for CuControllerTask<N> {
     where
         Self: Sized,
     {
-        let limit = match cfg {
-            Some(cfg) => cfg.get::<f64>("tracking_error_limit_rad")?.unwrap_or(0.5),
-            None => 0.5,
-        };
-        if !limit.is_finite() || limit <= 0.0 {
-            return Err(CuError::from(
-                "cu-controller: 'tracking_error_limit_rad' must be positive and finite",
-            ));
-        }
-        let mut task = Self::new_with_limit(limit);
-        if let Some(cfg) = cfg {
-            let timeout = cfg.get::<u64>("state_timeout_ns")?;
-            let speed = cfg.get::<f64>("max_joint_speed_si")?;
-            let acceleration = cfg.get::<f64>("max_joint_acceleration_si")?;
-            if timeout == Some(0)
-                || speed.is_some_and(|v| !v.is_finite() || v <= 0.0)
-                || acceleration.is_some_and(|v| !v.is_finite() || v <= 0.0)
-                || speed.is_some() != acceleration.is_some()
-            {
-                return Err(CuError::from(
-                    "cu-controller: invalid watchdog or rate limits",
-                ));
-            }
-            task.state_timeout_ns = timeout;
-            task.max_speed = speed;
-            task.max_acceleration = acceleration;
-            let kp = cfg.get::<f64>("effort_kp")?;
-            let kv = cfg.get::<f64>("effort_kv")?;
-            if kp.is_some_and(|v| !v.is_finite() || v < 0.0)
-                || kv.is_some_and(|v| !v.is_finite() || v < 0.0)
-            {
-                return Err(CuError::from(
-                    "cu-controller: 'effort_kp'/'effort_kv' must be finite and >= 0",
-                ));
-            }
-            task.mode = cfg
-                .get_value::<CuControllerMode>("mode")?
-                .unwrap_or_default();
-            if task.max_speed.is_some() && task.mode != CuControllerMode::Position {
-                return Err(CuError::from(
-                    "cu-controller: rate limits require 'mode: position'",
-                ));
-            }
-            if let Some(kp) = kp {
-                task.effort_kp = kp;
-            }
-            if let Some(kv) = kv {
-                task.effort_kv = kv;
-            }
-        }
-        Ok(task)
+        let params = cfg
+            .map(ComponentConfig::deserialize_into::<CuControllerParams>)
+            .transpose()?
+            .unwrap_or_default();
+        Self::from_params(params)
     }
 
     fn process<'i, 'o>(
@@ -370,8 +443,10 @@ impl<const N: usize> CuTask for CuControllerTask<N> {
         let state = input.1.payload();
         let setpoint = input.0.payload();
 
+        let mode = self.params.mode;
+        let CuEffortGains { kp, kv } = self.params.effort_gains;
         let mut command = CuJointCommandPayload::<N> {
-            mode: self.mode,
+            mode,
             ..Default::default()
         };
         let now = ctx.now();
@@ -403,11 +478,11 @@ impl<const N: usize> CuTask for CuControllerTask<N> {
             (None, Some(state)) => {
                 command.positions = state.positions;
                 command.status = CuControllerStatus::Idle;
-                if self.mode == CuControllerMode::Effort {
+                if mode == CuControllerMode::Effort {
                     for j in 0..N {
                         command.efforts[j] = CuJointEffort::from_position(
                             state.positions[j],
-                            -self.effort_kv * state.velocities[j].si_value(),
+                            -kv * state.velocities[j].si_value(),
                         );
                     }
                 }
@@ -429,30 +504,30 @@ impl<const N: usize> CuTask for CuControllerTask<N> {
                 }
                 command.max_tracking_error = max_kind.with_si_value(max_err);
                 if setpoint.status == CuFollowStatus::ErrorEmptyTrajectory
-                    || max_err > self.tracking_error_limit_rad
+                    || max_err > self.params.tracking_error_limit
                 {
                     command.positions = state.positions;
                     command.status = CuControllerStatus::Fault;
-                    if self.mode == CuControllerMode::Effort {
+                    if mode == CuControllerMode::Effort {
                         // Damping brake: no stiffness towards the setpoint,
                         // but resist motion instead of going limp.
                         for j in 0..N {
                             command.efforts[j] = CuJointEffort::from_position(
                                 state.positions[j],
-                                -self.effort_kv * state.velocities[j].si_value(),
+                                -kv * state.velocities[j].si_value(),
                             );
                         }
                     }
                 } else {
                     command.positions = setpoint.positions;
                     command.velocities = setpoint.velocities;
-                    if self.mode == CuControllerMode::Effort {
+                    if mode == CuControllerMode::Effort {
                         for j in 0..N {
                             let pos_err =
                                 setpoint.positions[j].si_value() - state.positions[j].si_value();
                             let vel_err =
                                 setpoint.velocities[j].si_value() - state.velocities[j].si_value();
-                            let effort = self.effort_kp * pos_err + self.effort_kv * vel_err;
+                            let effort = kp * pos_err + kv * vel_err;
                             command.efforts[j] =
                                 CuJointEffort::from_position(setpoint.positions[j], effort);
                         }
@@ -470,7 +545,10 @@ impl<const N: usize> CuTask for CuControllerTask<N> {
         // Rate limiting applies while a setpoint is followed (running or
         // holding its end). It starts from the measured state after idle or
         // fault, so no stale command or velocity carries over.
-        if let (Some(max_speed), Some(max_acceleration)) = (self.max_speed, self.max_acceleration)
+        if let Some(CuRateLimit {
+            max_speed,
+            max_acceleration,
+        }) = self.params.rate_limit
             && matches!(
                 command.status,
                 CuControllerStatus::Running | CuControllerStatus::Holding
@@ -547,6 +625,14 @@ mod tests {
         }
     }
 
+    fn with_limit(limit: f64) -> CuControllerTask<2> {
+        CuControllerTask::from_params(CuControllerParams {
+            tracking_error_limit: limit,
+            ..CuControllerParams::default()
+        })
+        .unwrap()
+    }
+
     fn state(pos: f64) -> CuJointStatePayload<2> {
         CuJointStatePayload {
             status: CuRobotStatus::Ready,
@@ -603,7 +689,7 @@ mod tests {
 
     #[test]
     fn test_tracking_fault_holds_measured() {
-        let mut task = CuControllerTask::<2>::new_with_limit(0.1);
+        let mut task = with_limit(0.1);
         let out = run(
             &mut task,
             Some(follow(1.0, CuFollowStatus::Running)),
@@ -622,9 +708,10 @@ mod tests {
 
     #[test]
     fn test_effort_mode_computes_pd_effort() {
-        let mut task = CuControllerTask::<2>::new_with_limit(0.5);
+        let mut task = with_limit(0.5);
         task.set_mode(CuControllerMode::Effort);
-        task.set_effort_gains(10.0, 2.0);
+        task.set_effort_gains(CuEffortGains { kp: 10.0, kv: 2.0 })
+            .unwrap();
         let out = run(
             &mut task,
             Some(follow(0.5, CuFollowStatus::Running)),
@@ -638,7 +725,7 @@ mod tests {
 
     #[test]
     fn test_effort_fault_outputs_zero_effort() {
-        let mut task = CuControllerTask::<2>::new_with_limit(0.1);
+        let mut task = with_limit(0.1);
         task.set_mode(CuControllerMode::Effort);
         let out = run(
             &mut task,
@@ -651,7 +738,7 @@ mod tests {
 
     #[test]
     fn test_velocity_mode_tags_command() {
-        let mut task = CuControllerTask::<2>::new_with_limit(0.5);
+        let mut task = with_limit(0.5);
         task.set_mode(CuControllerMode::Velocity);
         let out = run(
             &mut task,
@@ -665,7 +752,7 @@ mod tests {
 
     #[test]
     fn test_freeze_thaw_round_trip() {
-        let mut task = CuControllerTask::<2>::new_with_limit(0.25);
+        let mut task = with_limit(0.25);
         let _ = run(
             &mut task,
             Some(follow(0.4, CuFollowStatus::Running)),
@@ -688,5 +775,102 @@ mod tests {
             .unwrap();
         assert_eq!(restored.last_command[0].si_value(), 0.4);
         assert_eq!(restored.last_status, CuControllerStatus::Running);
+    }
+
+    #[test]
+    fn test_invalid_params_rejected() {
+        let bad = |p: CuControllerParams| CuControllerTask::<2>::from_params(p).is_err();
+        let d = CuControllerParams::default();
+        assert!(bad(CuControllerParams {
+            tracking_error_limit: 0.0,
+            ..d
+        }));
+        assert!(bad(CuControllerParams {
+            tracking_error_limit: f64::NAN,
+            ..d
+        }));
+        assert!(bad(CuControllerParams {
+            state_timeout: Some(Time::new::<second>(0.0)),
+            ..d
+        }));
+        let rate = CuRateLimit {
+            max_speed: 1.0,
+            max_acceleration: 2.0,
+        };
+        assert!(bad(CuControllerParams {
+            rate_limit: Some(CuRateLimit {
+                max_speed: -1.0,
+                ..rate
+            }),
+            ..d
+        }));
+        assert!(bad(CuControllerParams {
+            rate_limit: Some(CuRateLimit {
+                max_acceleration: f64::INFINITY,
+                ..rate
+            }),
+            ..d
+        }));
+        assert!(bad(CuControllerParams {
+            mode: CuControllerMode::Velocity,
+            rate_limit: Some(rate),
+            ..d
+        }));
+        assert!(bad(CuControllerParams {
+            effort_gains: CuEffortGains { kp: -1.0, kv: 0.0 },
+            ..d
+        }));
+        assert!(!bad(CuControllerParams {
+            rate_limit: Some(rate),
+            ..d
+        }));
+    }
+
+    #[test]
+    fn test_set_effort_gains_rejects_invalid() {
+        let mut task = CuControllerTask::<2>::default();
+        assert!(
+            task.set_effort_gains(CuEffortGains {
+                kp: f64::NAN,
+                kv: 1.0
+            })
+            .is_err()
+        );
+        assert_eq!(task.params().effort_gains, CuEffortGains::default());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_reads_config() {
+        let cfg: ComponentConfig = ron::from_str(
+            r#"#![enable(unwrap_newtypes)] {"mode": "position", "tracking_error_limit": 0.25,
+            "state_timeout": 0.2, "rate_limit": {"max_speed": 1.5, "max_acceleration": 6.0},
+            "effort_gains": {"kp": 10.0, "kv": 2.0}}"#,
+        )
+        .unwrap();
+        let task = CuControllerTask::<2>::new(Some(&cfg), ()).unwrap();
+        let p = task.params();
+        assert_eq!(p.tracking_error_limit, 0.25);
+        assert_eq!(p.state_timeout, Some(Time::new::<second>(0.2)));
+        assert_eq!(task.state_timeout_ns, Some(200_000_000));
+        assert_eq!(
+            p.rate_limit,
+            Some(CuRateLimit {
+                max_speed: 1.5,
+                max_acceleration: 6.0
+            })
+        );
+        assert_eq!(p.effort_gains, CuEffortGains { kp: 10.0, kv: 2.0 });
+        let task = CuControllerTask::<2>::new(None, ()).unwrap();
+        assert_eq!(task.params(), &CuControllerParams::default());
+        for bad in [
+            r#"{"tracking_error_limit_rad": 0.5}"#,
+            r#"{"rate_limit": {"max_speed": 1.5}}"#,
+            r#"{"mode": "effort", "rate_limit": {"max_speed": 1.5, "max_acceleration": 6.0}}"#,
+        ] {
+            let cfg: ComponentConfig =
+                ron::from_str(&format!("#![enable(unwrap_newtypes)] {bad}")).unwrap();
+            assert!(CuControllerTask::<2>::new(Some(&cfg), ()).is_err(), "{bad}");
+        }
     }
 }

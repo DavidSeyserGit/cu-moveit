@@ -8,12 +8,15 @@
 use crate::CuJointPlanPath;
 use crate::CuJointPlanRequest;
 use crate::CuJointPlanner;
+use crate::CuJointPlannerTask;
 use crate::CuPlanStatus;
 use crate::CuPlannerKind;
 use crate::common::check_endpoints;
 use crate::common::write_header;
 use crate::validity::CuSceneValidity;
 use crate::validity::joint_distance;
+use bincode::Decode;
+use bincode::Encode;
 use cu_collision::CuRobotCollisionModel;
 use cu_kinematics::CuJointMetric;
 use cu_kinematics::CuJointPosition;
@@ -23,14 +26,35 @@ use cu_kinematics::CuKinematicChain;
 use cu29::cutask_anytime::Quality;
 use cu29::cutask_anytime::quality_from_f32;
 use cu29::prelude::*;
+use serde::Deserialize;
+use serde::Serialize;
+
+/// Parameters of [`CuJointDirect`].
+#[derive(
+    Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, Encode, Decode, Reflect,
+)]
+#[serde(default, deny_unknown_fields)]
+pub struct CuJointDirectParams {
+    /// Resolution of the segment collision check.
+    pub collision_check_step: CuJointResolution,
+    /// Scaling of dimensionless joint-space distances and costs.
+    pub metric: CuJointMetric,
+}
+
+impl CuJointDirectParams {
+    /// Checks the metric and collision-check resolution.
+    pub fn validate(&self) -> CuResult<()> {
+        self.metric.validate()?;
+        self.collision_check_step.metric().validate()
+    }
+}
 
 /// Straight joint-space line planner.
 ///
-/// Config keys: `chain`, `collision_model` (robot models), optional
-/// `collision_check_step` (`CuJointResolution`) and `metric`
-/// (`CuJointMetric`).
+/// Built with [`CuJointPlanner::new`] from robot models and
+/// [`CuJointDirectParams`]; runs in [`CuJointDirectTask`].
 #[derive(Clone)]
-pub struct CuJointDirectPlanner<const N: usize, const M: usize = N> {
+pub struct CuJointDirect<const N: usize, const M: usize = N> {
     validity: CuSceneValidity<N, M>,
     metric: CuJointMetric,
     start: [CuJointPosition; N],
@@ -39,42 +63,29 @@ pub struct CuJointDirectPlanner<const N: usize, const M: usize = N> {
     effort: u32,
 }
 
-impl<const N: usize, const M: usize> CuJointDirectPlanner<N, M> {
-    /// Creates the planner for explicit robot models.
-    pub fn new(
+/// [`CuJointPlannerTask`] running [`CuJointDirect`].
+pub type CuJointDirectTask<const N: usize, const M: usize = N> =
+    CuJointPlannerTask<CuJointDirect<N, M>, N, M>;
+
+impl<const N: usize, const M: usize> CuJointPlanner<N, M> for CuJointDirect<N, M> {
+    const KIND: CuPlannerKind = CuPlannerKind::Direct;
+
+    type Params = CuJointDirectParams;
+
+    fn new(
         chain: CuKinematicChain<N>,
-        model: CuRobotCollisionModel<N, M>,
-        resolution: CuJointResolution,
-        metric: CuJointMetric,
-    ) -> Self {
-        Self {
-            validity: CuSceneValidity::new(chain, model, resolution),
-            metric,
+        collision_model: CuRobotCollisionModel<N, M>,
+        params: CuJointDirectParams,
+    ) -> CuResult<Self> {
+        params.validate()?;
+        Ok(Self {
+            validity: CuSceneValidity::new(chain, collision_model, params.collision_check_step),
+            metric: params.metric,
             start: [CuJointPosition::default(); N],
             goal: [CuJointPosition::default(); N],
             status: CuPlanStatus::InvalidRequest,
             effort: 0,
-        }
-    }
-}
-
-impl<const N: usize, const M: usize> CuJointPlanner<N> for CuJointDirectPlanner<N, M> {
-    const KIND: CuPlannerKind = CuPlannerKind::Direct;
-
-    fn from_config(config: Option<&ComponentConfig>) -> CuResult<Self> {
-        let chain = CuKinematicChain::from_config(config)?;
-        let model = CuRobotCollisionModel::from_config(config)?;
-        let mut resolution = CuJointResolution::default();
-        let mut metric = CuJointMetric::default();
-        if let Some(cfg) = config {
-            if let Some(v) = cfg.get_value::<CuJointResolution>("collision_check_step")? {
-                resolution = v;
-            }
-            if let Some(v) = cfg.get_value::<CuJointMetric>("metric")? {
-                metric = v;
-            }
-        }
-        Ok(Self::new(chain, model, resolution, metric))
+        })
     }
 
     fn begin(&mut self, request: &CuJointPlanRequest<N>, _seed: u64) -> CuResult<CuPlanStatus> {

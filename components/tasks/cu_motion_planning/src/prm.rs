@@ -11,6 +11,7 @@
 use crate::CuJointPlanPath;
 use crate::CuJointPlanRequest;
 use crate::CuJointPlanner;
+use crate::CuJointPlannerTask;
 use crate::CuPlanStatus;
 use crate::CuPlannerKind;
 use crate::common::check_endpoints;
@@ -42,14 +43,17 @@ pub const PRM_MAX_NEIGHBORS: usize = 10;
 
 /// Parameters of [`CuJointPrm`].
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode, Reflect)]
+#[serde(default, deny_unknown_fields)]
 pub struct CuJointPrmParams {
-    /// Normalized joint-space radius for roadmap edges.
+    /// Joint-space radius for roadmap edges (dimensionless, metric-scaled).
     pub connection_radius: f64,
     /// Neighbours tried per new node (`1..=PRM_MAX_NEIGHBORS`).
     pub neighbors: u32,
     /// Roadmap capacity (`3..=PRM_MAX_NODES`).
     pub max_nodes: u32,
+    /// Resolution of the segment collision checks.
     pub collision_check_step: CuJointResolution,
+    /// Scaling of dimensionless joint-space distances and costs.
     pub metric: CuJointMetric,
 }
 
@@ -66,19 +70,28 @@ impl Default for CuJointPrmParams {
 }
 
 impl CuJointPrmParams {
-    fn is_valid(&self) -> bool {
-        self.connection_radius.is_finite()
-            && self.connection_radius > 0.0
-            && (1..=PRM_MAX_NEIGHBORS as u32).contains(&self.neighbors)
-            && (3..=PRM_MAX_NODES as u32).contains(&self.max_nodes)
+    /// Checks every parameter, the metric, and the collision-check resolution.
+    pub fn validate(&self) -> CuResult<()> {
+        self.metric.validate()?;
+        self.collision_check_step.metric().validate()?;
+        let valid = {
+            self.connection_radius.is_finite()
+                && self.connection_radius > 0.0
+                && (1..=PRM_MAX_NEIGHBORS as u32).contains(&self.neighbors)
+                && (3..=PRM_MAX_NODES as u32).contains(&self.max_nodes)
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(CuError::from("cu-motion-planning: invalid PRM parameters"))
+        }
     }
 }
 
 /// Probabilistic roadmap planner (single query per job).
 ///
-/// Config keys: `chain`, `collision_model`, and optional
-/// `connection_radius`, `neighbors`, `max_nodes`, `collision_check_step`,
-/// `metric`.
+/// Built with [`CuJointPlanner::new`] from robot models and [`CuJointPrmParams`];
+/// runs in [`CuJointPrmTask`].
 pub struct CuJointPrm<const N: usize, const M: usize = N> {
     validity: CuSceneValidity<N, M>,
     params: CuJointPrmParams,
@@ -96,9 +109,17 @@ pub struct CuJointPrm<const N: usize, const M: usize = N> {
 const START: usize = 0;
 const GOAL: usize = 1;
 
+/// [`CuJointPlannerTask`] running [`CuJointPrm`].
+pub type CuJointPrmTask<const N: usize, const M: usize = N> =
+    CuJointPlannerTask<CuJointPrm<N, M>, N, M>;
+
 impl<const N: usize, const M: usize> CuJointPrm<N, M> {
-    /// Creates the planner for explicit robot models.
-    pub fn new(
+    /// The validated planner parameters.
+    pub const fn params(&self) -> &CuJointPrmParams {
+        &self.params
+    }
+
+    fn build(
         chain: CuKinematicChain<N>,
         model: CuRobotCollisionModel<N, M>,
         params: CuJointPrmParams,
@@ -249,34 +270,18 @@ impl<const N: usize, const M: usize> CuJointPrm<N, M> {
     }
 }
 
-impl<const N: usize, const M: usize> CuJointPlanner<N> for CuJointPrm<N, M> {
+impl<const N: usize, const M: usize> CuJointPlanner<N, M> for CuJointPrm<N, M> {
     const KIND: CuPlannerKind = CuPlannerKind::Sampling;
 
-    fn from_config(config: Option<&ComponentConfig>) -> CuResult<Self> {
-        let chain = CuKinematicChain::from_config(config)?;
-        let model = CuRobotCollisionModel::from_config(config)?;
-        let mut params = CuJointPrmParams::default();
-        if let Some(cfg) = config {
-            if let Some(v) = cfg.get::<f64>("connection_radius")? {
-                params.connection_radius = v;
-            }
-            if let Some(v) = cfg.get::<u32>("neighbors")? {
-                params.neighbors = v;
-            }
-            if let Some(v) = cfg.get::<u32>("max_nodes")? {
-                params.max_nodes = v;
-            }
-            if let Some(v) = cfg.get_value::<CuJointResolution>("collision_check_step")? {
-                params.collision_check_step = v;
-            }
-            if let Some(v) = cfg.get_value::<CuJointMetric>("metric")? {
-                params.metric = v;
-            }
-        }
-        if !params.is_valid() {
-            return Err(CuError::from("cu-motion-planning: invalid PRM parameters"));
-        }
-        Ok(Self::new(chain, model, params))
+    type Params = CuJointPrmParams;
+
+    fn new(
+        chain: CuKinematicChain<N>,
+        collision_model: CuRobotCollisionModel<N, M>,
+        params: CuJointPrmParams,
+    ) -> CuResult<Self> {
+        params.validate()?;
+        Ok(Self::build(chain, collision_model, params))
     }
 
     fn begin(&mut self, request: &CuJointPlanRequest<N>, seed: u64) -> CuResult<CuPlanStatus> {
@@ -286,11 +291,7 @@ impl<const N: usize, const M: usize> CuJointPlanner<N> for CuJointPrm<N, M> {
         self.degree = [0; PRM_MAX_NODES];
         self.best = CuJointPlanPath::default();
         self.straight_cost = joint_distance(&request.start, &request.goal, self.params.metric);
-        self.status = if self.params.is_valid() {
-            check_endpoints(&mut self.validity, request, self.params.metric)
-        } else {
-            CuPlanStatus::InvalidRequest
-        };
+        self.status = check_endpoints(&mut self.validity, request, self.params.metric);
         if self.status != CuPlanStatus::Searching {
             return Ok(self.status);
         }

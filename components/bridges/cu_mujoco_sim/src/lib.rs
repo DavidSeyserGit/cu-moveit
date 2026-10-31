@@ -30,20 +30,23 @@
 //! The Tx `joint_command` channel carries
 //! [`CuJointCommandPayload<6>`](cu_controller::CuJointCommandPayload) and the
 //! Rx `joint_state` channel carries
-//! [`CuJointStatePayload<6>`](cu_controller::CuJointStatePayload): the
+//! [`CuJointStatePayload<6>`](cu_kinematics::CuJointStatePayload): the
 //! unified controller contract for the 6-DOF igus ReBeL arm. `N` is fixed at
 //! 6 in v1; the sidecar is built to match. Joints are revolute, positions
 //! are SI radians, velocities SI radians per second. Only the command
 //! positions reach the wire; command velocities/status stay on the Copper
 //! side.
 //!
-//! # Config keys
+//! # Config
+//!
+//! The bridge `config:` block is a [`CuMujocoSimParams`]; unknown keys are
+//! rejected.
 //!
 //! | Key | Type | Default | Meaning |
 //! |---|---|---|---|
 //! | `host` | `String` | `"127.0.0.1"` | sidecar address |
 //! | `port` | `u16` | `8765` | sidecar TCP port |
-//! | `read_timeout_ms` | `u64` | `250` | socket read (and connect/write) timeout |
+//! | `read_timeout` | `Time` (s) | `0.25` | socket read (and connect/write) timeout |
 //!
 //! The bridge connects in
 //! [`start`](cu29::prelude::CuBridge::start) and reconnects lazily in
@@ -60,7 +63,7 @@
 //!         config: {
 //!             "host": "127.0.0.1",
 //!             "port": 8765,
-//!             "read_timeout_ms": 250,
+//!             "read_timeout": 0.25,
 //!         },
 //!         channels: [
 //!             Tx(id: "joint_command"),
@@ -72,7 +75,7 @@
 //!     ( src: "controller", dst: "mujoco/joint_command",
 //!       msg: "cu_controller::CuJointCommandPayload<6>" ),
 //!     ( src: "mujoco/joint_state", dst: "controller",
-//!       msg: "cu_controller::CuJointStatePayload<6>" ),
+//!       msg: "cu_kinematics::CuJointStatePayload<6>" ),
 //! ],
 //! ```
 //!
@@ -86,10 +89,10 @@ use bincode::error::DecodeError;
 use bincode::error::EncodeError;
 use cu_controller::CuJointCommandPayload;
 use cu_controller::CuJointEffort;
-use cu_controller::CuJointStatePayload;
-use cu_controller::CuRobotStatus;
 use cu_kinematics::CuJointPosition;
+use cu_kinematics::CuJointStatePayload;
 use cu_kinematics::CuJointVelocity;
+use cu_kinematics::CuRobotStatus;
 use cu29::prelude::*;
 use cu29::rx_channels;
 use cu29::tx_channels;
@@ -97,18 +100,69 @@ use cu29::units::si::angle::radian;
 use cu29::units::si::angular_velocity::radian_per_second;
 use cu29::units::si::f64::Angle;
 use cu29::units::si::f64::AngularVelocity;
+use cu29::units::si::f64::Time;
+use cu29::units::si::time::second;
+use serde::Deserialize;
+use serde::Serialize;
 use std::io::Read;
 use std::io::Write;
 use std::net::TcpStream;
 use std::net::ToSocketAddrs;
 use std::time::Duration;
 
-/// Default sidecar host.
-pub const DEFAULT_HOST: &str = "127.0.0.1";
-/// Default sidecar TCP port.
-pub const DEFAULT_PORT: u16 = 8765;
-/// Default socket read/connect/write timeout in milliseconds.
-pub const DEFAULT_READ_TIMEOUT_MS: u64 = 250;
+/// Parameters of [`CuMujocoSimBridge`]; the bridge `config:` block.
+///
+/// ```rust
+/// use cu_mujoco_sim::CuMujocoSimParams;
+/// use cu29::units::si::f64::Time;
+/// use cu29::units::si::time::second;
+///
+/// let params = CuMujocoSimParams {
+///     port: 9000,
+///     ..CuMujocoSimParams::default()
+/// };
+/// assert_eq!(params.host, "127.0.0.1");
+/// assert_eq!(params.read_timeout, Time::new::<second>(0.25));
+/// params.validate().unwrap();
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Reflect)]
+#[serde(default, deny_unknown_fields)]
+pub struct CuMujocoSimParams {
+    /// Sidecar host name or address.
+    pub host: String,
+    /// Sidecar TCP port.
+    pub port: u16,
+    /// Socket read (and connect/write) timeout; positive and finite.
+    pub read_timeout: Time,
+}
+
+impl Default for CuMujocoSimParams {
+    /// `127.0.0.1:8765`, 0.25 s timeout.
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".into(),
+            port: 8765,
+            read_timeout: Time::new::<second>(0.25),
+        }
+    }
+}
+
+impl CuMujocoSimParams {
+    /// Checks that the host is non-empty and the timeout is positive, finite,
+    /// and representable as a [`Duration`].
+    pub fn validate(&self) -> CuResult<()> {
+        if self.host.is_empty() {
+            return Err(CuError::from("cu-mujoco-sim: 'host' must not be empty"));
+        }
+        Duration::try_from_secs_f64(self.read_timeout.get::<second>())
+            .ok()
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| {
+                CuError::from("cu-mujoco-sim: 'read_timeout' must be positive and finite")
+            })?;
+        Ok(())
+    }
+}
 /// Fixed joint count for v1 (igus ReBeL 6-DOF).
 pub const MUJOCO_DOF: usize = 6;
 /// Largest accepted wire line; bounds the stack read buffer.
@@ -133,35 +187,33 @@ rx_channels! {
 /// re-established on `start`, so keyframe restore never resurrects a stale fd.
 #[derive(Reflect)]
 pub struct CuMujocoSimBridge {
-    host: String,
-    port: u16,
-    read_timeout_ms: u64,
+    #[reflect(ignore)]
+    params: CuMujocoSimParams,
     #[reflect(ignore)]
     stream: Option<TcpStream>,
 }
 
 impl CuMujocoSimBridge {
-    /// Sidecar host from config.
-    pub fn host(&self) -> &str {
-        &self.host
+    /// Creates a bridge from validated params (the socket connects in `start`).
+    pub fn from_params(params: CuMujocoSimParams) -> CuResult<Self> {
+        params.validate()?;
+        Ok(Self {
+            params,
+            stream: None,
+        })
     }
 
-    /// Sidecar TCP port from config.
-    pub const fn port(&self) -> u16 {
-        self.port
-    }
-
-    /// Socket timeout in milliseconds from config.
-    pub const fn read_timeout_ms(&self) -> u64 {
-        self.read_timeout_ms
+    /// Params this bridge runs with.
+    pub fn params(&self) -> &CuMujocoSimParams {
+        &self.params
     }
 
     fn timeout(&self) -> Duration {
-        Duration::from_millis(self.read_timeout_ms)
+        Duration::from_secs_f64(self.params.read_timeout.get::<second>())
     }
 
     fn connect(&self) -> CuResult<TcpStream> {
-        let addr = (self.host.as_str(), self.port)
+        let addr = (self.params.host.as_str(), self.params.port)
             .to_socket_addrs()
             .map_err(|e| {
                 CuError::new_with_cause("cu-mujoco-sim: cannot resolve sidecar address", e)
@@ -180,10 +232,13 @@ impl CuMujocoSimBridge {
     }
 
     fn ensure_connected(&mut self) -> CuResult<&mut TcpStream> {
-        if self.stream.is_none() {
-            self.stream = Some(self.connect()?);
+        match self.stream {
+            Some(ref mut stream) => Ok(stream),
+            None => {
+                let stream = self.connect()?;
+                Ok(self.stream.insert(stream))
+            }
         }
-        Ok(self.stream.as_mut().expect("just connected"))
     }
 
     fn drop_stream(&mut self) {
@@ -195,23 +250,26 @@ impl CuMujocoSimBridge {
 ///
 /// Only the command positions reach the wire; velocities and status stay on
 /// the Copper side.
-pub fn encode_command_line(payload: &CuJointCommandPayload<MUJOCO_DOF>) -> String {
+pub(crate) fn encode_command_line(payload: &CuJointCommandPayload<MUJOCO_DOF>) -> CuResult<String> {
     let q: [f64; MUJOCO_DOF] = payload.positions.map(CuJointPosition::si_value);
     let qd: [f64; MUJOCO_DOF] = payload.velocities.map(CuJointVelocity::si_value);
     let effort: [f64; MUJOCO_DOF] = payload.efforts.map(CuJointEffort::si_value);
     let mut line = serde_json::to_string(
         &serde_json::json!({"type": "command", "q": q, "qd": qd, "effort": effort, "mode": payload.mode}),
     )
-    .expect("command line is JSON-serializable");
+    .map_err(|e| CuError::new_with_cause("cu-mujoco-sim: cannot encode command", e))?;
     line.push('\n');
-    line
+    Ok(line)
 }
 
 /// Decodes one sidecar state line into `out`, parsing `q` into positions and
 /// `qd` into velocities (`time` is ignored).
 ///
 /// `out` is left untouched when the line is malformed; the error is returned.
-pub fn decode_state_line(line: &str, out: &mut CuJointStatePayload<MUJOCO_DOF>) -> CuResult<()> {
+pub(crate) fn decode_state_line(
+    line: &str,
+    out: &mut CuJointStatePayload<MUJOCO_DOF>,
+) -> CuResult<()> {
     let value: serde_json::Value = serde_json::from_str(line)
         .map_err(|e| CuError::new_with_cause("cu-mujoco-sim: bad JSON", e))?;
     if value.get("type").and_then(serde_json::Value::as_str) != Some("state") {
@@ -260,15 +318,16 @@ pub fn decode_state_line(line: &str, out: &mut CuJointStatePayload<MUJOCO_DOF>) 
 
 impl Freezable for CuMujocoSimBridge {
     fn freeze<E: Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {
-        Encode::encode(&self.host, encoder)?;
-        Encode::encode(&self.port, encoder)?;
-        Encode::encode(&self.read_timeout_ms, encoder)
+        Encode::encode(&self.params.host, encoder)?;
+        Encode::encode(&self.params.port, encoder)?;
+        Encode::encode(&self.params.read_timeout.get::<second>(), encoder)
     }
 
     fn thaw<D: Decoder>(&mut self, decoder: &mut D) -> Result<(), DecodeError> {
-        self.host = Decode::decode(decoder)?;
-        self.port = Decode::decode(decoder)?;
-        self.read_timeout_ms = Decode::decode(decoder)?;
+        self.params.host = Decode::decode(decoder)?;
+        self.params.port = Decode::decode(decoder)?;
+        let read_timeout: f64 = Decode::decode(decoder)?;
+        self.params.read_timeout = Time::new::<second>(read_timeout);
         self.stream = None;
         Ok(())
     }
@@ -288,24 +347,11 @@ impl CuBridge for CuMujocoSimBridge {
     where
         Self: Sized,
     {
-        let mut bridge = Self {
-            host: DEFAULT_HOST.into(),
-            port: DEFAULT_PORT,
-            read_timeout_ms: DEFAULT_READ_TIMEOUT_MS,
-            stream: None,
-        };
-        if let Some(config) = config {
-            if let Some(host) = config.get::<String>("host")? {
-                bridge.host = host;
-            }
-            if let Some(port) = config.get::<u16>("port")? {
-                bridge.port = port;
-            }
-            if let Some(read_timeout_ms) = config.get::<u64>("read_timeout_ms")? {
-                bridge.read_timeout_ms = read_timeout_ms;
-            }
-        }
-        Ok(bridge)
+        let params = config
+            .map(ComponentConfig::deserialize_into::<CuMujocoSimParams>)
+            .transpose()?
+            .unwrap_or_default();
+        Self::from_params(params)
     }
 
     fn start(&mut self, _ctx: &CuContext) -> CuResult<()> {
@@ -329,11 +375,11 @@ impl CuBridge for CuMujocoSimBridge {
         let Some(payload) = cmd.payload() else {
             return Ok(());
         };
-        let line = encode_command_line(payload);
-        let result = self
-            .ensure_connected()?
+        let line = encode_command_line(payload)?;
+        let stream = self.ensure_connected()?;
+        let result = stream
             .write_all(line.as_bytes())
-            .and_then(|()| self.stream.as_mut().expect("just connected").flush());
+            .and_then(|()| stream.flush());
         if let Err(e) = result {
             self.drop_stream();
             return Err(CuError::new_with_cause(
@@ -421,7 +467,7 @@ mod tests {
 
     #[test]
     fn test_encode_command_line_shape() {
-        let line = encode_command_line(&test_command([0.0, 0.5, -1.0, 1.5, -0.25, 3.0]));
+        let line = encode_command_line(&test_command([0.0, 0.5, -1.0, 1.5, -0.25, 3.0])).unwrap();
         assert!(line.ends_with('\n'));
         let value: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(value.get("type").and_then(|t| t.as_str()), Some("command"));
@@ -453,7 +499,7 @@ mod tests {
         payload.efforts = [CuJointEffort::Revolute(cu29::units::si::f64::Torque::new::<
             cu29::units::si::torque::newton_meter,
         >(2.5)); MUJOCO_DOF];
-        let line = encode_command_line(&payload);
+        let line = encode_command_line(&payload).unwrap();
         let value: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(value.get("mode").and_then(|m| m.as_str()), Some("effort"));
         let effort = value.get("effort").and_then(|v| v.as_array()).unwrap();
@@ -501,19 +547,43 @@ mod tests {
     #[test]
     fn test_new_defaults() {
         let bridge = CuMujocoSimBridge::new(None, &[], &[], ()).unwrap();
-        assert_eq!(bridge.host(), DEFAULT_HOST);
-        assert_eq!(bridge.port(), DEFAULT_PORT);
-        assert_eq!(bridge.read_timeout_ms(), DEFAULT_READ_TIMEOUT_MS);
+        assert_eq!(bridge.params().host, "127.0.0.1");
+        assert_eq!(bridge.params().port, 8765);
+        assert_eq!(bridge.timeout(), Duration::from_millis(250));
+    }
+
+    #[test]
+    fn test_new_reads_config() {
+        let cfg: ComponentConfig = ron::from_str(
+            r#"#![enable(unwrap_newtypes)] {"host": "10.0.0.9", "port": 9999, "read_timeout": 0.042}"#,
+        )
+        .unwrap();
+        let bridge = CuMujocoSimBridge::new(Some(&cfg), &[], &[], ()).unwrap();
+        assert_eq!(bridge.params().host, "10.0.0.9");
+        assert_eq!(bridge.params().port, 9999);
+        assert_eq!(bridge.timeout(), Duration::from_millis(42));
+        for bad in [
+            r#"{"read_timeout_ms": 250}"#,
+            r#"{"read_timeout": 0.0}"#,
+            r#"{"host": ""}"#,
+        ] {
+            let cfg: ComponentConfig =
+                ron::from_str(&format!("#![enable(unwrap_newtypes)] {bad}")).unwrap();
+            assert!(
+                CuMujocoSimBridge::new(Some(&cfg), &[], &[], ()).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
     fn test_freeze_thaw_restores_config_without_socket() {
-        let mut bridge = CuMujocoSimBridge {
+        let mut bridge = CuMujocoSimBridge::from_params(CuMujocoSimParams {
             host: "10.0.0.9".into(),
             port: 9999,
-            read_timeout_ms: 42,
-            stream: None,
-        };
+            read_timeout: Time::new::<second>(0.042),
+        })
+        .unwrap();
         let mut bytes = [0u8; 256];
         let mut encoder = bincode::enc::EncoderImpl::new(
             bincode::enc::write::SliceWriter::new(&mut bytes),
@@ -521,16 +591,16 @@ mod tests {
         );
         bridge.freeze(&mut encoder).unwrap();
         let len = encoder.into_writer().bytes_written();
-        bridge.host = "changed".into();
+        bridge.params.host = "changed".into();
         let mut decoder = bincode::de::DecoderImpl::new(
             bincode::de::read::SliceReader::new(&bytes[..len]),
             bincode::config::standard(),
             (),
         );
         bridge.thaw(&mut decoder).unwrap();
-        assert_eq!(bridge.host(), "10.0.0.9");
-        assert_eq!(bridge.port(), 9999);
-        assert_eq!(bridge.read_timeout_ms(), 42);
+        assert_eq!(bridge.params().host, "10.0.0.9");
+        assert_eq!(bridge.params().port, 9999);
+        assert_eq!(bridge.timeout(), Duration::from_millis(42));
     }
 
     /// Loopback sidecar: one command line in, one state line out.
@@ -560,12 +630,12 @@ mod tests {
         ready_rx.recv().unwrap();
 
         let (ctx, _) = CuContext::new_mock_clock();
-        let mut bridge = CuMujocoSimBridge {
-            host: DEFAULT_HOST.into(),
+        let mut bridge = CuMujocoSimBridge::from_params(CuMujocoSimParams {
             port,
-            read_timeout_ms: 5000,
-            stream: None,
-        };
+            read_timeout: Time::new::<second>(5.0),
+            ..CuMujocoSimParams::default()
+        })
+        .unwrap();
         bridge.start(&ctx).unwrap();
         let cmd = CuMsg::new(Some(test_command([1.0, 0.0, 0.0, 0.0, 0.0, 0.0])));
         bridge

@@ -1,4 +1,4 @@
-//! Stable-ID scene exclusion payload for attached-object collision pairs.
+//! Stable-ID scene exclusions for attached-object collision pairs.
 //!
 //! Mounting contact between a grasped object and the robot must be permitted:
 //! an attached shape overlaps its mount link by construction. Exclusions name
@@ -6,18 +6,16 @@
 //! alongside robot shape indices for attached-vs-robot pairs.
 //!
 //! [`CuSceneExclusions`] is a fixed-capacity `CuMsgPayload` published alongside
-//! [`CuPlanningScene`](crate::scene::CuPlanningScene). Consumers resolve it
-//! against the current snapshot with [`CuSceneExclusions::resolve`], which
-//! rejects invalid references (unassigned IDs, IDs absent from the snapshot,
-//! self-references, out-of-range robot shape indices) instead of silently
-//! skipping them. Resolution writes index-based exclusions in place into a
-//! caller-provided [`CuSceneQueryExclusions`](crate::scene_query::CuSceneQueryExclusions).
+//! [`CuPlanningScene`]. Pass it to a check with
+//! [`CuCollisionEnv::with_exclusions`](crate::CuCollisionEnv::with_exclusions); every
+//! check validates it against the environment and rejects invalid references
+//! (unassigned IDs, IDs absent from the snapshot, self-references, out-of-range
+//! robot shape indices) instead of silently skipping them.
 
+use crate::env::CuCollisionEnv;
 use crate::scene::CuObjectId;
 use crate::scene::CuPlanningScene;
 use crate::scene::CuSceneError;
-use crate::scene_query::CuSceneQueryExclusion;
-use crate::scene_query::CuSceneQueryExclusions;
 use bincode::Decode;
 use bincode::Encode;
 use cu29::prelude::*;
@@ -25,7 +23,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 /// Default capacity for stable-ID exclusions in [`CuSceneExclusions`].
-pub const DEFAULT_MAX_SCENE_EXCLUSIONS: usize = 16;
+pub const DEFAULT_MAX_EXCLUSIONS: usize = 16;
 
 /// Partner of an attached shape in a [`CuSceneExclusion`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect)]
@@ -102,79 +100,14 @@ impl CuSceneExclusion {
     }
 }
 
-mod serde_exclusion_array {
-    use super::CuSceneExclusion;
-    use serde::Deserializer;
-    use serde::Serializer;
-    use serde::de::Error as DeError;
-    use serde::de::SeqAccess;
-    use serde::de::Visitor;
-    use serde::ser::SerializeTuple;
-
-    pub mod exclusion_array {
-        use super::*;
-
-        pub fn serialize<S, const N: usize>(
-            values: &[CuSceneExclusion; N],
-            serializer: S,
-        ) -> Result<S::Ok, S::Error>
-        where
-            S: Serializer,
-        {
-            let mut seq = serializer.serialize_tuple(N)?;
-            for item in values.iter() {
-                seq.serialize_element(item)?;
-            }
-            seq.end()
-        }
-
-        pub fn deserialize<'de, D, const N: usize>(
-            deserializer: D,
-        ) -> Result<[CuSceneExclusion; N], D::Error>
-        where
-            D: Deserializer<'de>,
-        {
-            struct ArrayVisitor<const M: usize>;
-
-            impl<'de, const M: usize> Visitor<'de> for ArrayVisitor<M> {
-                type Value = [CuSceneExclusion; M];
-
-                fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-                    write!(formatter, "an array of {M} scene exclusion values")
-                }
-
-                fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-                where
-                    A: SeqAccess<'de>,
-                {
-                    let mut out = [CuSceneExclusion::NIL; M];
-                    let mut i = 0;
-                    while i < M {
-                        out[i] = seq
-                            .next_element()?
-                            .ok_or_else(|| DeError::invalid_length(i, &self))?;
-                        i += 1;
-                    }
-                    if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
-                        return Err(DeError::invalid_length(M + 1, &self));
-                    }
-                    Ok(out)
-                }
-            }
-
-            deserializer.deserialize_tuple(N, ArrayVisitor::<N>)
-        }
-    }
-}
-
 /// Fixed-capacity stable-ID exclusion set (`CuMsgPayload`-compliant).
 ///
-/// Published alongside a [`CuPlanningScene`] snapshot; resolved per query with
-/// [`resolve`](Self::resolve) so exclusions always bind to the current snapshot.
+/// Published alongside a [`CuPlanningScene`] snapshot and validated against it on every check,
+/// so exclusions always bind to the current snapshot.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Reflect)]
 #[reflect(no_field_bounds, from_reflect = false, type_path = false)]
-pub struct CuSceneExclusions<const MAX_EXCLUSIONS: usize = DEFAULT_MAX_SCENE_EXCLUSIONS> {
-    #[serde(with = "serde_exclusion_array::exclusion_array")]
+pub struct CuSceneExclusions<const MAX_EXCLUSIONS: usize = DEFAULT_MAX_EXCLUSIONS> {
+    #[serde(with = "crate::serde_arrays::exclusion_array")]
     exclusions: [CuSceneExclusion; MAX_EXCLUSIONS],
     len: u32,
 }
@@ -267,72 +200,62 @@ impl<const MAX_EXCLUSIONS: usize> CuSceneExclusions<MAX_EXCLUSIONS> {
         self.len = 0;
     }
 
-    /// Resolves stable IDs against `scene` into index-based query exclusions in place.
+    /// Checks every entry against `scene` and a robot model with `robot_shape_count` shapes.
     ///
-    /// `robot_shape_count` is the active shape count of the robot collision model
-    /// used by the query. Every entry is validated: unassigned or unknown IDs,
-    /// self-references, and out-of-range robot shape indices fail the whole
-    /// resolution, leaving `out` empty.
-    pub fn resolve<const MAX_OBS: usize, const MAX_ATT: usize, const MAX_OUT: usize>(
+    /// Unassigned or unknown IDs, self-references, and out-of-range robot shape indices fail.
+    /// Checks perform the same validation; this lets a caller reject a snapshot up front.
+    pub fn validate<const MAX_OBS: usize, const MAX_ATT: usize>(
         &self,
         scene: &CuPlanningScene<MAX_OBS, MAX_ATT>,
         robot_shape_count: usize,
-        out: &mut CuSceneQueryExclusions<MAX_OUT>,
     ) -> CuResult<()> {
-        out.clear();
-        if scene.attached_count() > u16::MAX as usize
-            || scene.obstacle_count() > u16::MAX as usize
-            || robot_shape_count > u16::MAX as usize
-        {
-            return Err(CuError::from(
-                "cu_collision: scene query shape count out of range",
-            ));
-        }
-        let mut resolved_out = CuSceneQueryExclusions::<MAX_OUT>::new();
-        for entry in self.as_slice() {
-            if !entry.attached_id.is_valid() {
-                return Err(CuSceneError::InvalidObjectId(entry.attached_id).into());
-            }
-            let Some(attached_index) = scene.find_attached_index(entry.attached_id) else {
-                return Err(CuSceneError::ObjectNotFound(entry.attached_id).into());
-            };
-            let attached_index = attached_index as u16;
-            let resolved = match entry.partner {
-                CuSceneExclusionPartner::RobotShape { shape_index } => {
-                    if shape_index as usize >= robot_shape_count {
-                        return Err(CuError::from(
-                            "cu_collision: scene exclusion robot shape index out of range",
-                        ));
-                    }
-                    CuSceneQueryExclusion::robot(attached_index, shape_index)
-                }
-                CuSceneExclusionPartner::Attached { attached_id } => {
-                    if !attached_id.is_valid() {
-                        return Err(CuSceneError::InvalidObjectId(attached_id).into());
-                    }
-                    if attached_id == entry.attached_id {
-                        return Err(CuError::from(
-                            "cu_collision: scene exclusion references its own attached shape",
-                        ));
-                    }
-                    let Some(partner_index) = scene.find_attached_index(attached_id) else {
-                        return Err(CuSceneError::ObjectNotFound(attached_id).into());
-                    };
-                    CuSceneQueryExclusion::attached(attached_index, partner_index as u16)
-                }
-                CuSceneExclusionPartner::Obstacle { obstacle_id } => {
-                    if !obstacle_id.is_valid() {
-                        return Err(CuSceneError::InvalidObjectId(obstacle_id).into());
-                    }
-                    let Some(partner_index) = scene.find_obstacle_index(obstacle_id) else {
-                        return Err(CuSceneError::ObjectNotFound(obstacle_id).into());
-                    };
-                    CuSceneQueryExclusion::obstacle(attached_index, partner_index as u16)
-                }
-            };
-            resolved_out.add(resolved)?;
-        }
-        *out = resolved_out;
-        Ok(())
+        validate_exclusions(self.as_slice(), &scene.collision_env(), robot_shape_count)
     }
+}
+
+/// Validates `exclusions` against the IDs present in `env`.
+pub(crate) fn validate_exclusions(
+    exclusions: &[CuSceneExclusion],
+    env: &CuCollisionEnv<'_>,
+    robot_shape_count: usize,
+) -> CuResult<()> {
+    for entry in exclusions {
+        if !entry.attached_id.is_valid() {
+            return Err(CuSceneError::InvalidObjectId(entry.attached_id).into());
+        }
+        if !env.find_attached(entry.attached_id) {
+            return Err(CuSceneError::ObjectNotFound(entry.attached_id).into());
+        }
+        match entry.partner {
+            CuSceneExclusionPartner::RobotShape { shape_index } => {
+                if shape_index as usize >= robot_shape_count {
+                    return Err(CuError::from(
+                        "cu_collision: scene exclusion robot shape index out of range",
+                    ));
+                }
+            }
+            CuSceneExclusionPartner::Attached { attached_id } => {
+                if !attached_id.is_valid() {
+                    return Err(CuSceneError::InvalidObjectId(attached_id).into());
+                }
+                if attached_id == entry.attached_id {
+                    return Err(CuError::from(
+                        "cu_collision: scene exclusion references its own attached shape",
+                    ));
+                }
+                if !env.find_attached(attached_id) {
+                    return Err(CuSceneError::ObjectNotFound(attached_id).into());
+                }
+            }
+            CuSceneExclusionPartner::Obstacle { obstacle_id } => {
+                if !obstacle_id.is_valid() {
+                    return Err(CuSceneError::InvalidObjectId(obstacle_id).into());
+                }
+                if !env.find_obstacle(obstacle_id) {
+                    return Err(CuSceneError::ObjectNotFound(obstacle_id).into());
+                }
+            }
+        }
+    }
+    Ok(())
 }

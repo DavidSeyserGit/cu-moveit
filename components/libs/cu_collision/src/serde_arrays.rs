@@ -1,8 +1,11 @@
-//! Serde helpers for const-generic fixed-size arrays.
+//! Crate-private serde helpers for const-generic fixed-size arrays of this crate's types.
+//!
+//! The shared helpers for kinematics types live in `cu_kinematics::serde_arrays`; its macro is not
+//! exported, so this crate keeps one local copy of the same pattern for its own element types.
 
 macro_rules! impl_const_array_serde {
     ($mod_name:ident, $elem_ty:ty, $label:literal) => {
-        pub mod $mod_name {
+        pub(crate) mod $mod_name {
             use serde::Deserializer;
             use serde::Serializer;
             use serde::de::Error as DeError;
@@ -10,7 +13,7 @@ macro_rules! impl_const_array_serde {
             use serde::de::Visitor;
             use serde::ser::SerializeTuple;
 
-            pub fn serialize<S, const N: usize>(
+            pub(crate) fn serialize<S, const N: usize>(
                 values: &[$elem_ty; N],
                 serializer: S,
             ) -> Result<S::Ok, S::Error>
@@ -18,15 +21,13 @@ macro_rules! impl_const_array_serde {
                 S: Serializer,
             {
                 let mut seq = serializer.serialize_tuple(N)?;
-                let mut i = 0;
-                while i < N {
-                    seq.serialize_element(&values[i])?;
-                    i += 1;
+                for value in values {
+                    seq.serialize_element(value)?;
                 }
                 seq.end()
             }
 
-            pub fn deserialize<'de, D, const N: usize>(
+            pub(crate) fn deserialize<'de, D, const N: usize>(
                 deserializer: D,
             ) -> Result<[$elem_ty; N], D::Error>
             where
@@ -70,20 +71,23 @@ macro_rules! impl_const_array_serde {
 }
 
 impl_const_array_serde!(
-    shape_array,
-    crate::shapes::CuCollisionShape,
-    "collision shape"
-);
-
-impl_const_array_serde!(
-    collision_contact_array,
+    contact_array,
     crate::model::CuCollisionContact,
     "collision contact"
 );
+impl_const_array_serde!(link_shape_array, crate::shapes::CuLinkShape, "link shape");
 impl_const_array_serde!(
-    collision_shape_array,
-    crate::shapes::CuCollisionShape,
-    "collision shape"
+    obstacle_array,
+    crate::scene::CuSceneObstacle,
+    "scene obstacle"
 );
-
-impl_const_array_serde!(frame_index_array, Option<usize>, "frame index");
+impl_const_array_serde!(
+    attached_array,
+    crate::scene::CuAttachedShape,
+    "attached shape"
+);
+impl_const_array_serde!(
+    exclusion_array,
+    crate::scene_exclusions::CuSceneExclusion,
+    "scene exclusion"
+);

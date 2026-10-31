@@ -13,6 +13,7 @@
 use crate::CuJointPlanPath;
 use crate::CuJointPlanRequest;
 use crate::CuJointPlanner;
+use crate::CuJointPlannerTask;
 use crate::CuPlanStatus;
 use crate::CuPlannerKind;
 use crate::common::check_endpoints;
@@ -42,12 +43,15 @@ const EMPTY: u16 = u16::MAX;
 
 /// Parameters of [`CuJointAStar`].
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode, Reflect)]
+#[serde(default, deny_unknown_fields)]
 pub struct CuJointAStarParams {
-    /// Grid spacing in normalized joint units.
+    /// Grid spacing (dimensionless, metric-scaled joint units).
     pub resolution: f64,
     /// Node capacity (`2..=ASTAR_MAX_NODES`).
     pub max_nodes: u32,
+    /// Resolution of the segment collision checks.
     pub collision_check_step: CuJointResolution,
+    /// Scaling of dimensionless joint-space distances and costs.
     pub metric: CuJointMetric,
 }
 
@@ -63,17 +67,27 @@ impl Default for CuJointAStarParams {
 }
 
 impl CuJointAStarParams {
-    fn is_valid(&self) -> bool {
-        self.resolution.is_finite()
-            && self.resolution > 0.0
-            && (2..=ASTAR_MAX_NODES as u32).contains(&self.max_nodes)
+    /// Checks every parameter, the metric, and the collision-check resolution.
+    pub fn validate(&self) -> CuResult<()> {
+        self.metric.validate()?;
+        self.collision_check_step.metric().validate()?;
+        let valid = {
+            self.resolution.is_finite()
+                && self.resolution > 0.0
+                && (2..=ASTAR_MAX_NODES as u32).contains(&self.max_nodes)
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(CuError::from("cu-motion-planning: invalid A* parameters"))
+        }
     }
 }
 
 /// A* search over a joint-space lattice.
 ///
-/// Config keys: `chain`, `collision_model`, and optional `resolution`,
-/// `max_nodes`, `collision_check_step`, `metric`.
+/// Built with [`CuJointPlanner::new`] from robot models and [`CuJointAStarParams`];
+/// runs in [`CuJointAStarTask`].
 #[derive(Clone)]
 pub struct CuJointAStar<const N: usize, const M: usize = N> {
     validity: CuSceneValidity<N, M>,
@@ -95,9 +109,17 @@ pub struct CuJointAStar<const N: usize, const M: usize = N> {
     best: CuJointPlanPath<N>,
 }
 
+/// [`CuJointPlannerTask`] running [`CuJointAStar`].
+pub type CuJointAStarTask<const N: usize, const M: usize = N> =
+    CuJointPlannerTask<CuJointAStar<N, M>, N, M>;
+
 impl<const N: usize, const M: usize> CuJointAStar<N, M> {
-    /// Creates the planner for explicit robot models.
-    pub fn new(
+    /// The validated planner parameters.
+    pub const fn params(&self) -> &CuJointAStarParams {
+        &self.params
+    }
+
+    fn build(
         chain: CuKinematicChain<N>,
         model: CuRobotCollisionModel<N, M>,
         params: CuJointAStarParams,
@@ -269,31 +291,18 @@ impl<const N: usize, const M: usize> CuJointAStar<N, M> {
     }
 }
 
-impl<const N: usize, const M: usize> CuJointPlanner<N> for CuJointAStar<N, M> {
+impl<const N: usize, const M: usize> CuJointPlanner<N, M> for CuJointAStar<N, M> {
     const KIND: CuPlannerKind = CuPlannerKind::Search;
 
-    fn from_config(config: Option<&ComponentConfig>) -> CuResult<Self> {
-        let chain = CuKinematicChain::from_config(config)?;
-        let model = CuRobotCollisionModel::from_config(config)?;
-        let mut params = CuJointAStarParams::default();
-        if let Some(cfg) = config {
-            if let Some(v) = cfg.get::<f64>("resolution")? {
-                params.resolution = v;
-            }
-            if let Some(v) = cfg.get::<u32>("max_nodes")? {
-                params.max_nodes = v;
-            }
-            if let Some(v) = cfg.get_value::<CuJointResolution>("collision_check_step")? {
-                params.collision_check_step = v;
-            }
-            if let Some(v) = cfg.get_value::<CuJointMetric>("metric")? {
-                params.metric = v;
-            }
-        }
-        if !params.is_valid() {
-            return Err(CuError::from("cu-motion-planning: invalid A* parameters"));
-        }
-        Ok(Self::new(chain, model, params))
+    type Params = CuJointAStarParams;
+
+    fn new(
+        chain: CuKinematicChain<N>,
+        collision_model: CuRobotCollisionModel<N, M>,
+        params: CuJointAStarParams,
+    ) -> CuResult<Self> {
+        params.validate()?;
+        Ok(Self::build(chain, collision_model, params))
     }
 
     fn begin(&mut self, request: &CuJointPlanRequest<N>, _seed: u64) -> CuResult<CuPlanStatus> {
@@ -314,11 +323,7 @@ impl<const N: usize, const M: usize> CuJointPlanner<N> for CuJointAStar<N, M> {
         // Every point is within half a cell diagonal of the lattice; one full
         // diagonal leaves room for the free-segment check to succeed.
         self.goal_reach = self.params.resolution * libm::sqrt(active as f64);
-        self.status = if self.params.is_valid() {
-            check_endpoints(&mut self.validity, request, self.params.metric)
-        } else {
-            CuPlanStatus::InvalidRequest
-        };
+        self.status = check_endpoints(&mut self.validity, request, self.params.metric);
         if self.status == CuPlanStatus::Searching {
             self.insert([0; N], 0.0, EMPTY);
         }

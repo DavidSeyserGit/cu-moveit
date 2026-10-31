@@ -3,12 +3,20 @@
 use bincode::Decode;
 use bincode::Encode;
 use cu29::prelude::*;
+use cu29::units::si::acceleration::meter_per_second_squared;
 use cu29::units::si::angle::radian;
+use cu29::units::si::angular_acceleration::radian_per_second_squared;
+use cu29::units::si::angular_jerk::radian_per_second_cubed;
 use cu29::units::si::angular_velocity::radian_per_second;
+use cu29::units::si::f64::Acceleration;
 use cu29::units::si::f64::Angle;
+use cu29::units::si::f64::AngularAcceleration;
+use cu29::units::si::f64::AngularJerk;
 use cu29::units::si::f64::AngularVelocity;
+use cu29::units::si::f64::Jerk;
 use cu29::units::si::f64::Length;
 use cu29::units::si::f64::Velocity;
+use cu29::units::si::jerk::meter_per_second_cubed;
 use cu29::units::si::length::meter;
 use cu29::units::si::velocity::meter_per_second;
 use serde::Deserialize;
@@ -56,7 +64,10 @@ impl CuJointPosition {
             _ => Err(CuError::from("Expected prismatic coordinate")),
         }
     }
-    #[doc(hidden)]
+    /// Returns the coordinate in SI base units (radians or meters; `0.0` for fixed joints).
+    ///
+    /// Intended for numerical kernels that operate on dimensionless arrays; convert back with
+    /// [`Self::with_si_value`] so the unit tag is never lost.
     pub fn si_value(self) -> f64 {
         match self {
             Self::Revolute(v) => v.get::<radian>(),
@@ -64,7 +75,8 @@ impl CuJointPosition {
             Self::Fixed => 0.0,
         }
     }
-    #[doc(hidden)]
+    /// Returns a coordinate of the same joint kind holding `value` in SI base units
+    /// (radians or meters). Fixed coordinates stay fixed.
     pub fn with_si_value(self, value: f64) -> Self {
         match self {
             Self::Revolute(_) => Self::Revolute(Angle::new::<radian>(value)),
@@ -99,7 +111,8 @@ impl Default for CuJointVelocity {
     }
 }
 impl CuJointVelocity {
-    #[doc(hidden)]
+    /// Creates a velocity of the same joint kind as `position` from an SI value
+    /// (rad/s or m/s). Fixed joints yield [`CuJointVelocity::Fixed`].
     pub fn from_coordinate(position: CuJointPosition, value: f64) -> Self {
         match position {
             CuJointPosition::Revolute(_) => {
@@ -111,7 +124,7 @@ impl CuJointVelocity {
             CuJointPosition::Fixed => Self::Fixed,
         }
     }
-    #[doc(hidden)]
+    /// Returns the velocity in SI base units (rad/s or m/s; `0.0` for fixed joints).
     pub fn si_value(self) -> f64 {
         match self {
             Self::Revolute(v) => v.get::<radian_per_second>(),
@@ -143,22 +156,23 @@ pub enum CuJointLimits {
     Fixed,
 }
 impl CuJointLimits {
-    /// Creates angular bounds from radians and radians per second.
-    pub fn from_radians(lower: f64, upper: f64, max_velocity: f64) -> Self {
+    /// Creates bounded revolute limits.
+    pub const fn revolute(lower: Angle, upper: Angle, max_velocity: AngularVelocity) -> Self {
         Self::Revolute {
-            lower: Angle::new::<radian>(lower),
-            upper: Angle::new::<radian>(upper),
-            max_velocity: AngularVelocity::new::<radian_per_second>(max_velocity),
+            lower,
+            upper,
+            max_velocity,
         }
     }
-    /// Creates linear bounds from meters and meters per second.
-    pub fn from_meters(lower: f64, upper: f64, max_velocity: f64) -> Self {
+    /// Creates bounded prismatic limits.
+    pub const fn prismatic(lower: Length, upper: Length, max_velocity: Velocity) -> Self {
         Self::Prismatic {
-            lower: Length::new::<meter>(lower),
-            upper: Length::new::<meter>(upper),
-            max_velocity: Velocity::new::<meter_per_second>(max_velocity),
+            lower,
+            upper,
+            max_velocity,
         }
     }
+    /// Lower position bound (`-pi` sampling bound for continuous joints).
     pub fn lower(self) -> CuJointPosition {
         match self {
             Self::Revolute { lower, .. } => lower.into(),
@@ -167,6 +181,7 @@ impl CuJointLimits {
             Self::Fixed => CuJointPosition::Fixed,
         }
     }
+    /// Upper position bound (`+pi` sampling bound for continuous joints).
     pub fn upper(self) -> CuJointPosition {
         match self {
             Self::Revolute { upper, .. } => upper.into(),
@@ -175,6 +190,7 @@ impl CuJointLimits {
             Self::Fixed => CuJointPosition::Fixed,
         }
     }
+    /// Maximum absolute joint velocity.
     pub fn max_velocity(self) -> CuJointVelocity {
         match self {
             Self::Revolute { max_velocity, .. } => CuJointVelocity::Revolute(max_velocity),
@@ -183,6 +199,7 @@ impl CuJointLimits {
             Self::Fixed => CuJointVelocity::Fixed,
         }
     }
+    /// Checks that `q` has this joint's unit kind and that the limits themselves are well formed.
     pub fn validate(self, q: CuJointPosition) -> CuResult<()> {
         if core::mem::discriminant(&q) != core::mem::discriminant(&self.lower())
             || !q.si_value().is_finite()
@@ -200,12 +217,14 @@ impl CuJointLimits {
         }
         Ok(())
     }
+    /// Returns `true` if `q` is valid and inside the bounds (always inside for continuous joints).
     pub fn contains(self, q: CuJointPosition) -> bool {
         self.validate(q).is_ok()
             && (matches!(self, Self::Continuous { .. })
                 || (q.si_value() >= self.lower().si_value()
                     && q.si_value() <= self.upper().si_value()))
     }
+    /// Clamps `q` to the bounds (continuous joints are returned unchanged).
     pub fn clamp(self, q: CuJointPosition) -> CuResult<CuJointPosition> {
         self.validate(q)?;
         if matches!(self, Self::Continuous { .. }) {
@@ -215,6 +234,105 @@ impl CuJointLimits {
             q.si_value()
                 .clamp(self.lower().si_value(), self.upper().si_value()),
         ))
+    }
+}
+
+/// A joint acceleration carries angular (rad/s²) or linear (m/s²) acceleration units.
+#[derive(Debug, Clone, Copy, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect)]
+#[serde(rename_all = "snake_case")]
+pub enum CuJointAcceleration {
+    Revolute(AngularAcceleration),
+    Prismatic(Acceleration),
+    Fixed,
+}
+impl Default for CuJointAcceleration {
+    fn default() -> Self {
+        Self::Revolute(AngularAcceleration::default())
+    }
+}
+impl From<AngularAcceleration> for CuJointAcceleration {
+    fn from(value: AngularAcceleration) -> Self {
+        Self::Revolute(value)
+    }
+}
+impl From<Acceleration> for CuJointAcceleration {
+    fn from(value: Acceleration) -> Self {
+        Self::Prismatic(value)
+    }
+}
+impl CuJointAcceleration {
+    /// Creates a value of the same joint kind as `position` from an SI value
+    /// (rad/s² or m/s²). Fixed joints yield `Fixed`.
+    pub fn from_coordinate(position: CuJointPosition, value: f64) -> Self {
+        match position {
+            CuJointPosition::Revolute(_) => {
+                Self::Revolute(AngularAcceleration::new::<radian_per_second_squared>(value))
+            }
+            CuJointPosition::Prismatic(_) => {
+                Self::Prismatic(Acceleration::new::<meter_per_second_squared>(value))
+            }
+            CuJointPosition::Fixed => Self::Fixed,
+        }
+    }
+    /// Returns the value in SI base units (rad/s² or m/s²; `0.0` for fixed joints).
+    pub fn si_value(self) -> f64 {
+        match self {
+            Self::Revolute(v) => v.get::<radian_per_second_squared>(),
+            Self::Prismatic(v) => v.get::<meter_per_second_squared>(),
+            Self::Fixed => 0.0,
+        }
+    }
+}
+
+/// A joint jerk carries angular (rad/s³) or linear (m/s³) jerk units.
+///
+/// An unbounded jerk (for example a jerk limit that should not constrain) is expressed as
+/// `f64::INFINITY` inside the unit value, e.g.
+/// `CuJointJerk::Revolute(AngularJerk::new::<radian_per_second_cubed>(f64::INFINITY))`;
+/// consumers may alternatively use `Option<CuJointJerk>` at the use site.
+#[derive(Debug, Clone, Copy, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect)]
+#[serde(rename_all = "snake_case")]
+pub enum CuJointJerk {
+    Revolute(AngularJerk),
+    Prismatic(Jerk),
+    Fixed,
+}
+impl Default for CuJointJerk {
+    fn default() -> Self {
+        Self::Revolute(AngularJerk::default())
+    }
+}
+impl From<AngularJerk> for CuJointJerk {
+    fn from(value: AngularJerk) -> Self {
+        Self::Revolute(value)
+    }
+}
+impl From<Jerk> for CuJointJerk {
+    fn from(value: Jerk) -> Self {
+        Self::Prismatic(value)
+    }
+}
+impl CuJointJerk {
+    /// Creates a value of the same joint kind as `position` from an SI value
+    /// (rad/s³ or m/s³). Fixed joints yield `Fixed`.
+    pub fn from_coordinate(position: CuJointPosition, value: f64) -> Self {
+        match position {
+            CuJointPosition::Revolute(_) => {
+                Self::Revolute(AngularJerk::new::<radian_per_second_cubed>(value))
+            }
+            CuJointPosition::Prismatic(_) => {
+                Self::Prismatic(Jerk::new::<meter_per_second_cubed>(value))
+            }
+            CuJointPosition::Fixed => Self::Fixed,
+        }
+    }
+    /// Returns the value in SI base units (rad/s³ or m/s³; `0.0` for fixed joints).
+    pub fn si_value(self) -> f64 {
+        match self {
+            Self::Revolute(v) => v.get::<radian_per_second_cubed>(),
+            Self::Prismatic(v) => v.get::<meter_per_second_cubed>(),
+            Self::Fixed => 0.0,
+        }
     }
 }
 
@@ -233,6 +351,7 @@ impl Default for CuJointMetric {
     }
 }
 impl CuJointMetric {
+    /// Checks that both scales are positive and finite.
     pub fn validate(self) -> CuResult<()> {
         let a = self.angular_scale.get::<radian>();
         let l = self.linear_scale.get::<meter>();
@@ -247,7 +366,8 @@ impl CuJointMetric {
     pub fn normalized(self, q: CuJointPosition) -> f64 {
         q.si_value() / self.scale(q)
     }
-    #[doc(hidden)]
+    /// Returns the SI scale (radians or meters) that normalizes coordinates of `q`'s joint kind;
+    /// `1.0` for fixed joints.
     pub fn scale(self, q: CuJointPosition) -> f64 {
         match q {
             CuJointPosition::Revolute(_) => self.angular_scale.get::<radian>(),
@@ -280,6 +400,7 @@ impl From<Angle> for CuJointResolution {
     }
 }
 impl CuJointResolution {
+    /// Uses the resolution as a joint-space metric.
     pub fn metric(self) -> CuJointMetric {
         CuJointMetric {
             angular_scale: self.angular,

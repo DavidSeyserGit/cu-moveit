@@ -8,14 +8,15 @@
 //! reconstruction used by the cubic follower mode.
 //!
 //! The peaks of velocity, acceleration and jerk of the quintic are computed in
-//! closed form ([`quintic_limit_ratio`]), and the velocity and acceleration
-//! peaks of the cubic in [`cubic_limit_ratio`]. Stretching all knot times by a
-//! factor `k` ([`stretch_time`]) keeps the shape and scales the peaks by
+//! closed form ([`CuTrajectoryPayload::quintic_limit_ratio`]), and the velocity
+//! and acceleration peaks of the cubic in [`cubic_limit_ratio`]. Stretching all
+//! knot times by a factor `k` ([`CuTrajectoryPayload::stretch_time`]) keeps the shape and scales the peaks by
 //! `1/k`, `1/k^2` and `1/k^3`, so a trajectory whose ratio to the limits is
 //! `r > 1` satisfies them exactly after stretching by `r`.
 
 use crate::CuJointTrajectoryLimits;
 use crate::CuTrajectoryPayload;
+use cu_kinematics::CuJointAcceleration;
 use cu_kinematics::CuJointPosition;
 use cu_kinematics::CuJointVelocity;
 use cu29::prelude::*;
@@ -140,87 +141,114 @@ fn sorted(roots: [Option<f64>; 2]) -> [Option<f64>; 2] {
     }
 }
 
-/// Smallest uniform time stretch under which the quintic reconstruction of
-/// `trajectory` respects `limits`, as a ratio of peak to limit.
-///
-/// Returns the largest of `peak_v / v_max`, `sqrt(peak_a / a_max)` and
-/// `cbrt(peak_j / j_max)` over all segments and non-fixed joints (an infinite
-/// jerk limit contributes nothing). A result `<= 1` means the limits already
-/// hold exactly. Returns `None` for fewer than two knots, non-positive
-/// segment durations, non-finite values, joint-kind disagreements or limits
-/// that are not positive.
-pub fn quintic_limit_ratio<const N: usize, const CAP: usize>(
-    trajectory: &CuTrajectoryPayload<N, CAP>,
-    limits: &CuJointTrajectoryLimits<N>,
-) -> Option<f64> {
-    if trajectory.len() < 2 || trajectory.len() > CAP {
-        return None;
-    }
-    let mut ratio = 0.0_f64;
-    for pair in trajectory.points().windows(2) {
-        let (a, b) = (&pair[0], &pair[1]);
-        let t = b.time_from_start.get::<second>() - a.time_from_start.get::<second>();
-        if !t.is_finite() || t <= 0.0 {
+impl<const N: usize, const CAP: usize> CuTrajectoryPayload<N, CAP> {
+    /// Smallest uniform time stretch under which the quintic reconstruction of
+    /// this trajectory respects `limits`, as a ratio of peak to limit (dimensionless).
+    ///
+    /// Returns the largest of `peak_v / v_max`, `sqrt(peak_a / a_max)` and
+    /// `cbrt(peak_j / j_max)` over all segments and non-fixed joints (an infinite
+    /// jerk limit contributes nothing). A result `<= 1` means the limits already
+    /// hold exactly. Returns `None` for fewer than two knots, non-positive
+    /// segment durations, non-finite values, joint-kind disagreements or limits
+    /// that are not positive.
+    pub fn quintic_limit_ratio(&self, limits: &CuJointTrajectoryLimits<N>) -> Option<f64> {
+        let trajectory = self;
+        if trajectory.len() < 2 || trajectory.len() > CAP {
             return None;
         }
-        for j in 0..N {
-            if matches!(a.positions[j], CuJointPosition::Fixed) {
-                continue;
-            }
-            let kinds_agree = matches!(
-                (
-                    a.positions[j],
-                    b.positions[j],
-                    a.velocities[j],
-                    b.velocities[j],
-                    limits.max_velocities[j]
-                ),
-                (
-                    CuJointPosition::Revolute(_),
-                    CuJointPosition::Revolute(_),
-                    CuJointVelocity::Revolute(_),
-                    CuJointVelocity::Revolute(_),
-                    CuJointVelocity::Revolute(_)
-                ) | (
-                    CuJointPosition::Prismatic(_),
-                    CuJointPosition::Prismatic(_),
-                    CuJointVelocity::Prismatic(_),
-                    CuJointVelocity::Prismatic(_),
-                    CuJointVelocity::Prismatic(_)
-                )
-            );
-            let (vmax, amax, jmax) = (
-                limits.max_velocities[j].si_value(),
-                limits.max_accelerations[j],
-                limits.max_jerks[j],
-            );
-            if !kinds_agree
-                || vmax.is_nan()
-                || vmax <= 0.0
-                || amax.is_nan()
-                || amax <= 0.0
-                || jmax.is_nan()
-                || jmax <= 0.0
-            {
+        let mut ratio = 0.0_f64;
+        for pair in trajectory.points().windows(2) {
+            let (a, b) = (&pair[0], &pair[1]);
+            let t = b.time_from_start.get::<second>() - a.time_from_start.get::<second>();
+            if !t.is_finite() || t <= 0.0 {
                 return None;
             }
-            let quintic = Quintic::new(
-                [a.positions[j].si_value(), b.positions[j].si_value()],
-                [a.velocities[j].si_value(), b.velocities[j].si_value()],
-                [a.accelerations[j], b.accelerations[j]],
-                t,
-            );
-            let (v, acc, jerk) = quintic.peaks();
-            if !v.is_finite() || !acc.is_finite() || !jerk.is_finite() {
-                return None;
+            for j in 0..N {
+                if matches!(a.positions[j], CuJointPosition::Fixed) {
+                    continue;
+                }
+                let kinds_agree = matches!(
+                    (
+                        a.positions[j],
+                        b.positions[j],
+                        a.velocities[j],
+                        b.velocities[j],
+                        limits.max_velocities[j]
+                    ),
+                    (
+                        CuJointPosition::Revolute(_),
+                        CuJointPosition::Revolute(_),
+                        CuJointVelocity::Revolute(_),
+                        CuJointVelocity::Revolute(_),
+                        CuJointVelocity::Revolute(_)
+                    ) | (
+                        CuJointPosition::Prismatic(_),
+                        CuJointPosition::Prismatic(_),
+                        CuJointVelocity::Prismatic(_),
+                        CuJointVelocity::Prismatic(_),
+                        CuJointVelocity::Prismatic(_)
+                    )
+                );
+                let (vmax, amax, jmax) = (
+                    limits.max_velocities[j].si_value(),
+                    limits.acc(j),
+                    limits.jerk(j),
+                );
+                if !kinds_agree
+                    || vmax.is_nan()
+                    || vmax <= 0.0
+                    || amax.is_nan()
+                    || amax <= 0.0
+                    || jmax.is_nan()
+                    || jmax <= 0.0
+                {
+                    return None;
+                }
+                let quintic = Quintic::new(
+                    [a.positions[j].si_value(), b.positions[j].si_value()],
+                    [a.velocities[j].si_value(), b.velocities[j].si_value()],
+                    [a.accelerations[j].si_value(), b.accelerations[j].si_value()],
+                    t,
+                );
+                let (v, acc, jerk) = quintic.peaks();
+                if !v.is_finite() || !acc.is_finite() || !jerk.is_finite() {
+                    return None;
+                }
+                ratio = ratio
+                    .max(v / vmax)
+                    .max(libm::sqrt(acc / amax))
+                    .max(libm::cbrt(jerk / jmax));
             }
-            ratio = ratio
-                .max(v / vmax)
-                .max(libm::sqrt(acc / amax))
-                .max(libm::cbrt(jerk / jmax));
         }
+        Some(ratio)
     }
-    Some(ratio)
+
+    /// Stretches all knot times by `factor` (dimensionless) and rescales
+    /// velocities by `1/factor` and accelerations by `1/factor^2`, so the motion
+    /// keeps its exact shape and every velocity, acceleration and jerk peak drops
+    /// by `1/factor`, `1/factor^2` and `1/factor^3`. `factor` must be finite and
+    /// positive.
+    pub fn stretch_time(&mut self, factor: f64) -> CuResult<()> {
+        if !factor.is_finite() || factor <= 0.0 {
+            return Err(CuError::from("Time stretch factor must be positive"));
+        }
+        let len = self.len();
+        for point in &mut self.points[..len] {
+            point.time_from_start =
+                Time::new::<second>(point.time_from_start.get::<second>() * factor);
+            for j in 0..N {
+                point.velocities[j] = CuJointVelocity::from_coordinate(
+                    point.positions[j],
+                    point.velocities[j].si_value() / factor,
+                );
+                point.accelerations[j] = CuJointAcceleration::from_coordinate(
+                    point.positions[j],
+                    point.accelerations[j].si_value() / (factor * factor),
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Exact `(max speed, min speed, max |acceleration|)` of a cubic or quintic
@@ -324,10 +352,7 @@ pub(crate) fn cubic_limit_ratio<const N: usize, const CAP: usize>(
                     CuJointVelocity::Prismatic(_)
                 )
             );
-            let (vmax, amax) = (
-                limits.max_velocities[j].si_value(),
-                limits.max_accelerations[j],
-            );
+            let (vmax, amax) = (limits.max_velocities[j].si_value(), limits.acc(j));
             if !kinds_agree || vmax.is_nan() || vmax <= 0.0 || amax.is_nan() || amax <= 0.0 {
                 return None;
             }
@@ -348,29 +373,4 @@ pub(crate) fn cubic_limit_ratio<const N: usize, const CAP: usize>(
         }
     }
     Some(ratio)
-}
-
-/// Stretches all knot times by `factor` and rescales velocities by `1/factor`
-/// and accelerations by `1/factor^2`, so the motion keeps its exact shape and
-/// every velocity, acceleration and jerk peak drops by `1/factor`,
-/// `1/factor^2` and `1/factor^3`. `factor` must be finite and positive.
-pub fn stretch_time<const N: usize, const CAP: usize>(
-    trajectory: &mut CuTrajectoryPayload<N, CAP>,
-    factor: f64,
-) -> CuResult<()> {
-    if !factor.is_finite() || factor <= 0.0 {
-        return Err(CuError::from("Time stretch factor must be positive"));
-    }
-    let len = trajectory.len();
-    for point in &mut trajectory.points[..len] {
-        point.time_from_start = Time::new::<second>(point.time_from_start.get::<second>() * factor);
-        for j in 0..N {
-            point.velocities[j] = CuJointVelocity::from_coordinate(
-                point.positions[j],
-                point.velocities[j].si_value() / factor,
-            );
-            point.accelerations[j] /= factor * factor;
-        }
-    }
-    Ok(())
 }

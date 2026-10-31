@@ -1,7 +1,7 @@
 //! Serde support for const-generic arrays of [`crate::CuJointEffort`]
 //! (serde's built-in array impls stop at small fixed sizes).
 
-pub mod effort_array {
+pub(crate) mod effort_array {
     use crate::CuJointEffort;
     use core::fmt;
     use serde::de::{Error as DeError, SeqAccess, Visitor};

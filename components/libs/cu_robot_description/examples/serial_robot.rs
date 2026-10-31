@@ -1,16 +1,20 @@
 //! Import a mixed revolute/prismatic serial arm and verify its planning pipeline.
 
+use cu_collision::CuCollisionEnv;
+use cu_collision::CuCollisionModelParams;
 use cu_collision::CuCollisionReport;
-use cu_collision::CuCollisionWorld;
 use cu_collision::CuPlanningScene;
 use cu_collision::CuSceneExclusions;
-use cu_joint_rrt_star::CuJointPlanRequest;
-use cu_joint_rrt_star::CuJointRrtParams;
+use cu_joint_rrt_star::CuJointRrtStar;
+use cu_joint_rrt_star::CuJointRrtStarParams;
 use cu_joint_rrt_star::CuJointRrtStarTask;
-use cu_kinematics::CuIkConfig;
+use cu_kinematics::CuIkParams;
 use cu_kinematics::CuIkStatus;
 use cu_kinematics::CuJointPosition;
+use cu_motion_planning::CuJointPlanRequest;
+use cu_motion_planning::CuJointPlanner;
 use cu_robot_description::CuRobotDescription;
+use cu_robot_description::CuSrdfImport;
 use cu_spatial_payloads::Transform3D;
 use cu29::cutask_anytime::CuAnytimeTask;
 use cu29::prelude::*;
@@ -22,8 +26,10 @@ fn main() -> CuResult<()> {
     let robot = CuRobotDescription::<2, 6>::from_urdf_srdf(
         include_str!("../tests/fixtures/serial.urdf"),
         include_str!("../tests/fixtures/serial.srdf"),
-        "manipulator",
-        Length::new::<meter>(0.005),
+        CuSrdfImport::new("manipulator").with_collision(CuCollisionModelParams {
+            safety_margin: Length::new::<meter>(0.005),
+            skip_adjacent_links: false,
+        }),
     )?;
     let mut start = [CuJointPosition::default(); 2];
     let mut goal = start;
@@ -32,39 +38,36 @@ fn main() -> CuResult<()> {
 
     // Runtime algorithms write into fixed-size caller-owned buffers.
     let mut target = Transform3D::<f64>::identity();
-    robot.chain.forward_kinematics(&goal, &mut target)?;
+    robot.chain().forward_kinematics(&goal, &mut target)?;
     let mut solution = start;
-    let status = robot.chain.inverse_kinematics_dls(
+    let status = robot.chain().inverse_kinematics_dls(
         &target,
         &start,
-        &CuIkConfig::default(),
+        &CuIkParams::default(),
         &mut solution,
     )?;
     if !matches!(status, CuIkStatus::Converged { .. }) {
         return Err(CuError::from("Example IK did not converge"));
     }
     let mut report = CuCollisionReport::<16>::default();
-    let world = CuCollisionWorld::<0>::new();
-    robot.collision_model.check_configuration(
-        &robot.chain,
-        &solution,
-        Some(&world),
-        &mut report,
-    )?;
+    let env = CuCollisionEnv::EMPTY;
+    robot
+        .collision_model()
+        .check_configuration(robot.chain(), &solution, &env, &mut report)?;
     if !report.is_collision_free() {
         return Err(CuError::from("Example IK solution is in collision"));
     }
 
-    let mut planner = CuJointRrtStarTask::new_with_planner(
-        cu_joint_rrt_star::CuJointRrtStar::new(
-            robot.chain,
-            robot.collision_model,
-            CuJointRrtParams::default(),
-        ),
+    let mut planner = CuJointRrtStarTask::from_planner(
+        CuJointRrtStar::new(
+            *robot.chain(),
+            *robot.collision_model(),
+            CuJointRrtStarParams::default(),
+        )?,
         64,
         32,
         7,
-    );
+    )?;
     let (ctx, _) = CuContext::new_mock_clock();
     let scene = CuPlanningScene::<16, 8>::new();
     let request = CuMsg::new(Some(CuJointPlanRequest {

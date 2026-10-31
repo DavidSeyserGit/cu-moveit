@@ -1,8 +1,14 @@
-//! Robot link collision models, fixed-capacity obstacle worlds, and in-place collision reports.
+//! Robot link collision models, their parameters, and in-place collision reports.
 
+use crate::env::CuCollisionEnv;
+use crate::scene_exclusions::CuSceneExclusionPartner as Partner;
+use crate::scene_exclusions::validate_exclusions;
 use crate::shapes::CuCollisionShape;
+use crate::shapes::CuLinkShape;
 use crate::shapes::shape_signed_distance;
 use crate::shapes::transform_shape;
+use CuContactKind::EnvironmentCollision;
+use CuContactKind::SelfCollision;
 use bincode::Decode;
 use bincode::Encode;
 use cu_kinematics::CuJointPosition;
@@ -44,14 +50,14 @@ pub struct CuCollisionContact {
 #[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect)]
 #[reflect(no_field_bounds, from_reflect = false, type_path = false)]
 pub struct CuCollisionReport<const MAX_CONTACTS: usize> {
-    #[serde(with = "crate::serde_arrays::collision_contact_array")]
-    pub contacts: [CuCollisionContact; MAX_CONTACTS],
+    #[serde(with = "crate::serde_arrays::contact_array")]
+    contacts: [CuCollisionContact; MAX_CONTACTS],
     /// Number of valid entries in `contacts`.
-    pub len: u32,
+    len: u32,
     /// Total detected contacts, including those exceeding storage capacity.
-    pub total_contacts: u32,
+    total_contacts: u32,
     /// Minimum surface-to-surface signed distance observed across all checked pairs.
-    pub min_signed_distance: Length64,
+    min_signed_distance: Length64,
 }
 
 impl<const MAX_CONTACTS: usize> Default for CuCollisionReport<MAX_CONTACTS> {
@@ -78,10 +84,21 @@ impl<const MAX_CONTACTS: usize> CuCollisionReport<MAX_CONTACTS> {
         self.total_contacts == 0
     }
 
-    /// Returns the recorded contacts slice `&contacts[..len]`.
+    /// Returns the stored contacts (at most `MAX_CONTACTS`).
     pub fn as_slice(&self) -> &[CuCollisionContact] {
         let count = (self.len as usize).min(MAX_CONTACTS);
         &self.contacts[..count]
+    }
+
+    /// Total detected contacts, including those that did not fit into storage.
+    pub const fn total_contacts(&self) -> usize {
+        self.total_contacts as usize
+    }
+
+    /// Minimum surface-to-surface signed distance over all checked pairs
+    /// (`+inf` when no pair was checked; negative means penetration).
+    pub const fn min_signed_distance(&self) -> Length64 {
+        self.min_signed_distance
     }
 
     fn push_contact(&mut self, contact: CuCollisionContact) {
@@ -94,64 +111,57 @@ impl<const MAX_CONTACTS: usize> CuCollisionReport<MAX_CONTACTS> {
     }
 }
 
-/// Fixed-capacity environment obstacle world (`CuMsgPayload`-compliant).
-#[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
-pub struct CuCollisionWorld<const MAX_OBSTACLES: usize> {
-    #[serde(with = "crate::serde_arrays::collision_shape_array")]
-    pub obstacles: [CuCollisionShape; MAX_OBSTACLES],
-    /// Number of active obstacles in `obstacles[..len]`.
-    pub len: u32,
+/// Parameters of a [`CuRobotCollisionModel`].
+///
+/// ```ron
+/// {"safety_margin": 0.005, "skip_adjacent_links": true}
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Reflect)]
+#[serde(default, deny_unknown_fields)]
+pub struct CuCollisionModelParams {
+    /// Minimum surface distance for a pair to count as collision-free (finite, `>= 0`).
+    pub safety_margin: Length64,
+    /// Disable self-collision pairs between shapes on adjacent joint frames
+    /// (`Some(i)` and `Some(i ± 1)`). Shapes on the same frame are never checked against each
+    /// other regardless of this flag.
+    pub skip_adjacent_links: bool,
 }
 
-impl<const MAX_OBSTACLES: usize> Default for CuCollisionWorld<MAX_OBSTACLES> {
+impl Default for CuCollisionModelParams {
     fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<const MAX_OBSTACLES: usize> CuCollisionWorld<MAX_OBSTACLES> {
-    /// Creates an empty obstacle world.
-    pub fn new() -> Self {
         Self {
-            obstacles: [CuCollisionShape::default(); MAX_OBSTACLES],
-            len: 0,
+            safety_margin: Length64::new::<meter>(0.0),
+            skip_adjacent_links: true,
         }
-    }
-
-    /// Clears all obstacles in place.
-    pub fn clear(&mut self) {
-        self.len = 0;
-    }
-
-    /// Appends an obstacle to the world if capacity permits.
-    pub fn add_obstacle(&mut self, shape: CuCollisionShape) -> CuResult<u16> {
-        let idx = self.len as usize;
-        if idx >= MAX_OBSTACLES {
-            return Err(CuError::from(
-                "cu_collision: obstacle world capacity exceeded",
-            ));
-        }
-        self.obstacles[idx] = shape;
-        self.len += 1;
-        Ok(idx as u16)
-    }
-
-    /// Borrows the active obstacles slice.
-    pub fn as_slice(&self) -> &[CuCollisionShape] {
-        let count = (self.len as usize).min(MAX_OBSTACLES);
-        &self.obstacles[..count]
     }
 }
 
-/// Fixed-capacity model for `N` movable frames and up to `M` attached collision shapes.
+impl CuCollisionModelParams {
+    /// Checks that the safety margin is finite and non-negative.
+    pub fn validate(&self) -> CuResult<()> {
+        validate_margin(self.safety_margin)
+    }
+}
+
+fn validate_margin(margin: Length64) -> CuResult<()> {
+    let m = margin.get::<meter>();
+    if m.is_finite() && m >= 0.0 {
+        Ok(())
+    } else {
+        Err(CuError::from("cu_collision: invalid safety margin"))
+    }
+}
+
+/// Fixed-capacity model for `N` movable frames and up to `M` collision shapes.
+///
+/// Each shape is a [`CuLinkShape`] on a joint frame or the base. Shape indices identify contacts
+/// and collision pairs; several shapes may share a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Reflect)]
 #[reflect(no_field_bounds, from_reflect = false, type_path = false)]
 pub struct CuRobotCollisionModel<const N: usize, const M: usize = N> {
-    link_shapes: [CuCollisionShape; M],
+    shapes: [CuLinkShape; M],
     safety_margin: Length64,
     check_pair: [[bool; M]; M],
-    frame_indices: [Option<usize>; M],
     len: usize,
 }
 
@@ -161,10 +171,9 @@ impl<const N: usize, const M: usize> Encode for CuRobotCollisionModel<N, M> {
         &self,
         encoder: &mut E,
     ) -> Result<(), bincode::error::EncodeError> {
-        Encode::encode(&self.link_shapes, encoder)?;
+        Encode::encode(&self.shapes, encoder)?;
         Encode::encode(&self.safety_margin, encoder)?;
         Encode::encode(&self.check_pair, encoder)?;
-        Encode::encode(&self.frame_indices, encoder)?;
         Encode::encode(&self.len, encoder)
     }
 }
@@ -173,18 +182,12 @@ impl<C, const N: usize, const M: usize> Decode<C> for CuRobotCollisionModel<N, M
         decoder: &mut D,
     ) -> Result<Self, bincode::error::DecodeError> {
         let model = Self {
-            link_shapes: Decode::decode(decoder)?,
+            shapes: Decode::decode(decoder)?,
             safety_margin: Decode::decode(decoder)?,
             check_pair: Decode::decode(decoder)?,
-            frame_indices: Decode::decode(decoder)?,
             len: Decode::decode(decoder)?,
         };
-        if model.len > M
-            || model.frame_indices[..model.len]
-                .iter()
-                .flatten()
-                .any(|&i| i >= N)
-        {
+        if model.len > M || model.link_shapes().iter().any(|s| s.frame >= Some(N)) {
             return Err(bincode::error::DecodeError::Other(
                 "Invalid collision model snapshot",
             ));
@@ -203,103 +206,53 @@ impl<'de, C, const N: usize, const M: usize> bincode::BorrowDecode<'de, C>
     }
 }
 
-#[derive(Deserialize)]
-struct CollisionModelConfig<const M: usize> {
-    #[serde(with = "crate::serde_arrays::collision_shape_array")]
-    link_shapes: [CuCollisionShape; M],
-    safety_margin: Length64,
-    #[serde(default)]
-    frame_indices: Option<FrameIndices<M>>,
-}
-
-#[derive(Deserialize)]
-struct FrameIndices<const M: usize>(
-    #[serde(with = "crate::serde_arrays::frame_index_array")] [Option<usize>; M],
-);
-
-impl<const N: usize> CuRobotCollisionModel<N> {
-    /// Creates a robot collision model from per-link local shapes and a safety margin.
-    ///
-    /// By default, all non-adjacent link pairs (`|i - j| > 1`) are enabled for self-collision checking.
-    pub fn new(link_shapes: [CuCollisionShape; N], safety_margin: Length64) -> Self {
-        let mut check_pair = [[false; N]; N];
-        let mut i = 0;
-        while i < N {
-            let mut j = i + 2;
-            while j < N {
-                check_pair[i][j] = true;
-                check_pair[j][i] = true;
-                j += 1;
-            }
-            i += 1;
-        }
-        Self {
-            link_shapes,
-            safety_margin,
-            check_pair,
-            frame_indices: core::array::from_fn(Some),
-            len: N,
-        }
-    }
-}
-
 impl<const N: usize, const M: usize> CuRobotCollisionModel<N, M> {
-    /// Loads a collision model. Without `frame_indices`, each shape attaches to the same-index joint.
-    pub fn from_config(config: Option<&ComponentConfig>) -> CuResult<Self> {
-        let config =
-            config.ok_or_else(|| CuError::from("Missing collision model configuration"))?;
-        let model = config
-            .get_value::<CollisionModelConfig<M>>("collision_model")?
-            .ok_or_else(|| CuError::from("Missing required collision_model configuration"))?;
-        let frames = model
-            .frame_indices
-            .map_or_else(|| core::array::from_fn(Some), |v| v.0);
-        let mut out = Self::new_attached(model.link_shapes, frames, M, model.safety_margin)?;
-        for i in 0..M {
-            for j in i + 1..M {
-                if let (Some(a), Some(b)) = (frames[i], frames[j])
-                    && a.abs_diff(b) == 1
-                {
-                    out.set_pair_enabled(i, j, false)?;
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    /// Creates a fixed-capacity model with shapes attached to joint frames or the base (`None`).
-    /// Shape indices identify contacts and collision pairs; several shapes may share a frame.
-    pub fn new_attached(
-        shapes: [CuCollisionShape; M],
-        frames: [Option<usize>; M],
-        len: usize,
-        safety_margin: Length64,
-    ) -> CuResult<Self> {
-        if len > M
-            || M > u16::MAX as usize
-            || frames[..len].iter().flatten().any(|&i| i >= N)
-            || !safety_margin.get::<meter>().is_finite()
-            || safety_margin.get::<meter>() < 0.0
-        {
+    /// Creates a model from up to `M` link shapes.
+    ///
+    /// Self-collision is checked between every pair of shapes on different frames, except
+    /// adjacent joint frames when `params.skip_adjacent_links` is set. Use
+    /// [`set_pair_enabled`](Self::set_pair_enabled) for further adjustments.
+    ///
+    /// Fails if more than `M` shapes are given, a frame index is `>= N`, a shape has invalid
+    /// geometry, or the params are invalid.
+    pub fn new(shapes: &[CuLinkShape], params: CuCollisionModelParams) -> CuResult<Self> {
+        params.validate()?;
+        if shapes.len() > M || M > u16::MAX as usize {
             return Err(CuError::from(
-                "Invalid collision attachments, capacity, or margin",
+                "cu_collision: collision model shape count exceeds capacity",
             ));
         }
+        if shapes.iter().any(|s| s.frame >= Some(N)) {
+            return Err(CuError::from(
+                "cu_collision: collision model frame index out of range",
+            ));
+        }
+        for s in shapes {
+            s.shape.validate()?;
+        }
+        Ok(Self::assemble(shapes, params))
+    }
+
+    /// Builds the model from already validated inputs.
+    pub(crate) fn assemble(shapes: &[CuLinkShape], params: CuCollisionModelParams) -> Self {
         let mut model = Self {
-            link_shapes: shapes,
-            frame_indices: frames,
-            len,
-            safety_margin,
+            shapes: [CuLinkShape::default(); M],
+            safety_margin: params.safety_margin,
             check_pair: [[false; M]; M],
+            len: shapes.len(),
         };
-        for i in 0..len {
-            for j in i + 1..len {
+        model.shapes[..shapes.len()].copy_from_slice(shapes);
+        for i in 0..shapes.len() {
+            for j in i + 1..shapes.len() {
+                let (a, b) = (shapes[i].frame, shapes[j].frame);
                 // Shapes on the same rigid body cannot move relative to one another.
-                model.check_pair[i][j] = frames[i] != frames[j];
-                model.check_pair[j][i] = frames[i] != frames[j];
+                let adjacent = matches!((a, b), (Some(a), Some(b)) if a.abs_diff(b) == 1);
+                let enabled = a != b && !(params.skip_adjacent_links && adjacent);
+                model.check_pair[i][j] = enabled;
+                model.check_pair[j][i] = enabled;
             }
         }
-        Ok(model)
+        model
     }
 
     /// Number of active collision shapes.
@@ -307,9 +260,9 @@ impl<const N: usize, const M: usize> CuRobotCollisionModel<N, M> {
         self.len
     }
 
-    /// Borrows shape storage. Only the first `shape_count()` entries are active.
-    pub const fn link_shapes(&self) -> &[CuCollisionShape; M] {
-        &self.link_shapes
+    /// Borrows the active link shapes.
+    pub fn link_shapes(&self) -> &[CuLinkShape] {
+        &self.shapes[..self.len]
     }
 
     /// Returns the configured safety margin.
@@ -318,8 +271,10 @@ impl<const N: usize, const M: usize> CuRobotCollisionModel<N, M> {
     }
 
     /// Sets the safety margin required for a pair to be considered collision-free.
-    pub fn set_safety_margin(&mut self, safety_margin: Length64) {
+    pub fn set_safety_margin(&mut self, safety_margin: Length64) -> CuResult<()> {
+        validate_margin(safety_margin)?;
         self.safety_margin = safety_margin;
+        Ok(())
     }
 
     /// Enables or disables self-collision checking between two shape indices.
@@ -345,178 +300,94 @@ impl<const N: usize, const M: usize> CuRobotCollisionModel<N, M> {
         self.check_pair[link_a][link_b]
     }
 
-    /// Transforms all local link shapes into world coordinates in place using `link_frames`.
+    /// Transforms the active link shapes into world coordinates in place using `link_frames`.
+    /// Only the first [`shape_count`](Self::shape_count) entries of `out_shapes` are written.
     pub fn world_link_shapes(
         &self,
         link_frames: &[Transform3D<f64>; N],
         out_shapes: &mut [CuCollisionShape; M],
     ) {
-        let mut i = 0;
-        while i < self.len {
-            if let Some(frame) = self.frame_indices[i] {
-                transform_shape(
-                    &link_frames[frame],
-                    &self.link_shapes[i],
-                    &mut out_shapes[i],
-                );
-            } else {
-                out_shapes[i] = self.link_shapes[i];
-            }
-            i += 1;
+        for (link, out) in self.link_shapes().iter().zip(out_shapes.iter_mut()) {
+            *out = world_shape(link_frames, link.frame, &link.shape);
         }
     }
 
-    /// Evaluates self-collision and optional environment collision for precomputed `link_frames`,
-    /// writing contacts and minimum signed distance into `out_report`.
-    pub fn check_frames<const MAX_OBS: usize, const MAX_CONTACTS: usize>(
+    /// Evaluates self-collision and `env` (obstacles, attached shapes, exclusions) for
+    /// precomputed `link_frames`, writing contacts and the minimum signed distance into
+    /// `out_report` (cleared first).
+    ///
+    /// Fails, leaving `out_report` unmodified, if `env` is invalid for this model (see
+    /// [`CuCollisionEnv`]).
+    pub fn check_frames<const MAX_CONTACTS: usize>(
         &self,
         link_frames: &[Transform3D<f64>; N],
-        world: Option<&CuCollisionWorld<MAX_OBS>>,
+        env: &CuCollisionEnv<'_>,
         out_report: &mut CuCollisionReport<MAX_CONTACTS>,
-    ) {
+    ) -> CuResult<()> {
+        self.validate_env(env)?;
         out_report.clear();
-
-        let mut world_shapes = [CuCollisionShape::default(); M];
-        self.world_link_shapes(link_frames, &mut world_shapes);
-
         let margin_m = self.safety_margin.get::<meter>();
         let mut min_dist_m = f64::INFINITY;
-
-        // 1. Self-collision checks
-        let mut i = 0;
-        while i < self.len {
-            let mut j = i + 1;
-            while j < self.len {
-                if self.check_pair[i][j] {
-                    let dist = shape_signed_distance(&world_shapes[i], &world_shapes[j]);
-                    let d_m = dist.get::<meter>();
-                    if d_m < min_dist_m {
-                        min_dist_m = d_m;
-                    }
-                    if d_m < margin_m {
-                        out_report.push_contact(CuCollisionContact {
-                            kind: CuContactKind::SelfCollision,
-                            link_index: i as u16,
-                            partner_index: j as u16,
-                            signed_distance: dist,
-                        });
-                    }
-                }
-                j += 1;
+        self.visit_pairs(link_frames, env, |contact| {
+            let d_m = contact.signed_distance.get::<meter>();
+            min_dist_m = min_dist_m.min(d_m);
+            if d_m < margin_m {
+                out_report.push_contact(contact);
             }
-            i += 1;
-        }
-
-        // 2. Environment collision checks
-        if let Some(world) = world {
-            let obs_slice = world.as_slice();
-            let mut link_idx = 0;
-            while link_idx < self.len {
-                let mut obs_idx = 0;
-                while obs_idx < obs_slice.len() {
-                    let dist = shape_signed_distance(&world_shapes[link_idx], &obs_slice[obs_idx]);
-                    let d_m = dist.get::<meter>();
-                    if d_m < min_dist_m {
-                        min_dist_m = d_m;
-                    }
-                    if d_m < margin_m {
-                        out_report.push_contact(CuCollisionContact {
-                            kind: CuContactKind::EnvironmentCollision,
-                            link_index: link_idx as u16,
-                            partner_index: obs_idx as u16,
-                            signed_distance: dist,
-                        });
-                    }
-                    obs_idx += 1;
-                }
-                link_idx += 1;
-            }
-        }
-
+            true
+        });
         out_report.min_signed_distance = Length64::new::<meter>(min_dist_m);
+        Ok(())
     }
 
-    /// Evaluates forward frames for joint angles `q` and populates `out_report` in place.
-    pub fn check_configuration<const MAX_OBS: usize, const MAX_CONTACTS: usize>(
+    /// Runs forward kinematics for `q` and calls [`check_frames`](Self::check_frames).
+    pub fn check_configuration<const MAX_CONTACTS: usize>(
         &self,
         chain: &CuKinematicChain<N>,
         q: &[CuJointPosition; N],
-        world: Option<&CuCollisionWorld<MAX_OBS>>,
+        env: &CuCollisionEnv<'_>,
         out_report: &mut CuCollisionReport<MAX_CONTACTS>,
     ) -> CuResult<()> {
         let mut frames = [Transform3D::<f64>::identity(); N];
         let mut ee = Transform3D::<f64>::identity();
         chain.forward_frames(q, &mut frames, &mut ee)?;
-        self.check_frames(&frames, world, out_report);
-        Ok(())
+        self.check_frames(&frames, env, out_report)
     }
 
-    /// Fast early-exit predicate returning `true` if joint configuration `q` is within joint limits
-    /// and free of both self-collision and environment collision.
-    pub fn is_configuration_collision_free<const MAX_OBS: usize>(
+    /// Early-exit predicate: `true` if `q` is within joint limits and no checked pair (self,
+    /// environment, attached) violates the safety margin.
+    pub fn is_configuration_collision_free(
         &self,
         chain: &CuKinematicChain<N>,
         q: &[CuJointPosition; N],
-        world: Option<&CuCollisionWorld<MAX_OBS>>,
+        env: &CuCollisionEnv<'_>,
     ) -> CuResult<bool> {
+        self.validate_env(env)?;
         if !chain.is_within_limits(q) {
             return Ok(false);
         }
         let mut frames = [Transform3D::<f64>::identity(); N];
         let mut ee = Transform3D::<f64>::identity();
         chain.forward_frames(q, &mut frames, &mut ee)?;
-
-        let mut world_shapes = [CuCollisionShape::default(); M];
-        self.world_link_shapes(&frames, &mut world_shapes);
-
         let margin_m = self.safety_margin.get::<meter>();
-
-        let mut i = 0;
-        while i < self.len {
-            let mut j = i + 1;
-            while j < self.len {
-                if self.check_pair[i][j]
-                    && shape_signed_distance(&world_shapes[i], &world_shapes[j]).get::<meter>()
-                        < margin_m
-                {
-                    return Ok(false);
-                }
-                j += 1;
-            }
-            i += 1;
-        }
-
-        if let Some(world) = world {
-            let obs_slice = world.as_slice();
-            let mut link_idx = 0;
-            while link_idx < self.len {
-                let mut obs_idx = 0;
-                while obs_idx < obs_slice.len() {
-                    if shape_signed_distance(&world_shapes[link_idx], &obs_slice[obs_idx])
-                        .get::<meter>()
-                        < margin_m
-                    {
-                        return Ok(false);
-                    }
-                    obs_idx += 1;
-                }
-                link_idx += 1;
-            }
-        }
-
-        Ok(true)
+        let mut free = true;
+        self.visit_pairs(&frames, env, |contact| {
+            free = contact.signed_distance.get::<meter>() >= margin_m;
+            free
+        });
+        Ok(free)
     }
 
     /// Checks whether the linearly interpolated joint-space segment from `q_start` to `q_end`
-    /// is collision-free at the configured angular and linear sampling resolution.
+    /// is collision-free at the given angular and linear sampling resolution.
     /// This is discrete sampling, not swept-volume continuous collision detection.
-    pub fn is_segment_collision_free<const MAX_OBS: usize>(
+    pub fn is_segment_collision_free(
         &self,
         chain: &CuKinematicChain<N>,
         q_start: &[CuJointPosition; N],
         q_end: &[CuJointPosition; N],
         max_step: impl Into<CuJointResolution>,
-        world: Option<&CuCollisionWorld<MAX_OBS>>,
+        env: &CuCollisionEnv<'_>,
     ) -> CuResult<bool> {
         let metric = max_step.into().metric();
         metric.validate()?;
@@ -528,24 +399,138 @@ impl<const N: usize, const M: usize> CuRobotCollisionModel<N, M> {
                 max_delta.max((metric.normalized(q_end[j]) - metric.normalized(q_start[j])).abs());
         }
         // Bound per-call work, including adversarial/non-finite inputs.
-        if max_delta > 1_000_000.0 {
+        if max_delta.is_nan() || max_delta > 1_000_000.0 {
             return Err(CuError::from("Collision segment requires too many samples"));
         }
         let steps = (libm::ceil(max_delta) as usize).max(1);
-        let mut s = 0;
-        while s <= steps {
+        for s in 0..=steps {
             let alpha = (s as f64) / (steps as f64);
             let mut q_interp = [CuJointPosition::default(); N];
-            let mut k = 0;
-            while k < N {
+            for k in 0..N {
                 q_interp[k] = q_start[k].interpolate(q_end[k], alpha)?;
-                k += 1;
             }
-            if !self.is_configuration_collision_free(chain, &q_interp, world)? {
+            if !self.is_configuration_collision_free(chain, &q_interp, env)? {
                 return Ok(false);
             }
-            s += 1;
         }
         Ok(true)
+    }
+
+    /// Checks that `env` can be evaluated against this model.
+    fn validate_env(&self, env: &CuCollisionEnv<'_>) -> CuResult<()> {
+        if env.obstacles().len() > u16::MAX as usize
+            || self.len + env.attached().len() > u16::MAX as usize
+        {
+            return Err(CuError::from(
+                "cu_collision: scene query shape count out of range",
+            ));
+        }
+        if env.attached().iter().any(|a| a.frame >= Some(N)) {
+            return Err(CuError::from(
+                "cu_collision: attached shape frame out of range",
+            ));
+        }
+        validate_exclusions(env.exclusions(), env, self.len)
+    }
+
+    /// Visits every checked pair in a fixed order (robot self, robot vs. obstacles, attached vs.
+    /// attached, attached vs. robot, attached vs. obstacles); `visit` returns `false` to stop.
+    fn visit_pairs(
+        &self,
+        link_frames: &[Transform3D<f64>; N],
+        env: &CuCollisionEnv<'_>,
+        mut visit: impl FnMut(CuCollisionContact) -> bool,
+    ) {
+        let mut robot = [CuCollisionShape::default(); M];
+        self.world_link_shapes(link_frames, &mut robot);
+        let robot = &robot[..self.len];
+        let obstacles = env.obstacles();
+        let attached = env.attached();
+        let robot_count = robot.len();
+        let mut emit =
+            |kind, link: usize, partner: usize, a: &CuCollisionShape, b: &CuCollisionShape| {
+                visit(CuCollisionContact {
+                    kind,
+                    link_index: link as u16,
+                    partner_index: partner as u16,
+                    signed_distance: shape_signed_distance(a, b),
+                })
+            };
+
+        for i in 0..robot_count {
+            for j in i + 1..robot_count {
+                if self.check_pair[i][j] && !emit(SelfCollision, i, j, &robot[i], &robot[j]) {
+                    return;
+                }
+            }
+        }
+        for (i, r) in robot.iter().enumerate() {
+            for (o, obstacle) in obstacles.iter().enumerate() {
+                if !emit(EnvironmentCollision, i, o, r, obstacle) {
+                    return;
+                }
+            }
+        }
+        for (i, att) in attached.iter().enumerate() {
+            let w = world_shape(link_frames, att.frame, &att.shape);
+            let link = robot_count + i;
+            for (j, other) in attached.iter().enumerate().skip(i + 1) {
+                // Equal frames (including `None == None`) are one rigid body.
+                if att.frame == other.frame
+                    || env.is_excluded(
+                        att.id,
+                        Partner::Attached {
+                            attached_id: other.id,
+                        },
+                    )
+                {
+                    continue;
+                }
+                let wo = world_shape(link_frames, other.frame, &other.shape);
+                if !emit(SelfCollision, link, robot_count + j, &w, &wo) {
+                    return;
+                }
+            }
+        }
+        for (i, att) in attached.iter().enumerate() {
+            let w = world_shape(link_frames, att.frame, &att.shape);
+            let link = robot_count + i;
+            for (r, shape) in robot.iter().enumerate() {
+                let partner = Partner::RobotShape {
+                    shape_index: r as u16,
+                };
+                if !env.is_excluded(att.id, partner) && !emit(SelfCollision, link, r, &w, shape) {
+                    return;
+                }
+            }
+        }
+        for (i, att) in attached.iter().enumerate() {
+            let w = world_shape(link_frames, att.frame, &att.shape);
+            let link = robot_count + i;
+            for (o, obstacle) in obstacles.iter().enumerate() {
+                let excluded = env.obstacle_id(o).is_some_and(|obstacle_id| {
+                    env.is_excluded(att.id, Partner::Obstacle { obstacle_id })
+                });
+                if !excluded && !emit(EnvironmentCollision, link, o, &w, obstacle) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// World-space copy of `shape` expressed in `frame` (`None` = base, unchanged).
+fn world_shape<const N: usize>(
+    link_frames: &[Transform3D<f64>; N],
+    frame: Option<usize>,
+    shape: &CuCollisionShape,
+) -> CuCollisionShape {
+    match frame {
+        Some(f) => {
+            let mut out = *shape;
+            transform_shape(&link_frames[f], shape, &mut out);
+            out
+        }
+        None => *shape,
     }
 }

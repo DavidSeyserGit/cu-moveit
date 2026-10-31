@@ -1,37 +1,51 @@
 //! Fixed-capacity joint-space trajectory payload and allocation-free sampling.
 //!
-//! [`CuTrajectoryPayload`] stores up to `MAX_POINTS` timestamped joint waypoints.
-//! [`CuTrajectoryPayload::sample`] interpolates joint positions and velocities
-//! in place into caller-provided buffers without allocating.
+//! [`CuTrajectoryPayload`] stores up to `MAX_POINTS` timestamped joint waypoints
+//! and the [`CuTrajectoryInterpolation`] that reconstructs the motion between
+//! them. [`CuTrajectoryPayload::sample`] interpolates joint positions and
+//! velocities in place into caller-provided buffers without allocating.
+//!
+//! Joint-space waypoints are timed with [`parameterize`]; Cartesian paths are
+//! built with [`blend_cartesian_path`] and timed with
+//! [`parameterize_cartesian_path`]. Both timing functions share
+//! [`CuTimingParams`] and report a [`CuTimingStatus`], and both set the
+//! payload's interpolation so [`CuFollowTrajectoryTask`] executes the motion
+//! that was validated.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
-#[cfg(not(feature = "std"))]
-extern crate alloc;
-
-pub mod cartesian_blend;
-pub mod parameterize;
-pub mod path_timing;
-pub mod quintic;
-pub mod serde_arrays;
-pub mod task;
+mod cartesian_blend;
+mod parameterize;
+mod path_timing;
+mod quintic;
+mod serde_arrays;
+mod task;
 #[cfg(test)]
 mod test_support;
 
+pub use cartesian_blend::CuCartesianBlendParams;
+pub use cartesian_blend::CuCartesianBlendPath;
+pub use cartesian_blend::CuCartesianBlendStatus;
+pub use cartesian_blend::CuCartesianPathPoint;
+pub use cartesian_blend::CuCartesianWaypoint;
+pub use cartesian_blend::CuTcpZone;
+pub use cartesian_blend::blend_cartesian_path;
+pub use parameterize::CuJointTrajectoryLimits;
+pub use parameterize::CuTimingOverrides;
+pub use parameterize::CuTimingParams;
+pub use parameterize::CuTimingStatus;
+pub use parameterize::CuTrajectoryProfile;
+pub use parameterize::parameterize;
+pub use path_timing::CuPathTimingParams;
+pub use path_timing::parameterize_cartesian_path;
 pub use task::CuFollowStatus;
+pub use task::CuFollowTrajectoryParams;
 pub use task::CuFollowTrajectoryTask;
 pub use task::CuTrajectoryFollowOutput;
-pub use task::CuTrajectoryInterpolation;
-
-pub use parameterize::CuJointTrajectoryLimits;
-pub use parameterize::CuParameterizeStatus;
-pub use parameterize::CuTrajectoryProfile;
-pub use parameterize::CuTrajectoryTiming;
-pub use parameterize::parameterize_trajectory;
-pub use parameterize::parameterize_with_profile;
 
 use bincode::Decode;
 use bincode::Encode;
+use cu_kinematics::CuJointAcceleration;
 use cu_kinematics::CuJointPosition;
 use cu_kinematics::CuJointVelocity;
 use cu29::prelude::*;
@@ -57,12 +71,12 @@ pub struct CuTrajectoryPoint<const N: usize> {
     pub positions: [CuJointPosition; N],
     #[serde(with = "cu_kinematics::serde_arrays::velocity_array")]
     pub velocities: [CuJointVelocity; N],
-    /// Joint accelerations in SI units (`rad/s^2` revolute, `m/s^2` prismatic).
+    /// Joint accelerations (`rad/s^2` revolute, `m/s^2` prismatic).
     ///
     /// Only [`CuTrajectoryPayload::sample_quintic`] reads them; trajectories
     /// that rest at, or have zero acceleration at, every waypoint store zero.
-    #[serde(with = "crate::serde_arrays::f64_array")]
-    pub accelerations: [f64; N],
+    #[serde(with = "cu_kinematics::serde_arrays::acceleration_array")]
+    pub accelerations: [CuJointAcceleration; N],
 }
 
 impl<const N: usize> Default for CuTrajectoryPoint<N> {
@@ -71,9 +85,31 @@ impl<const N: usize> Default for CuTrajectoryPoint<N> {
             time_from_start: Time::default(),
             positions: [CuJointPosition::default(); N],
             velocities: [CuJointVelocity::default(); N],
-            accelerations: [0.0; N],
+            accelerations: [CuJointAcceleration::default(); N],
         }
     }
+}
+
+/// Reconstruction of the motion between stored trajectory points.
+///
+/// Stored on every [`CuTrajectoryPayload`] (set by the parameterizer that
+/// produced it) and used by [`CuTrajectoryPayload::sample`].
+#[derive(
+    Default, Debug, Clone, Copy, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CuTrajectoryInterpolation {
+    /// Positions and velocities are interpolated linearly
+    /// ([`CuTrajectoryPayload::sample_linear`]).
+    #[default]
+    Linear,
+    /// Position and velocity are reconstructed using cubic Hermite interpolation
+    /// ([`CuTrajectoryPayload::sample_cubic`]).
+    Cubic,
+    /// Position and velocity are reconstructed with the quintic Hermite motion
+    /// through the stored positions, velocities and accelerations
+    /// ([`CuTrajectoryPayload::sample_quintic`]).
+    Quintic,
 }
 
 /// Fixed-capacity timestamped joint trajectory (`CuMsgPayload`-compliant).
@@ -84,6 +120,12 @@ pub struct CuTrajectoryPayload<const N: usize, const MAX_POINTS: usize = MAX_TRA
     pub points: [CuTrajectoryPoint<N>; MAX_POINTS],
     /// Number of valid waypoints in `points[..len]`.
     pub len: u32,
+    /// How [`CuTrajectoryPayload::sample`] reconstructs the motion between
+    /// points. [`parameterize`] and [`parameterize_cartesian_path`] set it to
+    /// the reconstruction their limits were validated on; hand-built
+    /// trajectories default to [`CuTrajectoryInterpolation::Linear`].
+    #[serde(default)]
+    pub interpolation: CuTrajectoryInterpolation,
 }
 
 // The bincode derive currently emits invalid impl generics for const defaults.
@@ -93,7 +135,8 @@ impl<const N: usize, const MAX_POINTS: usize> Encode for CuTrajectoryPayload<N, 
         encoder: &mut E,
     ) -> Result<(), bincode::error::EncodeError> {
         Encode::encode(&self.points, encoder)?;
-        Encode::encode(&self.len, encoder)
+        Encode::encode(&self.len, encoder)?;
+        Encode::encode(&self.interpolation, encoder)
     }
 }
 impl<C, const N: usize, const MAX_POINTS: usize> Decode<C> for CuTrajectoryPayload<N, MAX_POINTS> {
@@ -103,6 +146,7 @@ impl<C, const N: usize, const MAX_POINTS: usize> Decode<C> for CuTrajectoryPaylo
         Ok(Self {
             points: Decode::decode(decoder)?,
             len: Decode::decode(decoder)?,
+            interpolation: Decode::decode(decoder)?,
         })
     }
 }
@@ -123,11 +167,12 @@ impl<const N: usize, const MAX_POINTS: usize> Default for CuTrajectoryPayload<N,
 }
 
 impl<const N: usize, const MAX_POINTS: usize> CuTrajectoryPayload<N, MAX_POINTS> {
-    /// Creates an empty trajectory.
+    /// Creates an empty trajectory with [`CuTrajectoryInterpolation::Linear`].
     pub fn new() -> Self {
         Self {
             points: core::array::from_fn(|_| CuTrajectoryPoint::default()),
             len: 0,
+            interpolation: CuTrajectoryInterpolation::Linear,
         }
     }
 
@@ -172,19 +217,53 @@ impl<const N: usize, const MAX_POINTS: usize> CuTrajectoryPayload<N, MAX_POINTS>
         Ok(())
     }
 
-    /// Drops all waypoints.
+    /// Drops all waypoints; the interpolation is kept.
     pub fn clear(&mut self) {
         self.len = 0;
     }
 
-    /// Samples joint positions and velocities at `t` in place.
+    /// Samples joint positions and velocities at `t` in place with the
+    /// payload's [`interpolation`](Self::interpolation).
     ///
-    /// Linear interpolation between the bracketing waypoints (v1; cubic
-    /// interpolation arrives with the time-parameterization slice). `t` is
-    /// clamped to `[0, duration]`; sampling before the first or after the last
-    /// waypoint holds that endpoint. Errors on an empty trajectory or on
-    /// mismatched joint coordinate types.
+    /// Dispatches to [`sample_linear`](Self::sample_linear),
+    /// [`sample_cubic`](Self::sample_cubic) or
+    /// [`sample_quintic`](Self::sample_quintic). Sampling before the first or
+    /// after the last waypoint holds that endpoint.
     pub fn sample(
+        &self,
+        t: Time,
+        out_positions: &mut [CuJointPosition; N],
+        out_velocities: &mut [CuJointVelocity; N],
+    ) -> CuResult<()> {
+        self.sample_with(self.interpolation, t, out_positions, out_velocities)
+    }
+
+    /// Samples at `t` with an explicit `interpolation`, ignoring the payload's.
+    pub fn sample_with(
+        &self,
+        interpolation: CuTrajectoryInterpolation,
+        t: Time,
+        out_positions: &mut [CuJointPosition; N],
+        out_velocities: &mut [CuJointVelocity; N],
+    ) -> CuResult<()> {
+        match interpolation {
+            CuTrajectoryInterpolation::Linear => {
+                self.sample_linear(t, out_positions, out_velocities)
+            }
+            CuTrajectoryInterpolation::Cubic => self.sample_cubic(t, out_positions, out_velocities),
+            CuTrajectoryInterpolation::Quintic => {
+                self.sample_quintic(t, out_positions, out_velocities)
+            }
+        }
+    }
+
+    /// Samples joint positions and velocities at `t` in place by linear
+    /// interpolation between the bracketing waypoints.
+    ///
+    /// `t` is clamped to `[0, duration]`; sampling before the first or after
+    /// the last waypoint holds that endpoint. Errors on an empty trajectory or
+    /// on mismatched joint coordinate types.
+    pub fn sample_linear(
         &self,
         t: Time,
         out_positions: &mut [CuJointPosition; N],
@@ -240,8 +319,10 @@ impl<const N: usize, const MAX_POINTS: usize> CuTrajectoryPayload<N, MAX_POINTS>
 
     /// Samples cubic Hermite interpolation using the stored positions and velocities.
     ///
-    /// Use this for trajectories generated by `parameterize_cartesian_path`;
-    /// it preserves the continuous position and velocity at each stored knot.
+    /// [`parameterize`] and the non-S-curve profiles of
+    /// [`parameterize_cartesian_path`] validate their limits on this
+    /// reconstruction; it preserves the continuous position and velocity at
+    /// each stored knot.
     pub fn sample_cubic(
         &self,
         t: Time,
@@ -313,9 +394,8 @@ impl<const N: usize, const MAX_POINTS: usize> CuTrajectoryPayload<N, MAX_POINTS>
     ///
     /// Each segment is the quintic matching position, velocity and
     /// acceleration at both knots, so all three are continuous across the
-    /// trajectory and jerk is finite. Use this to execute trajectories from
-    /// `parameterize_cartesian_path` with the S-curve profile, whose limits
-    /// are verified on exactly this reconstruction. Sampling before the first
+    /// trajectory and jerk is finite. [`parameterize_cartesian_path`] with the
+    /// S-curve profile verifies its limits on exactly this reconstruction. Sampling before the first
     /// or after the last knot holds that endpoint.
     pub fn sample_quintic(
         &self,
@@ -382,7 +462,7 @@ impl<const N: usize, const MAX_POINTS: usize> CuTrajectoryPayload<N, MAX_POINTS>
             let quintic = quintic::Quintic::new(
                 [a.positions[j].si_value(), b.positions[j].si_value()],
                 [a.velocities[j].si_value(), b.velocities[j].si_value()],
-                [a.accelerations[j], b.accelerations[j]],
+                [a.accelerations[j].si_value(), b.accelerations[j].si_value()],
                 duration,
             );
             let (q, v, _) = quintic.eval(u);
@@ -510,5 +590,66 @@ mod tests {
             traj.sample(Time::new::<second>(0.0), &mut q, &mut qd)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn test_sample_dispatches_on_payload_interpolation() {
+        let mut traj = two_point_traj();
+        let mut q = [CuJointPosition::default(); 1];
+        let mut qd = [CuJointVelocity::default(); 1];
+        let mut q2 = q;
+        let mut qd2 = qd;
+        let t = Time::new::<second>(1.0);
+        for interpolation in [
+            CuTrajectoryInterpolation::Linear,
+            CuTrajectoryInterpolation::Cubic,
+            CuTrajectoryInterpolation::Quintic,
+        ] {
+            traj.interpolation = interpolation;
+            traj.sample(t, &mut q, &mut qd).unwrap();
+            match interpolation {
+                CuTrajectoryInterpolation::Linear => traj.sample_linear(t, &mut q2, &mut qd2),
+                CuTrajectoryInterpolation::Cubic => traj.sample_cubic(t, &mut q2, &mut qd2),
+                CuTrajectoryInterpolation::Quintic => traj.sample_quintic(t, &mut q2, &mut qd2),
+            }
+            .unwrap();
+            assert_eq!((q, qd), (q2, qd2), "{interpolation:?}");
+        }
+    }
+
+    #[test]
+    fn test_bincode_round_trip_keeps_interpolation() {
+        let mut traj = CuTrajectoryPayload::<1, 4>::new();
+        traj.push(point(0.0, 0.0, 0.0)).unwrap();
+        traj.push(point(1.0, 1.0, 0.0)).unwrap();
+        traj.interpolation = CuTrajectoryInterpolation::Quintic;
+        let mut bytes = [0u8; 1024];
+        let len =
+            bincode::encode_into_slice(&traj, &mut bytes, bincode::config::standard()).unwrap();
+        let (decoded, _): (CuTrajectoryPayload<1, 4>, usize) =
+            bincode::decode_from_slice(&bytes[..len], bincode::config::standard()).unwrap();
+        assert_eq!(decoded, traj);
+    }
+
+    #[test]
+    fn test_stretch_time_scales_and_limit_ratio_drops() {
+        let mut traj = CuTrajectoryPayload::<1, 4>::new();
+        traj.push(point(0.0, 0.0, 0.0)).unwrap();
+        traj.push(point(1.0, 1.0, 0.0)).unwrap();
+        let limits = CuJointTrajectoryLimits::new(
+            [CuJointVelocity::Revolute(AngularVelocity::new::<
+                radian_per_second,
+            >(1.0))],
+            [CuJointAcceleration::from_coordinate(
+                traj.points()[0].positions[0],
+                10.0,
+            )],
+        );
+        let before = traj.quintic_limit_ratio(&limits).unwrap();
+        traj.stretch_time(2.0).unwrap();
+        assert_eq!(traj.duration().get::<second>(), 2.0);
+        let after = traj.quintic_limit_ratio(&limits).unwrap();
+        assert!(after < before);
+        assert!(traj.stretch_time(0.0).is_err());
     }
 }

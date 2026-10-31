@@ -1,6 +1,6 @@
 //! STOMP: stochastic trajectory optimization, anytime and seeded.
 //!
-//! Like [`CuJointPathOptimizer`](crate::optimizer::CuJointPathOptimizer) the
+//! Like [`CuJointPathOptimizer`](crate::CuJointPathOptimizer) the
 //! path is a fixed number of waypoints seeded on the straight joint line, but
 //! updates need no gradients. Each iteration draws `rollouts` smooth noisy
 //! copies of the path, scores every waypoint of every rollout by its clearance
@@ -13,6 +13,7 @@
 use crate::CuJointPlanPath;
 use crate::CuJointPlanRequest;
 use crate::CuJointPlanner;
+use crate::CuJointPlannerTask;
 use crate::CuPlanStatus;
 use crate::CuPlannerKind;
 use crate::MAX_WAYPOINTS;
@@ -43,21 +44,29 @@ pub const STOMP_MAX_ROLLOUTS: usize = 16;
 
 /// Parameters of [`CuJointStomp`].
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode, Reflect)]
+#[serde(default, deny_unknown_fields)]
 pub struct CuJointStompParams {
     /// Path waypoints including start and goal (`3..=MAX_WAYPOINTS`).
     pub waypoints: u32,
     /// Noisy rollouts per iteration (`2..=STOMP_MAX_ROLLOUTS`).
     pub rollouts: u32,
-    /// Standard deviation of the exploration noise, normalized joint units.
+    /// Standard deviation of the exploration noise (dimensionless,
+    /// metric-scaled).
     pub noise: f64,
-    /// Exponent scale turning normalized rollout costs into weights.
+    /// Exponent scale turning normalized rollout costs into weights
+    /// (dimensionless).
     pub sensitivity: f64,
     /// Clearance below which the obstacle cost applies.
     pub clearance: Length,
+    /// Weight of the obstacle cost (dimensionless, `>= 0`).
     pub obstacle_weight: f64,
+    /// Weight of the smoothness cost (dimensionless, `>= 0`).
     pub smoothness_weight: f64,
+    /// Iterations after which the job ends.
     pub max_iterations: u32,
+    /// Resolution of the segment collision checks.
     pub collision_check_step: CuJointResolution,
+    /// Scaling of dimensionless joint-space distances and costs.
     pub metric: CuJointMetric,
 }
 
@@ -79,27 +88,37 @@ impl Default for CuJointStompParams {
 }
 
 impl CuJointStompParams {
-    fn is_valid(&self) -> bool {
-        let positive = |v: f64| v.is_finite() && v > 0.0;
-        (3..=MAX_WAYPOINTS as u32).contains(&self.waypoints)
-            && (2..=STOMP_MAX_ROLLOUTS as u32).contains(&self.rollouts)
-            && positive(self.noise)
-            && positive(self.sensitivity)
-            && positive(self.clearance.get::<meter>())
-            && self.obstacle_weight.is_finite()
-            && self.obstacle_weight >= 0.0
-            && self.smoothness_weight.is_finite()
-            && self.smoothness_weight >= 0.0
-            && self.max_iterations > 0
+    /// Checks every parameter, the metric, and the collision-check resolution.
+    pub fn validate(&self) -> CuResult<()> {
+        self.metric.validate()?;
+        self.collision_check_step.metric().validate()?;
+        let valid = {
+            let positive = |v: f64| v.is_finite() && v > 0.0;
+            (3..=MAX_WAYPOINTS as u32).contains(&self.waypoints)
+                && (2..=STOMP_MAX_ROLLOUTS as u32).contains(&self.rollouts)
+                && positive(self.noise)
+                && positive(self.sensitivity)
+                && positive(self.clearance.get::<meter>())
+                && self.obstacle_weight.is_finite()
+                && self.obstacle_weight >= 0.0
+                && self.smoothness_weight.is_finite()
+                && self.smoothness_weight >= 0.0
+                && self.max_iterations > 0
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(CuError::from(
+                "cu-motion-planning: invalid STOMP parameters",
+            ))
+        }
     }
 }
 
 /// Stochastic trajectory optimizer.
 ///
-/// Config keys: `chain`, `collision_model`, and optional `waypoints`,
-/// `rollouts`, `noise`, `sensitivity`, `clearance` (`Length`),
-/// `obstacle_weight`, `smoothness_weight`, `max_iterations`,
-/// `collision_check_step`, `metric`.
+/// Built with [`CuJointPlanner::new`] from robot models and [`CuJointStompParams`];
+/// runs in [`CuJointStompTask`].
 pub struct CuJointStomp<const N: usize, const M: usize = N> {
     validity: CuSceneValidity<N, M>,
     params: CuJointStompParams,
@@ -133,9 +152,17 @@ fn smooth<const N: usize>(values: &mut [[f64; N]], count: usize) {
     values[count - 1] = [0.0; N];
 }
 
+/// [`CuJointPlannerTask`] running [`CuJointStomp`].
+pub type CuJointStompTask<const N: usize, const M: usize = N> =
+    CuJointPlannerTask<CuJointStomp<N, M>, N, M>;
+
 impl<const N: usize, const M: usize> CuJointStomp<N, M> {
-    /// Creates the optimizer for explicit robot models.
-    pub fn new(
+    /// The validated planner parameters.
+    pub const fn params(&self) -> &CuJointStompParams {
+        &self.params
+    }
+
+    fn build(
         chain: CuKinematicChain<N>,
         model: CuRobotCollisionModel<N, M>,
         params: CuJointStompParams,
@@ -267,51 +294,18 @@ impl<const N: usize, const M: usize> CuJointStomp<N, M> {
     }
 }
 
-impl<const N: usize, const M: usize> CuJointPlanner<N> for CuJointStomp<N, M> {
+impl<const N: usize, const M: usize> CuJointPlanner<N, M> for CuJointStomp<N, M> {
     const KIND: CuPlannerKind = CuPlannerKind::Optimization;
 
-    fn from_config(config: Option<&ComponentConfig>) -> CuResult<Self> {
-        let chain = CuKinematicChain::from_config(config)?;
-        let model = CuRobotCollisionModel::from_config(config)?;
-        let mut params = CuJointStompParams::default();
-        if let Some(cfg) = config {
-            if let Some(v) = cfg.get::<u32>("waypoints")? {
-                params.waypoints = v;
-            }
-            if let Some(v) = cfg.get::<u32>("rollouts")? {
-                params.rollouts = v;
-            }
-            if let Some(v) = cfg.get::<f64>("noise")? {
-                params.noise = v;
-            }
-            if let Some(v) = cfg.get::<f64>("sensitivity")? {
-                params.sensitivity = v;
-            }
-            if let Some(v) = cfg.get_value::<Length>("clearance")? {
-                params.clearance = v;
-            }
-            if let Some(v) = cfg.get::<f64>("obstacle_weight")? {
-                params.obstacle_weight = v;
-            }
-            if let Some(v) = cfg.get::<f64>("smoothness_weight")? {
-                params.smoothness_weight = v;
-            }
-            if let Some(v) = cfg.get::<u32>("max_iterations")? {
-                params.max_iterations = v;
-            }
-            if let Some(v) = cfg.get_value::<CuJointResolution>("collision_check_step")? {
-                params.collision_check_step = v;
-            }
-            if let Some(v) = cfg.get_value::<CuJointMetric>("metric")? {
-                params.metric = v;
-            }
-        }
-        if !params.is_valid() {
-            return Err(CuError::from(
-                "cu-motion-planning: invalid STOMP parameters",
-            ));
-        }
-        Ok(Self::new(chain, model, params))
+    type Params = CuJointStompParams;
+
+    fn new(
+        chain: CuKinematicChain<N>,
+        collision_model: CuRobotCollisionModel<N, M>,
+        params: CuJointStompParams,
+    ) -> CuResult<Self> {
+        params.validate()?;
+        Ok(Self::build(chain, collision_model, params))
     }
 
     fn begin(&mut self, request: &CuJointPlanRequest<N>, seed: u64) -> CuResult<CuPlanStatus> {
@@ -321,11 +315,7 @@ impl<const N: usize, const M: usize> CuJointPlanner<N> for CuJointStomp<N, M> {
         self.count = self.params.waypoints as usize;
         self.kinds = request.start;
         self.straight_cost = joint_distance(&request.start, &request.goal, self.params.metric);
-        self.status = if self.params.is_valid() {
-            check_endpoints(&mut self.validity, request, self.params.metric)
-        } else {
-            CuPlanStatus::InvalidRequest
-        };
+        self.status = check_endpoints(&mut self.validity, request, self.params.metric);
         if self.status != CuPlanStatus::Searching {
             return Ok(self.status);
         }
