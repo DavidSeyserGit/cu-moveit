@@ -16,6 +16,8 @@ Before writing or reviewing code, read the applicable `SKILL.md` under `.agents/
 | RON config | `.agents/skills/copper-ron-config/SKILL.md` |
 | Build, checks, justfiles, releases | `.agents/skills/copper-workflow/SKILL.md` |
 
+Public API shape (params structs, constructors, units, visibility) follows `docs/api-conventions.md`.
+
 ## Non-Negotiable Copper House Rules
 
 1. **Static over dynamic:** Encode degrees of freedom (`const N: usize`) and frame/chain topology at compile time; zero heap allocations on the real-time path.
