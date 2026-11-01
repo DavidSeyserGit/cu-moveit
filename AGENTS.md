@@ -36,6 +36,6 @@ Versioning, breaking-change rules, and releases follow `docs/versioning.md`; rec
 
 1. `components/libs/repose_kinematics` (`repose-kinematics`): Serial chain kinematics (`CuKinematicChain<N>`), Forward Kinematics, Geometric Jacobians, Damped Least-Squares Inverse Kinematics, `CuForwardKinematicsTask<N>`, and 6-DOF igus ReBeL preset.
 2. `components/libs/repose_collision` (`repose-collision`): Fixed-capacity capsule/sphere self-collision and environment collision checking (`no_std`).
-3. `components/tasks/cu_servo` (`cu-servo`): Real-time Jacobian velocity/twist servoing (`CuTask`) with joint-limit and singularity damping.
+3. `components/tasks/repose_servo` (`repose-servo`): Real-time Jacobian velocity/twist servoing (`CuTask`) with joint-limit and singularity damping.
 4. `components/tasks/repose_motion_planning` (`repose-motion-planning`): planner-agnostic `CuJointPlanner` contract and generic anytime planner task, with non-sampling planners (direct, path optimizer); `components/tasks/repose_joint_rrt_star` (`repose-joint-rrt-star`) is the sampling-based RRT* implementation with deterministic `CuRng`.
-5. `components/bridges/cu_igus_cri` (`cu-igus-cri`): Native `CuBridge` for the igus ReBeL CRI Ethernet protocol (`192.168.3.11:3920`).
+5. `components/bridges/repose_igus_cri` (`repose-igus-cri`): Native `CuBridge` for the igus ReBeL CRI Ethernet protocol (`192.168.3.11:3920`).

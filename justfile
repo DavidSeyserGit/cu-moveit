@@ -43,13 +43,17 @@ semver-check baseline=`git describe --tags --abbrev=0 --match 'v*'`:
     #!/usr/bin/env bash
     set -euo pipefail
     release_type="${SEMVER_RELEASE_TYPE:-}"
+    args=()
     for pkg in $(cargo metadata --no-deps --format-version 1 | jq -r '.packages[].name'); do
-        if ! git grep -q "^name = \"$pkg\"" "{{baseline}}" -- '*Cargo.toml'; then
+        if git grep -q "^name = \"$pkg\"" "{{baseline}}" -- '*Cargo.toml'; then
+            args+=(-p "$pkg")
+        else
             echo "semver-check: skipping $pkg (not in {{baseline}})"
-            continue
         fi
-        cargo semver-checks check-release -p "$pkg" --baseline-rev "{{baseline}}" ${release_type:+--release-type "$release_type"}
     done
+    if [ ${#args[@]} -eq 0 ]; then exit 0; fi
+    # One invocation so the baseline is checked out and built once for all crates.
+    cargo semver-checks check-release "${args[@]}" --baseline-rev "{{baseline}}" ${release_type:+--release-type "$release_type"}
 
 # Bump the shared workspace version, commit and tag vX.Y.Z (needs cargo-release; see docs/versioning.md).
 # Dry run by default; pass --execute to apply. Never pushes or publishes.

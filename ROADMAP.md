@@ -113,7 +113,7 @@ Controller-interface completion, building on `v0.2.2`:
      status (idle/running/holding/fault) and tracking error. Shared
      `CuJointStatePayload<N>` / `CuJointCommandPayload<N>` payloads (extending
      today's `CuJointPositionsPayload<N>`) are the only interface a bridge
-     sees: simulators (`repose-mujoco-sim`) and hardware (`cu-igus-cri`, Step 4)
+     sees: simulators (`repose-mujoco-sim`) and hardware (`repose-igus-cri`, Step 4)
      implement the same `joint_command`/`joint_state` channels, so swapping
      sim for a real robot is a RON graph change, not an app change. Generalize
      `repose-mujoco-sim` from fixed `N = 6` as the first consumer.
@@ -148,7 +148,7 @@ Controller-interface completion, building on `v0.2.2`:
    monitoring and collision-triggered abort with defined stop/hold reporting;
    distinguish geometric validation before execution from monitoring during it.
 4. **Robot bridges.** Extend the joint command/state contract established in
-   Step 2 to hardware through a generic `CuBridge`; prove it with `cu-igus-cri` for the igus
+   Step 2 to hardware through a generic `CuBridge`; prove it with `repose-igus-cri` for the igus
    ReBeL CRI protocol (`192.168.3.11:3920`); hardware-in-the-loop example plans
    and executes on the real ReBeL.
 5. **Generality (deliberately last).** Tree/branched kinematic structures,
@@ -205,6 +205,6 @@ Passing tests alone does not close a phase.
   and later execution monitoring. Define ownership and stale-result handling
   before freezing the scene/request/result contracts.
 - Undecided: additional robot presets beyond the igus ReBeL (added only when a
-  bridge or user needs one); the second bridge target after `cu-igus-cri`
+  bridge or user needs one); the second bridge target after `repose-igus-cri`
   (decided by hardware access); whether benchmark results ship as a report
   crate or as local demonstrations.
