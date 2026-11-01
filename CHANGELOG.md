@@ -7,6 +7,8 @@ may be breaking.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-01
+
 ### Breaking
 
 - Crates renamed for the Repose rebrand: `cu-repose` → `repose`, and every
@@ -55,7 +57,8 @@ Full notes: [docs/releases/0.4.0.md](docs/releases/0.4.0.md).
 
 Initial release.
 
-[Unreleased]: https://github.com/ReposeRobotics/repose/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/ReposeRobotics/repose/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/ReposeRobotics/repose/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/ReposeRobotics/repose/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/ReposeRobotics/repose/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/ReposeRobotics/repose/compare/v0.4.0...v0.4.1
