@@ -18,9 +18,9 @@ environments = ["host", "embedded"]
 
 [dependencies]
 bincode = { workspace = true }
-repose-collision = { version = "0.6.0", path = "../repose_collision", default-features = false }
+repose-collision = { version = "0.7.0", path = "../repose_collision", default-features = false }
 cu-spatial-payloads = { workspace = true }
-repose-kinematics = { version = "0.6.0", path = "../repose_kinematics", default-features = false }
+repose-kinematics = { version = "0.7.0", path = "../repose_kinematics", default-features = false }
 cu29 = { workspace = true }
 libm = { workspace = true }
 serde = { workspace = true }

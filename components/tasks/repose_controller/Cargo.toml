@@ -18,8 +18,8 @@ environments = ["host", "embedded"]
 
 [dependencies]
 bincode = { workspace = true }
-repose-kinematics = { version = "0.6.0", path = "../../libs/repose_kinematics", default-features = false }
-repose-trajectory = { version = "0.6.0", path = "../../libs/repose_trajectory", default-features = false }
+repose-kinematics = { version = "0.7.0", path = "../../libs/repose_kinematics", default-features = false }
+repose-trajectory = { version = "0.7.0", path = "../../libs/repose_trajectory", default-features = false }
 cu29 = { workspace = true }
 serde = { workspace = true }
 

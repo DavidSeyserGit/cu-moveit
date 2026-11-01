@@ -19,15 +19,15 @@ domains = ["algorithm/manipulation"]
 environments = ["host", "embedded"]
 
 [dependencies]
-repose-kinematics = { version = "0.6.0", path = "../repose_kinematics", default-features = false }
-repose-collision = { version = "0.6.0", path = "../repose_collision", default-features = false }
-repose-robot-description = { version = "0.6.0", path = "../repose_robot_description", default-features = false }
-repose-trajectory = { version = "0.6.0", path = "../repose_trajectory", default-features = false }
-repose-motion-planning = { version = "0.6.0", path = "../../tasks/repose_motion_planning", default-features = false }
-repose-joint-rrt-star = { version = "0.6.0", path = "../../tasks/repose_joint_rrt_star", default-features = false }
-repose-controller = { version = "0.6.0", path = "../../tasks/repose_controller", default-features = false }
-repose-io = { version = "0.6.0", path = "../../tasks/repose_io", default-features = false }
-repose-mujoco-sim = { version = "0.6.0", path = "../../bridges/repose_mujoco_sim", default-features = false, optional = true }
+repose-kinematics = { version = "0.7.0", path = "../repose_kinematics", default-features = false }
+repose-collision = { version = "0.7.0", path = "../repose_collision", default-features = false }
+repose-robot-description = { version = "0.7.0", path = "../repose_robot_description", default-features = false }
+repose-trajectory = { version = "0.7.0", path = "../repose_trajectory", default-features = false }
+repose-motion-planning = { version = "0.7.0", path = "../../tasks/repose_motion_planning", default-features = false }
+repose-joint-rrt-star = { version = "0.7.0", path = "../../tasks/repose_joint_rrt_star", default-features = false }
+repose-controller = { version = "0.7.0", path = "../../tasks/repose_controller", default-features = false }
+repose-io = { version = "0.7.0", path = "../../tasks/repose_io", default-features = false }
+repose-mujoco-sim = { version = "0.7.0", path = "../../bridges/repose_mujoco_sim", default-features = false, optional = true }
 
 [features]
 default = ["std"]
