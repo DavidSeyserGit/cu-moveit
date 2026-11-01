@@ -11,11 +11,11 @@ mujoco/joint_state ─► goal ─► planner ─► timing ─► follower ─�
 
 | Node | Component | Role |
 |---|---|---|
-| `goal` | `cu_motion_planning::CuJointGoalTask<6>` | First ready state + configured goal → one plan request |
-| `planner` | `cu_joint_rrt_star::CuJointRrtStarTask<6>` | Anytime RRT* in the background, seeded by `cu_rng::CuRngBundle` |
-| `timing` | `cu_motion_planning::CuPlanToTrajectoryTask<6, 1024>` | Final path → cubic-timed trajectory within joint limits |
-| `follower` | `cu_trajectory::CuFollowTrajectoryTask<6, 1024>` | Samples the trajectory on the message clock |
-| `controller` | `cu_controller::CuControllerTask<6>` | Tracking-error watchdog and rate-limited commands |
+| `goal` | `repose_motion_planning::CuJointGoalTask<6>` | First ready state + configured goal → one plan request |
+| `planner` | `repose_joint_rrt_star::CuJointRrtStarTask<6>` | Anytime RRT* in the background, seeded by `cu_rng::CuRngBundle` |
+| `timing` | `repose_motion_planning::CuPlanToTrajectoryTask<6, 1024>` | Final path → cubic-timed trajectory within joint limits |
+| `follower` | `repose_trajectory::CuFollowTrajectoryTask<6, 1024>` | Samples the trajectory on the message clock |
+| `controller` | `repose_controller::CuControllerTask<6>` | Tracking-error watchdog and rate-limited commands |
 | `observer` | `observer::GoalObserver` (this crate) | Test oracle: writes `result.json` and exits |
 
 The planner uses the `igus_rebel` chain and self-collision presets; the scene
@@ -28,7 +28,7 @@ compensation.
 - Rust 1.95 or newer and the Copper dependencies in `Cargo.toml`.
 - Python 3 with `mujoco` and `numpy` (`python -m pip install mujoco numpy`).
 - An expanded igus ReBeL URDF whose movable joints are named `joint1` through
-  `joint6`, ordered to match `cu_kinematics::igus_rebel_chain()`. The URDF supplies MuJoCo's
+  `joint6`, ordered to match `repose_kinematics::igus_rebel_chain()`. The URDF supplies MuJoCo's
   inertial model; verify that it describes the same robot as the Copper preset.
 
 From this directory, start the sidecar in one terminal:

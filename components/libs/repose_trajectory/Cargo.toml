@@ -1,0 +1,39 @@
+[package]
+name = "repose-trajectory"
+description = "Fixed-capacity joint trajectory payload and sampling for copper-rs"
+version.workspace = true
+publish.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+repository.workspace = true
+
+[package.metadata.copper]
+kind = "lib"
+domains = ["algorithm/manipulation"]
+environments = ["host", "embedded"]
+
+[dependencies]
+bincode = { workspace = true }
+repose-collision = { version = "0.6.0", path = "../repose_collision", default-features = false }
+cu-spatial-payloads = { workspace = true }
+repose-kinematics = { version = "0.6.0", path = "../repose_kinematics", default-features = false }
+cu29 = { workspace = true }
+libm = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+ron = "0.12"
+
+[features]
+default = ["std"]
+std = [
+  "cu29/std",
+  "repose-kinematics/std",
+  "repose-collision/std",
+  "bincode/std",
+  "serde/std",
+]

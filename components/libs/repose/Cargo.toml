@@ -1,0 +1,45 @@
+[package]
+name = "repose"
+description = "Repose: deterministic, real-time robot arm manipulation for copper-rs (umbrella crate)"
+version.workspace = true
+publish.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+repository.workspace = true
+homepage = "https://getrepose.dev"
+readme = "README.md"
+
+[package.metadata.copper]
+kind = "lib"
+domains = ["algorithm/manipulation"]
+environments = ["host", "embedded"]
+
+[dependencies]
+repose-kinematics = { version = "0.6.0", path = "../repose_kinematics", default-features = false }
+repose-collision = { version = "0.6.0", path = "../repose_collision", default-features = false }
+repose-robot-description = { version = "0.6.0", path = "../repose_robot_description", default-features = false }
+repose-trajectory = { version = "0.6.0", path = "../repose_trajectory", default-features = false }
+repose-motion-planning = { version = "0.6.0", path = "../../tasks/repose_motion_planning", default-features = false }
+repose-joint-rrt-star = { version = "0.6.0", path = "../../tasks/repose_joint_rrt_star", default-features = false }
+repose-controller = { version = "0.6.0", path = "../../tasks/repose_controller", default-features = false }
+repose-io = { version = "0.6.0", path = "../../tasks/repose_io", default-features = false }
+repose-mujoco-sim = { version = "0.6.0", path = "../../bridges/repose_mujoco_sim", default-features = false, optional = true }
+
+[features]
+default = ["std"]
+std = [
+  "repose-kinematics/std",
+  "repose-collision/std",
+  "repose-robot-description/std",
+  "repose-trajectory/std",
+  "repose-motion-planning/std",
+  "repose-joint-rrt-star/std",
+  "repose-controller/std",
+  "repose-io/std",
+]
+# MuJoCo simulator bridge (host only).
+mujoco-sim = ["std", "dep:repose-mujoco-sim", "repose-mujoco-sim/std"]

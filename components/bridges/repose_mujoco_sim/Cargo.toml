@@ -1,0 +1,39 @@
+[package]
+name = "repose-mujoco-sim"
+description = "CuBridge to an external MuJoCo simulator sidecar over TCP/JSON"
+version.workspace = true
+publish.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+repository.workspace = true
+
+[package.metadata.copper]
+kind = "bridge"
+domains = ["simulation/mujoco"]
+environments = ["host"]
+
+[dependencies]
+bincode = { workspace = true }
+repose-controller = { version = "0.6.0", path = "../../tasks/repose_controller", default-features = false }
+repose-kinematics = { version = "0.6.0", path = "../../libs/repose_kinematics", default-features = false }
+cu29 = { workspace = true }
+serde = { workspace = true }
+serde_json = "1.0"
+
+[dev-dependencies]
+ron = "0.12"
+
+[features]
+default = ["std"]
+std = [
+  "cu29/std",
+  "repose-controller/std",
+  "repose-kinematics/std",
+  "bincode/std",
+  "serde/std",
+  "serde_json/std",
+]

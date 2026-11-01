@@ -19,24 +19,24 @@ in that order.
 
 ## Current State (done)
 
-- `cu-kinematics`: `CuKinematicChain<N>` FK, space/body Jacobians,
+- `repose-kinematics`: `CuKinematicChain<N>` FK, space/body Jacobians,
   manipulability, DLS and differential IK with singularity/joint-limit damping,
   FK/IK/servo `CuTask`s, igus ReBeL preset.
-- `cu-collision`: fixed-capacity sphere/capsule model, signed-distance queries,
+- `repose-collision`: fixed-capacity sphere/capsule model, signed-distance queries,
   self/environment checking, `CuCollisionCheckTask<N>`.
-- `cu-robot-description`: startup URDF serial-chain and SRDF group/exclusion/
+- `repose-robot-description`: startup URDF serial-chain and SRDF group/exclusion/
   state import into fixed-size kinematic and collision models.
-- `cu-motion-planning`: planner-agnostic `CuJointPlanner` trait, request/path
+- `repose-motion-planning`: planner-agnostic `CuJointPlanner` trait, request/path
   payloads with explicit `CuPlanStatus`, shared scene validity checks, the
   generic anytime `CuJointPlannerTask<P, N>`, and built-in planners:
   RRT-Connect and PRM (sampling), A* lattice (search), gradient path
   optimizer and STOMP (optimization), direct joint line.
-- `cu-joint-rrt-star`: sampling-based RRT* implementing `CuJointPlanner`, with
+- `repose-joint-rrt-star`: sampling-based RRT* implementing `CuJointPlanner`, with
   deterministic `CuRng` seeding, informed pruning, rewiring, and shortcutting.
-- `cu-trajectory`: fixed-capacity trajectory payloads, profile timing, per-waypoint
+- `repose-trajectory`: fixed-capacity trajectory payloads, profile timing, per-waypoint
   Cartesian TCP zones, C² spline geometry, quintic interpolation, and S-curve
   joint jerk bounds; follower preemption and empty-trajectory cancellation.
-- `cu-mujoco-sim`: `CuBridge` to a MuJoCo sidecar over TCP/JSON carrying
+- `repose-mujoco-sim`: `CuBridge` to a MuJoCo sidecar over TCP/JSON carrying
   `CuJointPositionsPayload<6>` both ways (released in `v0.2.1`); the local
   playground closes the plan → follow → sim → feedback loop.
 - All crates pass `just pr-check` and are published at
@@ -60,7 +60,7 @@ Controller-interface completion, building on `v0.2.2`:
   carries position, velocity, and effort modes, with typed torque/force per
   joint kind. `CuControllerTask<N>` computes PD effort; bridges apply raw
   torque/force. Position-mode velocity feedforward landed with it.
-- **Gripper and digital IO (implemented).** `cu-io` defines the
+- **Gripper and digital IO (implemented).** `repose-io` defines the
   robot-agnostic `digital_in`/`digital_out` payloads
   (`CuDigitalInputPayload<N>` with device status, `CuDigitalOutputPayload<N>`
   with a drive mask). A gripper is IO, not a payload of its own:
@@ -101,7 +101,7 @@ Controller-interface completion, building on `v0.2.2`:
      and execution status. Use a local, git-excluded demonstration to exercise
      the complete loop; kinematic animation alone does not satisfy this step.
      Define the joint command/state contract here so it can also support the
-     hardware bridge in Step 4. (Implemented: `cu-mujoco-sim` `CuBridge` over
+     hardware bridge in Step 4. (Implemented: `repose-mujoco-sim` `CuBridge` over
      `CuJointPositionsPayload<6>`, released in `v0.2.1`; the local playground
      closes the loop and the Trajectory Studio executes in the sim.)
    - **Unified robot controller (implemented in `v0.2.2`).** Upstream `cu29` has no robot
@@ -113,12 +113,12 @@ Controller-interface completion, building on `v0.2.2`:
      status (idle/running/holding/fault) and tracking error. Shared
      `CuJointStatePayload<N>` / `CuJointCommandPayload<N>` payloads (extending
      today's `CuJointPositionsPayload<N>`) are the only interface a bridge
-     sees: simulators (`cu-mujoco-sim`) and hardware (`cu-igus-cri`, Step 4)
+     sees: simulators (`repose-mujoco-sim`) and hardware (`cu-igus-cri`, Step 4)
      implement the same `joint_command`/`joint_state` channels, so swapping
      sim for a real robot is a RON graph change, not an app change. Generalize
-     `cu-mujoco-sim` from fixed `N = 6` as the first consumer.
+     `repose-mujoco-sim` from fixed `N = 6` as the first consumer.
      Shape (per Copper component design): a new crate
-     `components/tasks/cu_controller` holding the payloads and a
+     `components/tasks/repose_controller` holding the payloads and a
      `CuControllerTask<N>` — a multi-input `CuTask` (follower setpoint +
      measured state in, unified command out), `Reflect` + `Freezable`
      (last command, status, watchdog state round-trip for replay), zero
@@ -163,7 +163,7 @@ Controller-interface completion, building on `v0.2.2`:
    `just api-check` / `just release-dry-run`. To publish: flip the single
    `publish = false` switch in the workspace `Cargo.toml` to `true`, publish
    all crates to crates.io in lockstep (dependency order) at the shared
-   version, publish the `cu-repose` umbrella crate that re-exports them, and tag the release `v1.0.0`. Until then, releases are
+   version, publish the `repose` umbrella crate that re-exports them, and tag the release `v1.0.0`. Until then, releases are
    git tags (`vX.Y.Z`, workspace-wide, never per-crate) with GitHub Releases,
    and consumers use git dependencies.
 
@@ -185,7 +185,7 @@ Passing tests alone does not close a phase.
 
 - **No ROS / ROS 2 interop.** No ROS nodes, messages, actions, `ros2_control`
   adapters, or MoveIt plugin/config compatibility. URDF/SRDF *file* import at
-  startup (already in `cu-robot-description`) is the sole exception — a file
+  startup (already in `repose-robot-description`) is the sole exception — a file
   format, not a ROS runtime dependency.
 - **No generic perception.** No point-cloud pipelines, camera drivers, object
   recognition, or grasp synthesis. External perception may publish Copper

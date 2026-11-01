@@ -10,7 +10,7 @@
     tasks: [
         (
             id: "goal",
-            type: "cu_motion_planning::CuJointGoalTask<6>",
+            type: "repose_motion_planning::CuJointGoalTask<6>",
             config: {"goal": [
                 {"revolute": 0.4}, {"revolute": -0.3}, {"revolute": 0.5},
                 {"revolute": 0.0}, {"revolute": 0.4}, {"revolute": 0.0},
@@ -18,7 +18,7 @@
         ),
         (
             id: "planner",
-            type: "cu_joint_rrt_star::CuJointRrtStarTask<6>",
+            type: "repose_joint_rrt_star::CuJointRrtStarTask<6>",
             background: true,
             anytime: (time_budget_ms: 250.0, quality_target: 0.95),
             resources: {"rng": "planner_rng.rng"},
@@ -26,7 +26,7 @@
         ),
         (
             id: "timing",
-            type: "cu_motion_planning::CuPlanToTrajectoryTask<6, 1024>",
+            type: "repose_motion_planning::CuPlanToTrajectoryTask<6, 1024>",
             config: {
                 "profile": "cubic",
                 "sample_period": 0.02,
@@ -42,10 +42,10 @@
                 },
             },
         ),
-        (id: "follower", type: "cu_trajectory::CuFollowTrajectoryTask<6, 1024>"),
+        (id: "follower", type: "repose_trajectory::CuFollowTrajectoryTask<6, 1024>"),
         (
             id: "controller",
-            type: "cu_controller::CuControllerTask<6>",
+            type: "repose_controller::CuControllerTask<6>",
             config: {
                 "tracking_error_limit": 0.5,
                 "state_timeout": 0.2,
@@ -68,23 +68,23 @@
     bridges: [
         (
             id: "mujoco",
-            type: "cu_mujoco_sim::CuMujocoSimBridge",
+            type: "repose_mujoco_sim::CuMujocoSimBridge",
             config: {"host": "127.0.0.1", "port": 55091, "read_timeout": 0.25},
             channels: [
-                Tx(id: "joint_command", msg: "cu_controller::CuJointCommandPayload<6>"),
-                Rx(id: "joint_state", msg: "cu_kinematics::CuJointStatePayload<6>"),
+                Tx(id: "joint_command", msg: "repose_controller::CuJointCommandPayload<6>"),
+                Rx(id: "joint_state", msg: "repose_kinematics::CuJointStatePayload<6>"),
             ],
         ),
     ],
     cnx: [
-        (src: "mujoco/joint_state", dst: "goal", msg: "cu_kinematics::CuJointStatePayload<6>"),
-        (src: "goal", dst: "planner", msg: "cu_motion_planning::CuJointPlanRequest<6>"),
-        (src: "planner", dst: "timing", msg: "cu_motion_planning::CuJointPlanPath<6>"),
-        (src: "timing", dst: "follower", msg: "cu_trajectory::CuTrajectoryPayload<6, 1024>"),
-        (src: "follower", dst: "controller", msg: "cu_trajectory::CuTrajectoryFollowOutput<6>"),
-        (src: "mujoco/joint_state", dst: "controller", msg: "cu_kinematics::CuJointStatePayload<6>"),
-        (src: "controller", dst: "mujoco/joint_command", msg: "cu_controller::CuJointCommandPayload<6>"),
-        (src: "mujoco/joint_state", dst: "observer", msg: "cu_kinematics::CuJointStatePayload<6>"),
-        (src: "controller", dst: "observer", msg: "cu_controller::CuJointCommandPayload<6>"),
+        (src: "mujoco/joint_state", dst: "goal", msg: "repose_kinematics::CuJointStatePayload<6>"),
+        (src: "goal", dst: "planner", msg: "repose_motion_planning::CuJointPlanRequest<6>"),
+        (src: "planner", dst: "timing", msg: "repose_motion_planning::CuJointPlanPath<6>"),
+        (src: "timing", dst: "follower", msg: "repose_trajectory::CuTrajectoryPayload<6, 1024>"),
+        (src: "follower", dst: "controller", msg: "repose_trajectory::CuTrajectoryFollowOutput<6>"),
+        (src: "mujoco/joint_state", dst: "controller", msg: "repose_kinematics::CuJointStatePayload<6>"),
+        (src: "controller", dst: "mujoco/joint_command", msg: "repose_controller::CuJointCommandPayload<6>"),
+        (src: "mujoco/joint_state", dst: "observer", msg: "repose_kinematics::CuJointStatePayload<6>"),
+        (src: "controller", dst: "observer", msg: "repose_controller::CuJointCommandPayload<6>"),
     ],
 )

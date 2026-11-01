@@ -6,19 +6,19 @@ Studio is available as the private `studio` submodule. Clone with `git clone --r
 
 ## Crates
 
-Add the whole stack with one dependency, the `cu-repose` umbrella crate, or depend on individual components. Product site: [getrepose.dev](https://getrepose.dev).
+Add the whole stack with one dependency, the `repose` umbrella crate, or depend on individual components. Product site: [getrepose.dev](https://getrepose.dev).
 
 | Crate | Path | Kind | Description |
 |---|---|---|---|
-| `cu-repose` | `components/libs/cu_repose` | umbrella | Re-exports every component below (`kinematics`, `collision`, `motion_planning`, …); MuJoCo bridge behind feature `mujoco-sim` |
-| `cu-kinematics` | `components/libs/cu_kinematics` | `lib` / `task` | Const-generic `CuKinematicChain<N>` forward kinematics, space/body geometric Jacobians, DLS inverse kinematics, differential IK with singularity/limit damping, `CuForwardKinematicsTask<N>`, `CuInverseKinematicsTask<N>`, `CuServoTask<N>`, the bridge-facing `CuJointStatePayload<N>`, and 6-DOF igus ReBeL model |
-| `cu-collision` | `components/libs/cu_collision` | `lib` / `task` | Fixed-capacity sphere/capsule primitives, exact signed-distance queries, `CuRobotCollisionModel<N, M>`, `CuPlanningScene` with a zero-copy `CuCollisionEnv`, `CuCollisionCheckTask<N>`, and igus ReBeL collision geometry |
-| `cu-robot-description` | `components/libs/cu_robot_description` | `startup lib` | URDF serial-chain extraction, primitive collision conversion, and SRDF serial groups, collision exclusions, and named states |
-| `cu-trajectory` | `components/libs/cu_trajectory` | `lib` / `task` | Fixed-capacity joint trajectories, interpolation, timing profiles, and sampled Cartesian TCP-zone blending |
-| `cu-motion-planning` | `components/tasks/cu_motion_planning` | `lib` / `task` | Planner-agnostic contract: `CuJointPlanner` trait, `CuJointPlanRequest<N>` / `CuJointPlanPath<N>` with explicit `CuPlanStatus`, shared scene validity checks, the generic anytime `CuJointPlannerTask<P, N>`, `CuJointGoalTask<N>` (state + goal → request) and `CuPlanToTrajectoryTask<N, CAP>` (path → timed trajectory), and built-in planners: RRT-Connect and PRM (sampling), A* lattice (search), gradient path optimizer and STOMP (optimization), direct joint line |
-| `cu-joint-rrt-star` | `components/tasks/cu_joint_rrt_star` | `task` | Sampling-based RRT* implementing `CuJointPlanner`, with deterministic `CuRng` seeding, informed pruning, rewiring, and path shortcutting; `CuJointRrtStarTask` is the generic planner task running it |
-| `cu-controller` | `components/tasks/cu_controller` | `task` | Robot-agnostic joint controller with position/velocity/effort modes, robot status, state watchdog, and command rate limiting |
-| `cu-io` | `components/tasks/cu_io` | `task` | Robot-agnostic digital IO payloads and an IO-driven gripper task |
+| `repose` | `components/libs/repose` | umbrella | Re-exports every component below (`kinematics`, `collision`, `motion_planning`, …); MuJoCo bridge behind feature `mujoco-sim` |
+| `repose-kinematics` | `components/libs/repose_kinematics` | `lib` / `task` | Const-generic `CuKinematicChain<N>` forward kinematics, space/body geometric Jacobians, DLS inverse kinematics, differential IK with singularity/limit damping, `CuForwardKinematicsTask<N>`, `CuInverseKinematicsTask<N>`, `CuServoTask<N>`, the bridge-facing `CuJointStatePayload<N>`, and 6-DOF igus ReBeL model |
+| `repose-collision` | `components/libs/repose_collision` | `lib` / `task` | Fixed-capacity sphere/capsule primitives, exact signed-distance queries, `CuRobotCollisionModel<N, M>`, `CuPlanningScene` with a zero-copy `CuCollisionEnv`, `CuCollisionCheckTask<N>`, and igus ReBeL collision geometry |
+| `repose-robot-description` | `components/libs/repose_robot_description` | `startup lib` | URDF serial-chain extraction, primitive collision conversion, and SRDF serial groups, collision exclusions, and named states |
+| `repose-trajectory` | `components/libs/repose_trajectory` | `lib` / `task` | Fixed-capacity joint trajectories, interpolation, timing profiles, and sampled Cartesian TCP-zone blending |
+| `repose-motion-planning` | `components/tasks/repose_motion_planning` | `lib` / `task` | Planner-agnostic contract: `CuJointPlanner` trait, `CuJointPlanRequest<N>` / `CuJointPlanPath<N>` with explicit `CuPlanStatus`, shared scene validity checks, the generic anytime `CuJointPlannerTask<P, N>`, `CuJointGoalTask<N>` (state + goal → request) and `CuPlanToTrajectoryTask<N, CAP>` (path → timed trajectory), and built-in planners: RRT-Connect and PRM (sampling), A* lattice (search), gradient path optimizer and STOMP (optimization), direct joint line |
+| `repose-joint-rrt-star` | `components/tasks/repose_joint_rrt_star` | `task` | Sampling-based RRT* implementing `CuJointPlanner`, with deterministic `CuRng` seeding, informed pruning, rewiring, and path shortcutting; `CuJointRrtStarTask` is the generic planner task running it |
+| `repose-controller` | `components/tasks/repose_controller` | `task` | Robot-agnostic joint controller with position/velocity/effort modes, robot status, state watchdog, and command rate limiting |
+| `repose-io` | `components/tasks/repose_io` | `task` | Robot-agnostic digital IO payloads and an IO-driven gripper task |
 
 See [ROADMAP.md](ROADMAP.md) for where this is going and what is explicitly out
 of scope.
@@ -29,12 +29,19 @@ Nothing is published to crates.io yet (`publish = false` workspace-wide; the API
 is pre-1.0 and may change). Depend on the git repository instead:
 
 ```toml
-cu-repose = { git = "https://github.com/ReposeRobotics/repose", tag = "v0.7.0" }
+repose = { git = "https://github.com/ReposeRobotics/repose", tag = "v0.7.0" }
 ```
 
-The workspace is versioned and tagged as a whole (`vX.Y.Z`), never per crate.
-At 1.0 the crates will be published to crates.io in lockstep behind a single
-`cu-repose` umbrella crate; see the publishing step in [ROADMAP.md](ROADMAP.md).
+The workspace is versioned and tagged as a whole (`vX.Y.Z`), never per crate;
+`repose` carries the product version. Pre-1.0, a minor bump (0.6 → 0.7) may
+break the Rust API, payload encoding, or RON config; patch releases never do.
+The full policy is in [docs/versioning.md](docs/versioning.md), and every
+release is recorded in [CHANGELOG.md](CHANGELOG.md).
+
+| Repose | Copper (`cu29`) | Rust (MSRV) |
+|---|---|---|
+| 0.7 (as `repose-*`) | 1.3 | 1.95 |
+| 0.1 – 0.6 (as `cu-*`) | 1.3 | 1.95 |
 
 ## Quick Start
 
@@ -43,7 +50,7 @@ just
 ```
 
 Every task is generic over its joint count and capacities and can be named
-directly in RON, e.g. `type: "cu_trajectory::CuFollowTrajectoryTask<6, 1024>"`;
+directly in RON, e.g. `type: "repose_trajectory::CuFollowTrajectoryTask<6, 1024>"`;
 applications do not wrap library tasks. For a complete goal → plan → time →
 follow → control loop against MuJoCo, configured entirely in RON, see
 [the simulator example](examples/mujoco_rebel/README.md).
@@ -89,7 +96,7 @@ let robot = CuRobotDescription::<6, 24>::from_urdf_srdf(
 let fk = CuForwardKinematicsTask::from_params(robot.chain().clone())?;
 ```
 
-Parsing requires the `cu-robot-description` crate's `std` feature and runs at
+Parsing requires the `repose-robot-description` crate's `std` feature and runs at
 startup. The resulting kinematic and collision models remain fixed-size and
 usable by the `no_std` runtime crates. `N` counts movable joints, not fixed joints;
 `M` is a collision-shape capacity. Import errors report insufficient capacity or
@@ -118,7 +125,7 @@ The format follows the [MoveIt URDF/SRDF guide](https://moveit.picknik.ai/main/d
 Run the complete mixed revolute/prismatic example:
 
 ```bash
-cargo run -p cu-robot-description --example serial_robot
+cargo run -p repose-robot-description --example serial_robot
 ```
 
 It loads URDF/SRDF, resolves two named states, computes FK and IK, checks the IK
@@ -133,7 +140,7 @@ joint-velocity variants. Joint-limit RON values now use `revolute`, `prismatic`,
 
 ## Continuous motion and TCP zones
 
-`cu_trajectory::cartesian_blend::blend_cartesian_path` takes a serial chain,
+`repose_trajectory::cartesian_blend::blend_cartesian_path` takes a serial chain,
 collision model, joint waypoints, and one typed `Length` zone radius per
 waypoint. A zero interior radius is an exact stop; a positive radius replaces
 that TCP corner with a sampled quadratic fly-by path. The first and last radii
@@ -174,7 +181,7 @@ reproduction of a vendor controller's zone algorithm.
 
 ## Motion planners
 
-All planners implement `cu_motion_planning::CuJointPlanner` and run in one
+All planners implement `repose_motion_planning::CuJointPlanner` and run in one
 Copper task, `CuJointPlannerTask<P, N>`: `begin` starts a job from a
 `CuJointPlanRequest<N>`, `step(budget)` does a bounded quantum of work, and
 `write_best` fills a `CuJointPlanPath<N>` in place. The task owns the anytime
@@ -185,7 +192,7 @@ waypoints and its `status` names the reason (`invalid_start`,
 
 | Planner | Kind | Behaviour |
 |---|---|---|
-| `CuJointRrtStar` (`cu-joint-rrt-star`) | sampling | Seeded RRT* with rewiring and shortcutting; keeps shortening its path. |
+| `CuJointRrtStar` (`repose-joint-rrt-star`) | sampling | Seeded RRT* with rewiring and shortcutting; keeps shortening its path. |
 | `CuJointRrtConnect` | sampling | Bidirectional trees; fastest to a first path, converges on connection without optimizing. |
 | `CuJointPrm` | sampling | Probabilistic roadmap (up to 1024 nodes) plus Dijkstra; improves as the roadmap densifies. Rebuilt per job. |
 | `CuJointAStar` | search | Deterministic A* on a joint-space lattice (`resolution`); complete at that resolution within its node capacity. |

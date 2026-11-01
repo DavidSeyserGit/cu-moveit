@@ -1,9 +1,9 @@
 //! Headless test oracle: reports whether the arm reached the goal.
 
-use cu_controller::CuControllerStatus;
-use cu_controller::CuJointCommandPayload;
-use cu_kinematics::CuJointPosition;
-use cu_kinematics::CuJointStatePayload;
+use repose_controller::CuControllerStatus;
+use repose_controller::CuJointCommandPayload;
+use repose_kinematics::CuJointPosition;
+use repose_kinematics::CuJointStatePayload;
 use cu29::bincode::Decode;
 use cu29::bincode::Encode;
 use cu29::bincode::de::Decoder;
@@ -18,7 +18,7 @@ use serde::Deserialize;
 const MAX_FAULT_CYCLES: u32 = 50;
 
 #[derive(Deserialize)]
-struct Goal(#[serde(with = "cu_kinematics::serde_arrays::position_array")] [CuJointPosition; 6]);
+struct Goal(#[serde(with = "repose_kinematics::serde_arrays::position_array")] [CuJointPosition; 6]);
 
 /// Writes `result.json` and exits once the controller holds within
 /// `tolerance` of `goal`, faults persistently, or `max_cycles` elapse.

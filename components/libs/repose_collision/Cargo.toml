@@ -1,0 +1,32 @@
+[package]
+name = "repose-collision"
+description = "Deterministic, allocation-free capsule and sphere robot collision checking for copper-rs"
+version.workspace = true
+publish.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+repository.workspace = true
+
+[package.metadata.copper]
+kind = "lib"
+domains = ["algorithm/collision", "algorithm/manipulation"]
+environments = ["host", "embedded"]
+
+[dependencies]
+bincode = { workspace = true }
+repose-kinematics = { version = "0.6.0", path = "../repose_kinematics", default-features = false }
+cu-spatial-payloads = { workspace = true }
+cu29 = { workspace = true }
+libm = { workspace = true }
+serde = { workspace = true }
+
+[features]
+default = ["std"]
+std = ["cu29/std", "repose-kinematics/std", "bincode/std", "serde/std"]
+
+[dev-dependencies]
+ron = "0.12"

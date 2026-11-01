@@ -1,0 +1,37 @@
+[package]
+name = "repose-robot-description"
+description = "Startup URDF and SRDF import into fixed-capacity Copper serial robot models"
+version.workspace = true
+publish.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[package.metadata.copper]
+kind = "lib"
+domains = ["algorithm/manipulation"]
+environments = ["host"]
+
+[dependencies]
+repose-kinematics = { version = "0.6.0", path = "../repose_kinematics", default-features = false }
+repose-collision = { version = "0.6.0", path = "../repose_collision", default-features = false }
+cu-spatial-payloads = { workspace = true }
+cu29 = { workspace = true }
+roxmltree = { version = "0.21", optional = true }
+
+[dev-dependencies]
+repose-joint-rrt-star = { path = "../../tasks/repose_joint_rrt_star", default-features = false }
+repose-motion-planning = { path = "../../tasks/repose_motion_planning", default-features = false }
+
+[features]
+default = ["std"]
+std = ["dep:roxmltree", "cu29/std", "repose-kinematics/std", "repose-collision/std"]
+
+[[example]]
+name = "serial_robot"
+required-features = ["std"]
+
+[[test]]
+name = "planning"
+required-features = ["std"]

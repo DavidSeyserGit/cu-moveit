@@ -48,7 +48,7 @@ capability still reachable and adjustable by parameters.
 ## Units
 
 - Public lengths, angles, velocities, accelerations, jerks, and times use
-  `cu29::units` types or the joint-typed enums from `cu-kinematics`
+  `cu29::units` types or the joint-typed enums from `repose-kinematics`
   (`CuJointPosition`, `CuJointVelocity`, `CuJointAcceleration`, `CuJointJerk`).
 - Dimensionless values (gains, weights, probabilities, metric-scaled
   joint-space distances) stay `f64` and say "dimensionless" in their docs.
@@ -66,7 +66,7 @@ capability still reachable and adjustable by parameters.
   library tasks), and payloads/params because real `bevy_reflect` (the
   `cu29/reflect` feature) requires it. Generic type parameters that are not
   reflected get a manual `TypePath` impl (see
-  `cu_motion_planning::impl_planner_type_path!`). `just lint` and `just test`
+  `repose_motion_planning::impl_planner_type_path!`). `just lint` and `just test`
   build with `cu29/reflect` to keep this working.
 - Const generics users change most come first; everything else has a default.
   Names: `N` joints, `M` collision shapes, `MAX_*` capacities.
@@ -78,7 +78,7 @@ capability still reachable and adjustable by parameters.
 - Modules are private; `lib.rs` re-exports the public items, so each item has
   exactly one import path. A crate never re-exports another crate's items.
 - Serde helpers, index lookups, and invariant checks are `pub(crate)`. The one
-  shared set of fixed-array serde helpers lives in `cu-kinematics`.
+  shared set of fixed-array serde helpers lives in `repose-kinematics`.
 - No `#[doc(hidden)] pub`.
 
 ## Hot-path functions

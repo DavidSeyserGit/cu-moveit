@@ -1,0 +1,37 @@
+[package]
+name = "repose-controller"
+description = "Robot-agnostic unified joint controller task for copper-rs: follower setpoint + measured state in, unified joint command out"
+version.workspace = true
+publish.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+repository.workspace = true
+
+[package.metadata.copper]
+kind = "task"
+domains = ["control", "manipulation"]
+environments = ["host", "embedded"]
+
+[dependencies]
+bincode = { workspace = true }
+repose-kinematics = { version = "0.6.0", path = "../../libs/repose_kinematics", default-features = false }
+repose-trajectory = { version = "0.6.0", path = "../../libs/repose_trajectory", default-features = false }
+cu29 = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+ron = "0.12"
+
+[features]
+default = ["std"]
+std = [
+  "cu29/std",
+  "repose-kinematics/std",
+  "repose-trajectory/std",
+  "bincode/std",
+  "serde/std",
+]

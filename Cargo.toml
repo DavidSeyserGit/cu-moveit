@@ -1,27 +1,27 @@
 [workspace]
 members = [
-  "components/bridges/cu_mujoco_sim",
-  "components/libs/cu_repose",
-  "components/libs/cu_kinematics",
-  "components/libs/cu_collision",
-  "components/libs/cu_robot_description",
-  "components/libs/cu_trajectory",
-  "components/tasks/cu_joint_rrt_star",
-  "components/tasks/cu_controller",
-  "components/tasks/cu_io",
-  "components/tasks/cu_motion_planning",
+  "components/bridges/repose_mujoco_sim",
+  "components/libs/repose",
+  "components/libs/repose_kinematics",
+  "components/libs/repose_collision",
+  "components/libs/repose_robot_description",
+  "components/libs/repose_trajectory",
+  "components/tasks/repose_joint_rrt_star",
+  "components/tasks/repose_controller",
+  "components/tasks/repose_io",
+  "components/tasks/repose_motion_planning",
 ]
 default-members = [
-  "components/bridges/cu_mujoco_sim",
-  "components/libs/cu_repose",
-  "components/libs/cu_kinematics",
-  "components/libs/cu_collision",
-  "components/libs/cu_robot_description",
-  "components/libs/cu_trajectory",
-  "components/tasks/cu_joint_rrt_star",
-  "components/tasks/cu_controller",
-  "components/tasks/cu_io",
-  "components/tasks/cu_motion_planning",
+  "components/bridges/repose_mujoco_sim",
+  "components/libs/repose",
+  "components/libs/repose_kinematics",
+  "components/libs/repose_collision",
+  "components/libs/repose_robot_description",
+  "components/libs/repose_trajectory",
+  "components/tasks/repose_joint_rrt_star",
+  "components/tasks/repose_controller",
+  "components/tasks/repose_io",
+  "components/tasks/repose_motion_planning",
 ]
 resolver = "3"
 
@@ -37,6 +37,16 @@ repository = "https://github.com/ReposeRobotics/repose"
 # Pre-1.0: nothing is published to crates.io. Flip this one switch (and add
 # versioned path dependencies, already in place) to start lockstep publishing.
 publish = false
+
+# cargo-release: one shared version, one `vX.Y.Z` tag for the whole workspace.
+# See docs/versioning.md.
+[workspace.metadata.release]
+shared-version = true
+consolidate-commits = true
+tag-name = "v{{version}}"
+pre-release-commit-message = "chore: release v{{version}}"
+publish = false
+push = false
 
 [workspace.dependencies]
 cu29 = { version = "1.3.1", default-features = false, features = ["units"] }

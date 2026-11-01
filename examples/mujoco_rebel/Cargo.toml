@@ -2,7 +2,7 @@
 
 [package]
 name = "sim-demo"
-version = "0.1.0"
+version = "0.0.0"
 edition = "2024"
 rust-version = "1.95"
 publish = false
@@ -13,13 +13,13 @@ path = "src/main.rs"
 
 [dependencies]
 cu29 = { version = "1.3.1", default-features = false, features = ["std", "units"] }
-cu-controller = { path = "../../components/tasks/cu_controller" }
-cu-kinematics = { path = "../../components/libs/cu_kinematics" }
-cu-trajectory = { path = "../../components/libs/cu_trajectory" }
+repose-controller = { path = "../../components/tasks/repose_controller" }
+repose-kinematics = { path = "../../components/libs/repose_kinematics" }
+repose-trajectory = { path = "../../components/libs/repose_trajectory" }
 cu-rng = "1.3.0"
-cu-joint-rrt-star = { path = "../../components/tasks/cu_joint_rrt_star" }
-cu-motion-planning = { path = "../../components/tasks/cu_motion_planning" }
-cu-mujoco-sim = { path = "../../components/bridges/cu_mujoco_sim" }
+repose-joint-rrt-star = { path = "../../components/tasks/repose_joint_rrt_star" }
+repose-motion-planning = { path = "../../components/tasks/repose_motion_planning" }
+repose-mujoco-sim = { path = "../../components/bridges/repose_mujoco_sim" }
 serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
 
 [build-dependencies]
@@ -29,12 +29,12 @@ cu29-build = "1.3.0"
 default = ["std"]
 std = [
   "cu29/std",
-  "cu-controller/std",
-  "cu-kinematics/std",
-  "cu-trajectory/std",
-  "cu-joint-rrt-star/std",
-  "cu-motion-planning/std",
+  "repose-controller/std",
+  "repose-kinematics/std",
+  "repose-trajectory/std",
+  "repose-joint-rrt-star/std",
+  "repose-motion-planning/std",
   "cu-rng/std",
-  "cu-mujoco-sim/std",
+  "repose-mujoco-sim/std",
   "serde/std",
 ]

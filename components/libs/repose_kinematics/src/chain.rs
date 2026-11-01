@@ -1,0 +1,514 @@
+//! Serial kinematic chain definitions, forward kinematics, and geometric Jacobians.
+
+use bincode::Decode;
+use bincode::Encode;
+use cu_spatial_payloads::Transform3D;
+use cu29::prelude::*;
+use cu29::units::si::angle::radian;
+use cu29::units::si::f64::Angle as Angle64;
+use cu29::units::si::f64::Length as Length64;
+use cu29::units::si::length::meter;
+use serde::Deserialize;
+use serde::Serialize;
+
+/// Principal or arbitrary unit axis of actuation in the joint's local frame.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, Encode, Decode, Reflect,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CuJointAxis {
+    PosX,
+    NegX,
+    PosY,
+    NegY,
+    #[default]
+    PosZ,
+    NegZ,
+    Arbitrary([f64; 3]),
+}
+
+impl CuJointAxis {
+    /// Returns the unit vector `[x, y, z]` in the local joint frame.
+    pub fn unit_vector(self) -> [f64; 3] {
+        match self {
+            Self::PosX => [1.0, 0.0, 0.0],
+            Self::NegX => [-1.0, 0.0, 0.0],
+            Self::PosY => [0.0, 1.0, 0.0],
+            Self::NegY => [0.0, -1.0, 0.0],
+            Self::PosZ => [0.0, 0.0, 1.0],
+            Self::NegZ => [0.0, 0.0, -1.0],
+            Self::Arbitrary(v) => {
+                let norm = libm::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+                v.map(|c| c / norm)
+            }
+        }
+    }
+}
+
+/// Actuation mechanism of a single joint in a serial chain.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, Reflect,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CuJointType {
+    #[default]
+    Revolute,
+    Prismatic,
+    Fixed,
+}
+
+use crate::joint::CuJointLimits;
+use crate::joint::CuJointPosition;
+
+/// Static kinematic specification of a single joint following URDF conventions.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, Encode, Decode, Reflect,
+)]
+#[serde(deny_unknown_fields)]
+pub struct CuJointSpec {
+    /// Actuation mechanism.
+    pub joint_type: CuJointType,
+    /// Parent-to-joint translation (URDF `origin xyz`).
+    pub origin_translation: [Length64; 3],
+    /// Parent-to-joint roll-pitch-yaw (URDF `origin rpy`).
+    pub origin_rpy: [Angle64; 3],
+    /// Actuation axis in the joint frame.
+    pub axis: CuJointAxis,
+    /// Position and velocity bounds.
+    pub limits: CuJointLimits,
+}
+
+impl CuJointSpec {
+    /// Creates a revolute joint from its parent-frame origin (URDF `xyz`, `rpy`).
+    pub const fn revolute(
+        origin_translation: [Length64; 3],
+        origin_rpy: [Angle64; 3],
+        axis: CuJointAxis,
+        limits: CuJointLimits,
+    ) -> Self {
+        Self::actuated(
+            CuJointType::Revolute,
+            origin_translation,
+            origin_rpy,
+            axis,
+            limits,
+        )
+    }
+
+    /// Creates a prismatic joint from its parent-frame origin (URDF `xyz`, `rpy`).
+    pub const fn prismatic(
+        origin_translation: [Length64; 3],
+        origin_rpy: [Angle64; 3],
+        axis: CuJointAxis,
+        limits: CuJointLimits,
+    ) -> Self {
+        Self::actuated(
+            CuJointType::Prismatic,
+            origin_translation,
+            origin_rpy,
+            axis,
+            limits,
+        )
+    }
+
+    const fn actuated(
+        joint_type: CuJointType,
+        origin_translation: [Length64; 3],
+        origin_rpy: [Angle64; 3],
+        axis: CuJointAxis,
+        limits: CuJointLimits,
+    ) -> Self {
+        Self {
+            joint_type,
+            origin_translation,
+            origin_rpy,
+            axis,
+            limits,
+        }
+    }
+
+    /// Checks coordinate units and validity of joint specifications before numerical work.
+    pub fn validate_coordinate(&self, q: CuJointPosition) -> CuResult<()> {
+        self.limits.validate(q)?;
+        if self
+            .origin_translation
+            .iter()
+            .any(|v| !v.get::<meter>().is_finite())
+            || self
+                .origin_rpy
+                .iter()
+                .any(|v| !v.get::<radian>().is_finite())
+            || (self.joint_type != CuJointType::Fixed
+                && self.axis.unit_vector().iter().any(|v| !v.is_finite()))
+        {
+            return Err(CuError::from(
+                "Non-finite joint origin or invalid joint axis",
+            ));
+        }
+        if !matches!(
+            (self.joint_type, q),
+            (CuJointType::Revolute, CuJointPosition::Revolute(_))
+                | (CuJointType::Prismatic, CuJointPosition::Prismatic(_))
+                | (CuJointType::Fixed, CuJointPosition::Fixed)
+        ) {
+            return Err(CuError::from("Joint type and coordinate units disagree"));
+        }
+        Ok(())
+    }
+
+    /// Computes the static parent-to-joint origin transform.
+    pub fn origin_transform(&self) -> Transform3D<f64> {
+        Transform3D::<f64>::from_translation_euler_xyz(self.origin_translation, self.origin_rpy)
+    }
+
+    /// Computes the local motion transform for joint displacement `q`.
+    pub fn motion_transform(&self, q: CuJointPosition) -> CuResult<Transform3D<f64>> {
+        self.validate_coordinate(q)?;
+        let val = q.si_value();
+        let u = self.axis.unit_vector();
+        Ok(match self.joint_type {
+            CuJointType::Fixed => Transform3D::<f64>::identity(),
+            CuJointType::Revolute => axis_angle_transform(u, val),
+            CuJointType::Prismatic => Transform3D::<f64>::from_matrix([
+                [1.0, 0.0, 0.0, u[0] * val],
+                [0.0, 1.0, 0.0, u[1] * val],
+                [0.0, 0.0, 1.0, u[2] * val],
+                [0.0, 0.0, 0.0, 1.0],
+            ]),
+        })
+    }
+}
+
+/// Compile-time sized $N$-DOF serial robot kinematic chain.
+///
+/// # Example
+/// ```rust
+/// use repose_kinematics::{CuJointAxis, CuJointLimits, CuJointSpec, CuKinematicChain};
+/// use cu_spatial_payloads::Transform3D;
+/// use cu29::units::si::angle::radian;
+/// use cu29::units::si::angular_velocity::radian_per_second;
+/// use cu29::units::si::f64::{Angle, AngularVelocity, Length};
+/// use cu29::units::si::length::meter;
+///
+/// let m = Length::new::<meter>;
+/// let rad = Angle::new::<radian>;
+/// let chain = CuKinematicChain::new([CuJointSpec::revolute(
+///     [m(0.0), m(0.0), m(0.1)],
+///     [rad(0.0); 3],
+///     CuJointAxis::PosZ,
+///     CuJointLimits::revolute(
+///         rad(-core::f64::consts::PI),
+///         rad(core::f64::consts::PI),
+///         AngularVelocity::new::<radian_per_second>(2.0),
+///     ),
+/// )])
+/// .with_tool_offset(Transform3D::<f64>::from_translation_euler_xyz([m(0.0), m(0.0), m(0.05)], [rad(0.0); 3]));
+/// chain.validate().unwrap();
+/// let mut ee = Transform3D::<f64>::identity();
+/// chain.forward_kinematics(&[Angle::new::<radian>(0.0).into()], &mut ee).unwrap();
+/// assert!((ee.to_matrix()[2][3] - 0.15).abs() < 1e-12);
+/// ```
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Reflect)]
+#[reflect(no_field_bounds, from_reflect = false)]
+#[serde(deny_unknown_fields)]
+pub struct CuKinematicChain<const N: usize> {
+    #[serde(with = "crate::serde_arrays::joint_spec_array")]
+    joints: [CuJointSpec; N],
+    #[serde(default = "Transform3D::<f64>::identity")]
+    tool_offset: Transform3D<f64>,
+}
+
+impl<const N: usize> PartialEq for CuKinematicChain<N> {
+    fn eq(&self, other: &Self) -> bool {
+        self.joints == other.joints && self.tool_offset.to_matrix() == other.tool_offset.to_matrix()
+    }
+}
+
+impl<const N: usize> CuKinematicChain<N> {
+    /// Creates a serial kinematic chain with an identity tool offset.
+    pub const fn new(joints: [CuJointSpec; N]) -> Self {
+        Self {
+            joints,
+            tool_offset: Transform3D::<f64>::identity(),
+        }
+    }
+
+    /// Replaces the flange-to-tool transform (builder form of [`Self::set_tool_offset`]).
+    pub const fn with_tool_offset(mut self, tool_offset: Transform3D<f64>) -> Self {
+        self.tool_offset = tool_offset;
+        self
+    }
+
+    /// Checks that every joint has finite origins, a valid axis, and well-formed limits.
+    pub fn validate(&self) -> CuResult<()> {
+        for joint in &self.joints {
+            joint.validate_coordinate(joint.limits.lower())?;
+        }
+        if self
+            .tool_offset
+            .to_matrix()
+            .iter()
+            .flatten()
+            .any(|v| !v.is_finite())
+        {
+            return Err(CuError::from("Non-finite chain tool offset"));
+        }
+        Ok(())
+    }
+
+    /// Borrows the static joint specifications.
+    pub const fn joints(&self) -> &[CuJointSpec; N] {
+        &self.joints
+    }
+
+    /// Borrows the flange-to-tool transform.
+    pub const fn tool_offset(&self) -> &Transform3D<f64> {
+        &self.tool_offset
+    }
+
+    /// Sets the flange-to-tool transform.
+    pub fn set_tool_offset(&mut self, tool_offset: Transform3D<f64>) {
+        self.tool_offset = tool_offset;
+    }
+
+    /// Returns `true` if every joint angle in `q` satisfies its joint limits.
+    pub fn is_within_limits(&self, q: &[CuJointPosition; N]) -> bool {
+        let mut i = 0;
+        while i < N {
+            if self.joints[i].validate_coordinate(q[i]).is_err()
+                || !self.joints[i].limits.contains(q[i])
+            {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    /// Clamps each joint angle in `q` in place to its configured limits.
+    pub fn clamp_to_limits(&self, q: &mut [CuJointPosition; N]) -> CuResult<()> {
+        let mut i = 0;
+        while i < N {
+            self.joints[i].validate_coordinate(q[i])?;
+            q[i] = self.joints[i].limits.clamp(q[i])?;
+            i += 1;
+        }
+        Ok(())
+    }
+
+    /// Computes the base-to-tool forward kinematics transform in place.
+    pub fn forward_kinematics(
+        &self,
+        q: &[CuJointPosition; N],
+        out: &mut Transform3D<f64>,
+    ) -> CuResult<()> {
+        let mut acc = Transform3D::<f64>::identity();
+        let mut i = 0;
+        while i < N {
+            if !q[i].si_value().is_finite() {
+                return Err(CuError::from("repose_kinematics: non-finite joint angle"));
+            }
+            let step = self.joints[i]
+                .origin_transform()
+                .compose(self.joints[i].motion_transform(q[i])?);
+            acc = acc.compose(step);
+            i += 1;
+        }
+        *out = acc.compose(self.tool_offset);
+        Ok(())
+    }
+
+    /// Computes every intermediate link frame (`0..N`) and the final end-effector frame in place.
+    pub fn forward_frames(
+        &self,
+        q: &[CuJointPosition; N],
+        out_frames: &mut [Transform3D<f64>; N],
+        out_ee: &mut Transform3D<f64>,
+    ) -> CuResult<()> {
+        let mut acc = Transform3D::<f64>::identity();
+        let mut i = 0;
+        while i < N {
+            if !q[i].si_value().is_finite() {
+                return Err(CuError::from("repose_kinematics: non-finite joint angle"));
+            }
+            let step = self.joints[i]
+                .origin_transform()
+                .compose(self.joints[i].motion_transform(q[i])?);
+            acc = acc.compose(step);
+            out_frames[i] = acc;
+            i += 1;
+        }
+        *out_ee = acc.compose(self.tool_offset);
+        Ok(())
+    }
+
+    /// Computes the $6 \times N$ geometric space Jacobian in the base frame in place.
+    ///
+    /// Rows `0..3` correspond to linear velocity $[v_x, v_y, v_z]^T$ in $\text{m/s}$ and
+    /// rows `3..6` correspond to angular velocity $[\omega_x, \omega_y, \omega_z]^T$ in $\text{rad/s}$,
+    /// both measured at the tool origin and expressed in the base frame.
+    pub fn geometric_jacobian(
+        &self,
+        q: &[CuJointPosition; N],
+        out_jacobian: &mut [[f64; N]; 6],
+    ) -> CuResult<()> {
+        let mut ee = Transform3D::<f64>::identity();
+        self.geometric_jacobian_and_pose(q, out_jacobian, &mut ee)
+    }
+
+    /// Computes the $6 \times N$ geometric body Jacobian in the end-effector (tool) frame in place.
+    ///
+    /// Rows `0..3` correspond to linear velocity $[v_x, v_y, v_z]^T$ in $\text{m/s}$ and
+    /// rows `3..6` correspond to angular velocity $[\omega_x, \omega_y, \omega_z]^T$ in $\text{rad/s}$,
+    /// both measured at the tool origin and expressed in the end-effector frame.
+    pub fn body_jacobian(
+        &self,
+        q: &[CuJointPosition; N],
+        out_jacobian: &mut [[f64; N]; 6],
+    ) -> CuResult<()> {
+        let mut space_jac = [[0.0_f64; N]; 6];
+        let mut ee = Transform3D::<f64>::identity();
+        self.geometric_jacobian_and_pose(q, &mut space_jac, &mut ee)?;
+
+        let ee_mat = ee.to_matrix();
+        let mut col = 0;
+        while col < N {
+            let vx = space_jac[0][col];
+            let vy = space_jac[1][col];
+            let vz = space_jac[2][col];
+            let wx = space_jac[3][col];
+            let wy = space_jac[4][col];
+            let wz = space_jac[5][col];
+
+            // Multiply by R_ee^T (columns of R_ee become rows of R_ee^T)
+            out_jacobian[0][col] = ee_mat[0][0] * vx + ee_mat[1][0] * vy + ee_mat[2][0] * vz;
+            out_jacobian[1][col] = ee_mat[0][1] * vx + ee_mat[1][1] * vy + ee_mat[2][1] * vz;
+            out_jacobian[2][col] = ee_mat[0][2] * vx + ee_mat[1][2] * vy + ee_mat[2][2] * vz;
+
+            out_jacobian[3][col] = ee_mat[0][0] * wx + ee_mat[1][0] * wy + ee_mat[2][0] * wz;
+            out_jacobian[4][col] = ee_mat[0][1] * wx + ee_mat[1][1] * wy + ee_mat[2][1] * wz;
+            out_jacobian[5][col] = ee_mat[0][2] * wx + ee_mat[1][2] * wy + ee_mat[2][2] * wz;
+            col += 1;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn geometric_jacobian_and_pose(
+        &self,
+        q: &[CuJointPosition; N],
+        out_jacobian: &mut [[f64; N]; 6],
+        out_ee: &mut Transform3D<f64>,
+    ) -> CuResult<()> {
+        let mut joint_origins = [[0.0_f64; 3]; N];
+        let mut world_axes = [[0.0_f64; 3]; N];
+        let mut acc = Transform3D::<f64>::identity();
+
+        let mut i = 0;
+        while i < N {
+            if !q[i].si_value().is_finite() {
+                return Err(CuError::from("repose_kinematics: non-finite joint angle"));
+            }
+            let joint_frame = acc.compose(self.joints[i].origin_transform());
+            let mat = joint_frame.to_matrix();
+            joint_origins[i] = [mat[0][3], mat[1][3], mat[2][3]];
+
+            let local_axis = self.joints[i].axis.unit_vector();
+            world_axes[i] = [
+                mat[0][0] * local_axis[0] + mat[0][1] * local_axis[1] + mat[0][2] * local_axis[2],
+                mat[1][0] * local_axis[0] + mat[1][1] * local_axis[1] + mat[1][2] * local_axis[2],
+                mat[2][0] * local_axis[0] + mat[2][1] * local_axis[1] + mat[2][2] * local_axis[2],
+            ];
+
+            acc = joint_frame.compose(self.joints[i].motion_transform(q[i])?);
+            i += 1;
+        }
+
+        *out_ee = acc.compose(self.tool_offset);
+        let ee_mat = out_ee.to_matrix();
+        let p_ee = [ee_mat[0][3], ee_mat[1][3], ee_mat[2][3]];
+
+        let mut col = 0;
+        while col < N {
+            let w = world_axes[col];
+            match self.joints[col].joint_type {
+                CuJointType::Revolute => {
+                    let r = [
+                        p_ee[0] - joint_origins[col][0],
+                        p_ee[1] - joint_origins[col][1],
+                        p_ee[2] - joint_origins[col][2],
+                    ];
+                    let v = cross3(w, r);
+                    out_jacobian[0][col] = v[0];
+                    out_jacobian[1][col] = v[1];
+                    out_jacobian[2][col] = v[2];
+                    out_jacobian[3][col] = w[0];
+                    out_jacobian[4][col] = w[1];
+                    out_jacobian[5][col] = w[2];
+                }
+                CuJointType::Prismatic => {
+                    out_jacobian[0][col] = w[0];
+                    out_jacobian[1][col] = w[1];
+                    out_jacobian[2][col] = w[2];
+                    out_jacobian[3][col] = 0.0;
+                    out_jacobian[4][col] = 0.0;
+                    out_jacobian[5][col] = 0.0;
+                }
+                CuJointType::Fixed => {
+                    out_jacobian[0][col] = 0.0;
+                    out_jacobian[1][col] = 0.0;
+                    out_jacobian[2][col] = 0.0;
+                    out_jacobian[3][col] = 0.0;
+                    out_jacobian[4][col] = 0.0;
+                    out_jacobian[5][col] = 0.0;
+                }
+            }
+            col += 1;
+        }
+        Ok(())
+    }
+}
+
+const fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn axis_angle_transform(axis: [f64; 3], angle_rad: f64) -> Transform3D<f64> {
+    let norm_sq = axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2];
+    if norm_sq <= 1e-15 {
+        return Transform3D::<f64>::identity();
+    }
+    let inv_norm = 1.0 / libm::sqrt(norm_sq);
+    let ux = axis[0] * inv_norm;
+    let uy = axis[1] * inv_norm;
+    let uz = axis[2] * inv_norm;
+
+    let s = libm::sin(angle_rad);
+    let c = libm::cos(angle_rad);
+    let one_minus_c = 1.0 - c;
+
+    Transform3D::<f64>::from_matrix([
+        [
+            c + ux * ux * one_minus_c,
+            ux * uy * one_minus_c - uz * s,
+            ux * uz * one_minus_c + uy * s,
+            0.0,
+        ],
+        [
+            uy * ux * one_minus_c + uz * s,
+            c + uy * uy * one_minus_c,
+            uy * uz * one_minus_c - ux * s,
+            0.0,
+        ],
+        [
+            uz * ux * one_minus_c - uy * s,
+            uz * uy * one_minus_c + ux * s,
+            c + uz * uz * one_minus_c,
+            0.0,
+        ],
+        [0.0, 0.0, 0.0, 1.0],
+    ])
+}
