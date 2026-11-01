@@ -5,7 +5,7 @@
 //! dependency, so an application needs a single line in `Cargo.toml`:
 //!
 //! ```toml
-//! cu-repose = { git = "https://github.com/DavidSeyserGit/cu-moveit", tag = "v0.7.0" }
+//! cu-repose = { git = "https://github.com/ReposeRobotics/repose", tag = "v0.7.0" }
 //! ```
 //!
 //! | Module | Crate | Provides |

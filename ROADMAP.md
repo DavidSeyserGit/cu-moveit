@@ -40,7 +40,7 @@ in that order.
   `CuJointPositionsPayload<6>` both ways (released in `v0.2.1`); the local
   playground closes the plan → follow → sim → feedback loop.
 - All crates pass `just pr-check` and are published at
-  https://github.com/DavidSeyserGit/cu-moveit.
+  https://github.com/ReposeRobotics/repose.
 
 ## Approach
 

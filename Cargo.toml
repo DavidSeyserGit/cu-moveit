@@ -33,7 +33,7 @@ rust-version = "1.95"
 license = "Apache-2.0"
 keywords = ["robotics", "manipulation", "kinematics", "copper", "real-time"]
 categories = ["science::robotics"]
-repository = "https://github.com/DavidSeyserGit/cu-moveit"
+repository = "https://github.com/ReposeRobotics/repose"
 # Pre-1.0: nothing is published to crates.io. Flip this one switch (and add
 # versioned path dependencies, already in place) to start lockstep publishing.
 publish = false
