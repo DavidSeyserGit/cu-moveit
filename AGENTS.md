@@ -1,6 +1,6 @@
-# cu-moveit Agent Guidance
+# Repose Agent Guidance
 
-`cu-moveit` is a Copper-idiomatic (`cu29`) manipulation, kinematics, collision checking, and motion planning workspace built in strict alignment with `copper-project/copper-rs`.
+**Repose** (this repository, umbrella crate `cu-repose`) is a Copper-idiomatic (`cu29`) manipulation, kinematics, collision checking, and motion planning workspace built in strict alignment with `copper-project/copper-rs`.
 
 ## Skills
 

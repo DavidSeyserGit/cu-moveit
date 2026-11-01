@@ -34,6 +34,7 @@ api-check:
     cargo public-api -p cu-motion-planning
     cargo public-api -p cu-joint-rrt-star
     cargo public-api -p cu-mujoco-sim
+    cargo public-api -p cu-repose
 
 # Dry-run packaging for every crate without publishing (publish = false must be flipped first at 1.0).
 release-dry-run:
@@ -46,6 +47,7 @@ release-dry-run:
     cargo publish --dry-run -p cu-motion-planning
     cargo publish --dry-run -p cu-joint-rrt-star
     cargo publish --dry-run -p cu-mujoco-sim
+    cargo publish --dry-run -p cu-repose
 
 # Verify strict no_std compatibility across shared crates.
 nostd-ci:

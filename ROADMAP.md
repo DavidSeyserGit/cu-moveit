@@ -1,8 +1,8 @@
-# cu-moveit Roadmap
+# Repose Roadmap
 
 ## Goal
 
-Build a general, MoveIt-equivalent manipulation stack for
+Build Repose, a general manipulation stack comparable in scope to MoveIt, for
 [copper-rs (`cu29`)](https://github.com/copper-project/copper-rs) — Copper-native,
 not ported from ROS. It covers kinematics, collision checking, motion planning,
 trajectory generation, execution, servoing, and robot bridges for Copper apps,
@@ -163,8 +163,7 @@ Controller-interface completion, building on `v0.2.2`:
    `just api-check` / `just release-dry-run`. To publish: flip the single
    `publish = false` switch in the workspace `Cargo.toml` to `true`, publish
    all crates to crates.io in lockstep (dependency order) at the shared
-   version, add the thin `cu-moveit` facade crate re-exporting them behind
-   features, and tag the release `v1.0.0`. Until then, releases are
+   version, publish the `cu-repose` umbrella crate that re-exports them, and tag the release `v1.0.0`. Until then, releases are
    git tags (`vX.Y.Z`, workspace-wide, never per-crate) with GitHub Releases,
    and consumers use git dependencies.
 

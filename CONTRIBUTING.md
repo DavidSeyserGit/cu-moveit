@@ -1,4 +1,4 @@
-# Contributing to cu-moveit
+# Contributing to Repose
 
 This repository follows the exact contribution workflow and design standards of [`copper-project/copper-rs`](https://github.com/copper-project/copper-rs/blob/master/CONTRIBUTING.md) so crates developed here can be upstreamed directly into `copper-rs`.
 

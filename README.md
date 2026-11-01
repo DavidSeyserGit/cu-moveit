@@ -1,13 +1,16 @@
-# cu-moveit
+# Repose
 
-Deterministic, zero-allocation robot manipulation, kinematics, collision checking, and motion planning components for [`copper-rs` (`cu29`)](https://github.com/copper-project/copper-rs), designed from the ground up to follow Copper's `std`/`no_std`, compile-time static graph, and replay-deterministic architecture.
+**Repose** by [Repose Robotics](https://reposerobotics.org) is a deterministic, real-time manipulation stack for robot arms: kinematics, collision checking, motion planning, trajectory timing, and control as zero-allocation components for [`copper-rs` (`cu29`)](https://github.com/copper-project/copper-rs), designed from the ground up to follow Copper's `std`/`no_std`, compile-time static graph, and replay-deterministic architecture.
 
 ## Crates
 
+Add the whole stack with one dependency, the `cu-repose` umbrella crate, or depend on individual components. Product site: [getrepose.dev](https://getrepose.dev).
+
 | Crate | Path | Kind | Description |
 |---|---|---|---|
+| `cu-repose` | `components/libs/cu_repose` | umbrella | Re-exports every component below (`kinematics`, `collision`, `motion_planning`, …); MuJoCo bridge behind feature `mujoco-sim` |
 | `cu-kinematics` | `components/libs/cu_kinematics` | `lib` / `task` | Const-generic `CuKinematicChain<N>` forward kinematics, space/body geometric Jacobians, DLS inverse kinematics, differential IK with singularity/limit damping, `CuForwardKinematicsTask<N>`, `CuInverseKinematicsTask<N>`, `CuServoTask<N>`, the bridge-facing `CuJointStatePayload<N>`, and 6-DOF igus ReBeL model |
-| `cu-collision` | `components/libs/cu_collision` | `lib` / `task` | Fixed-capacity sphere/capsule primitives, exact signed-distance queries, `CuRobotCollisionModel<N>`, `CuCollisionWorld<MAX_OBSTACLES>`, `CuCollisionCheckTask<N>`, and igus ReBeL collision geometry |
+| `cu-collision` | `components/libs/cu_collision` | `lib` / `task` | Fixed-capacity sphere/capsule primitives, exact signed-distance queries, `CuRobotCollisionModel<N, M>`, `CuPlanningScene` with a zero-copy `CuCollisionEnv`, `CuCollisionCheckTask<N>`, and igus ReBeL collision geometry |
 | `cu-robot-description` | `components/libs/cu_robot_description` | `startup lib` | URDF serial-chain extraction, primitive collision conversion, and SRDF serial groups, collision exclusions, and named states |
 | `cu-trajectory` | `components/libs/cu_trajectory` | `lib` / `task` | Fixed-capacity joint trajectories, interpolation, timing profiles, and sampled Cartesian TCP-zone blending |
 | `cu-motion-planning` | `components/tasks/cu_motion_planning` | `lib` / `task` | Planner-agnostic contract: `CuJointPlanner` trait, `CuJointPlanRequest<N>` / `CuJointPlanPath<N>` with explicit `CuPlanStatus`, shared scene validity checks, the generic anytime `CuJointPlannerTask<P, N>`, `CuJointGoalTask<N>` (state + goal → request) and `CuPlanToTrajectoryTask<N, CAP>` (path → timed trajectory), and built-in planners: RRT-Connect and PRM (sampling), A* lattice (search), gradient path optimizer and STOMP (optimization), direct joint line |
@@ -24,12 +27,12 @@ Nothing is published to crates.io yet (`publish = false` workspace-wide; the API
 is pre-1.0 and may change). Depend on the git repository instead:
 
 ```toml
-cu-kinematics = { git = "https://github.com/DavidSeyserGit/cu-moveit", tag = "v0.6.0" }
+cu-repose = { git = "https://github.com/DavidSeyserGit/cu-moveit", tag = "v0.7.0" }
 ```
 
 The workspace is versioned and tagged as a whole (`vX.Y.Z`), never per crate.
 At 1.0 the crates will be published to crates.io in lockstep behind a single
-`cu-moveit` facade crate; see the publishing step in [ROADMAP.md](ROADMAP.md).
+`cu-repose` umbrella crate; see the publishing step in [ROADMAP.md](ROADMAP.md).
 
 ## Quick Start
 

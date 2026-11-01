@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "components/bridges/cu_mujoco_sim",
+  "components/libs/cu_repose",
   "components/libs/cu_kinematics",
   "components/libs/cu_collision",
   "components/libs/cu_robot_description",
@@ -12,6 +13,7 @@ members = [
 ]
 default-members = [
   "components/bridges/cu_mujoco_sim",
+  "components/libs/cu_repose",
   "components/libs/cu_kinematics",
   "components/libs/cu_collision",
   "components/libs/cu_robot_description",
