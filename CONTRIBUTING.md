@@ -4,6 +4,8 @@ This repository follows the exact contribution workflow and design standards of 
 
 ## Contribution Workflow
 
+AI agents and tools follow the same rules, spelled out in `AGENTS.md`.
+
 `master` is protected: every change lands through a pull request with green CI,
 and nobody pushes to it directly.
 
