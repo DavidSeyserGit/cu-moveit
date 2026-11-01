@@ -4,7 +4,6 @@ on:
   push:
     branches: [master]
   pull_request:
-    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 permissions:
   contents: read
@@ -36,12 +35,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0 # needs the release tags as baseline
+      # Breaks are allowed when CHANGELOG.md lists them under Unreleased (see justfile).
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-semver-checks,just
       - name: Check SemVer against the latest release tag
-        env:
-          # A PR labelled `breaking` targets the next minor release (pre-1.0).
-          SEMVER_RELEASE_TYPE: ${{ contains(github.event.pull_request.labels.*.name, 'breaking') && 'minor' || '' }}
         run: just semver-check

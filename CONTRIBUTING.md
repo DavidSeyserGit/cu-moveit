@@ -24,7 +24,9 @@ tag. Do the work in one worktree per branch, next to the repository:
 ```bash
 just wt lucas/feat/kinematics-ik      # ../repose-wt/kinematics-ik on a new branch from origin/master
 cd ../repose-wt/kinematics-ik
-# ...work, commit, push, open the PR...
+# ...work, commit...
+git push -u origin lucas/feat/kinematics-ik
+gh pr create --fill
 just wt-clean                         # from the main checkout: remove worktrees whose branch is merged
 ```
 
@@ -38,12 +40,14 @@ two worktrees.
    reflect), nextest, doctests and the SemVer check.
 2. Add an entry under `Unreleased` in `CHANGELOG.md` for any user-visible
    change.
-3. Push and open a PR against `master` (`gh pr create --fill`). The title is
+3. Push (`git push -u origin <branch>` the first time) and open a PR against
+   `master` (`gh pr create --fill`). The title is
    the eventual commit message; the body says what changed, why, and how it
    was tested.
-4. If the change is intentionally breaking (see `docs/versioning.md`), put
-   it under `### Breaking` in the changelog and add the `breaking` label, which
-   tells CI's SemVer check to allow it.
+4. If the change is intentionally breaking (see `docs/versioning.md`), list
+   it under `### Breaking` in the `Unreleased` changelog section. The SemVer
+   check then treats the next release as a minor and allows the break, for this
+   PR and for later ones until the release.
 5. PRs are **squash-merged**, so `master` gets one commit per PR and stays
    linear. Delete the branch after merging.
 
