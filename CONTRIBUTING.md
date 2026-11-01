@@ -4,10 +4,52 @@ This repository follows the exact contribution workflow and design standards of 
 
 ## Contribution Workflow
 
-1. Create a branch from `master` using `user/kind/description`, for example `lucas/feat/kinematics-ik`.
-2. Make one focused change. Add tests and update documentation or examples where behavior requires them.
-3. Run `just` (`just pr-check`) from the repository root. It checks formatting, runs `clippy --deny warnings` on `std` and `no_std`, runs `cargo nextest` on `std` and `no_std`, and runs doctests.
-4. Review the complete diff, then commit with a clear message.
+`master` is protected: every change lands through a pull request with green CI,
+and nobody pushes to it directly.
+
+### Branches
+
+- Branch from the latest `origin/master` and name it `user/kind/description`,
+  e.g. `lucas/feat/kinematics-ik`. `kind` is one of `feat`, `fix`, `refactor`,
+  `docs`, `chore`, `perf`, `test`.
+- Agent-created branches may use the tool's prefix (e.g. `t3/...`).
+- One branch, one focused change. Keep branches short-lived; rebase on
+  `origin/master` instead of merging it in.
+
+### Worktrees
+
+Keep the main checkout on a clean `master`: use it only to pull, review and
+tag. Do the work in one worktree per branch, next to the repository:
+
+```bash
+just wt lucas/feat/kinematics-ik      # ../repose-wt/kinematics-ik on a new branch from origin/master
+cd ../repose-wt/kinematics-ik
+# ...work, commit, push, open the PR...
+just wt-clean                         # from the main checkout: remove worktrees whose branch is merged
+```
+
+Worktrees share one `.git`, so branches and fetched refs are visible
+everywhere, but each has its own `target/`. Don't check out the same branch in
+two worktrees.
+
+### Pull requests
+
+1. Run `just` (`just pr-check`): formatting, clippy (`std`, `no_std`,
+   reflect), nextest, doctests and the SemVer check.
+2. Add an entry under `Unreleased` in `CHANGELOG.md` for any user-visible
+   change.
+3. Push and open a PR against `master` (`gh pr create --fill`). The title is
+   the eventual commit message; the body says what changed, why, and how it
+   was tested.
+4. If the change is intentionally breaking (see `docs/versioning.md`), put
+   it under `### Breaking` in the changelog and add the `breaking` label, which
+   tells CI's SemVer check to allow it.
+5. PRs are **squash-merged**, so `master` gets one commit per PR and stays
+   linear. Delete the branch after merging.
+
+### Releases
+
+Releases go through a PR too; see `docs/versioning.md`.
 
 ## Design Expectations
 

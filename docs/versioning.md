@@ -61,15 +61,18 @@ Examples and the local playground are not versioned (`version = "0.0.0"`,
 
 ## Release process
 
-1. Update `CHANGELOG.md`: move `Unreleased` entries under the new version
-   with the date, and update the README compatibility table if needed.
-2. `just pr-check`, which includes `just semver-check`: every library crate is
-   checked with `cargo-semver-checks` against the latest `v*` tag. If a branch
-   breaks the API on purpose, the next release must be a minor; confirm with
-   `SEMVER_RELEASE_TYPE=minor just pr-check`. Crates missing from the baseline
-   tag (new or renamed) are skipped.
-3. `just release <patch|minor>`: dry run; then `just release <level> --execute`.
-   This runs `cargo release`, which bumps the shared version, commits and
-   creates the `vX.Y.Z` tag. It does not push or publish.
-4. Push the commit and tag, and publish the GitHub release using the
-   changelog section as the notes.
+`master` is protected, so the version bump lands through a PR and the tag is
+created afterwards on the merged commit.
+
+1. `just wt lucas/chore/release-vX.Y.Z` and work in that worktree.
+2. In `CHANGELOG.md`, move the `Unreleased` entries under `## [X.Y.Z] - date`
+   and update the compare links; update the README compatibility table if
+   needed. Commit.
+3. `just release <patch|minor>` (dry run), then
+   `just release <patch|minor> --execute`. This runs `cargo release`, which
+   bumps the shared version and commits; it neither tags, pushes nor publishes.
+4. Run `just pr-check`, push, and open the release PR. Squash-merge it once CI
+   is green.
+5. From the main checkout, `git pull` and run `just tag`. This tags the
+   merged commit `vX.Y.Z` (taken from `Cargo.toml`) and pushes the tag. The
+   `Release` workflow then creates the GitHub release.

@@ -30,7 +30,7 @@ Versioning, breaking-change rules, and releases follow `docs/versioning.md`; rec
    - Payloads derive `#[derive(Default, Debug, Clone, Encode, Decode, Serialize, Deserialize, Reflect)]`.
    - `Tov` stays on the `CuMsg` envelope, never inside payload structs.
    - Tasks derive `Reflect` and implement `Freezable` + `CuTask` (or `CuAnytimeTask`).
-7. **Workflow:** Remove generated `Cargo.lock` before a work pass if needed, run `just fmt` after edits, and run `just pr-check` before committing.
+7. **Workflow:** Never commit to or push `master`; work on a branch in its own worktree and land it through a PR (see `CONTRIBUTING.md`). Remove generated `Cargo.lock` before a work pass if needed, run `just fmt` after edits, and run `just pr-check` before committing.
 
 ## Roadmap
 

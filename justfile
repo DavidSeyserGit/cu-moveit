@@ -55,8 +55,8 @@ semver-check baseline=`git describe --tags --abbrev=0 --match 'v*'`:
     # One invocation so the baseline is checked out and built once for all crates.
     cargo semver-checks check-release "${args[@]}" --baseline-rev "{{baseline}}" ${release_type:+--release-type "$release_type"}
 
-# Bump the shared workspace version, commit and tag vX.Y.Z (needs cargo-release; see docs/versioning.md).
-# Dry run by default; pass --execute to apply. Never pushes or publishes.
+# Bump the shared workspace version and commit, on a release branch (needs cargo-release; see docs/versioning.md).
+# Dry run by default; pass --execute to apply. Never tags, pushes or publishes.
 release level *args:
     cargo release {{level}} --workspace {{args}}
 
@@ -78,3 +78,35 @@ nostd-ci:
     cargo check --workspace --no-default-features
     cargo clippy --workspace --lib --no-default-features -- --deny warnings
     cargo nextest run --workspace --no-default-features
+
+# Create a worktree for a new branch off origin/master at ../repose-wt/<last path segment of branch>.
+wt branch:
+    git fetch origin master
+    git worktree add -b {{branch}} ../repose-wt/{{file_name(branch)}} origin/master
+    @echo "cd ../repose-wt/{{file_name(branch)}}"
+
+# Remove worktrees (and local branches) whose branch is merged into origin/master or deleted on the remote.
+wt-clean:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    git fetch --prune origin
+    git worktree list --porcelain | awk '/^worktree /{p=$2} /^branch /{sub("refs/heads/","",$2); print p, $2}' |
+    while read -r path branch; do
+        [ "$branch" = master ] && continue
+        gone=$(git for-each-ref --format='%(upstream:track)' "refs/heads/$branch")
+        if git merge-base --is-ancestor "$branch" origin/master || [ "$gone" = "[gone]" ]; then
+            echo "removing $path ($branch)"
+            git worktree remove "$path" && git branch -D "$branch"
+        fi
+    done
+    git worktree prune
+
+# Tag the current master commit vX.Y.Z from the workspace version and push the tag (after the release PR is merged).
+tag:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [ "$(git branch --show-current)" = master ] || { echo "run on master"; exit 1; }
+    git pull --ff-only origin master
+    version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "repose") | .version')
+    git tag -a "v$version" -m "Repose v$version"
+    git push origin "v$version"

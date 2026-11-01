@@ -7,6 +7,13 @@ may be breaking.
 
 ## [Unreleased]
 
+### Changed
+
+- `master` is protected; changes land through squash-merged PRs from
+  per-branch worktrees (`just wt`, `just wt-clean`). Releases bump the version
+  in a PR and are tagged afterwards with `just tag`. CI runs the SemVer check
+  on PRs (label `breaking` to allow a minor break).
+
 ## [0.7.0] - 2026-11-01
 
 ### Breaking

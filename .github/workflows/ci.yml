@@ -4,6 +4,7 @@ on:
   push:
     branches: [master]
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 permissions:
   contents: read
@@ -27,3 +28,20 @@ jobs:
           cargo nextest run --workspace --features std
           cargo nextest run --workspace --no-default-features
           cargo test --workspace --doc --features std
+
+  semver-check:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # needs the release tags as baseline
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks,just
+      - name: Check SemVer against the latest release tag
+        env:
+          # A PR labelled `breaking` targets the next minor release (pre-1.0).
+          SEMVER_RELEASE_TYPE: ${{ contains(github.event.pull_request.labels.*.name, 'breaking') && 'minor' || '' }}
+        run: just semver-check
