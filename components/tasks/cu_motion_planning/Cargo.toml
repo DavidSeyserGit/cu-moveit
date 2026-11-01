@@ -18,10 +18,10 @@ environments = ["host", "embedded"]
 
 [dependencies]
 bincode = { workspace = true }
-cu-collision = { version = "0.5.0", path = "../../libs/cu_collision", default-features = false }
-cu-kinematics = { version = "0.5.0", path = "../../libs/cu_kinematics", default-features = false }
+cu-collision = { version = "0.6.0", path = "../../libs/cu_collision", default-features = false }
+cu-kinematics = { version = "0.6.0", path = "../../libs/cu_kinematics", default-features = false }
 cu-rng = { workspace = true }
-cu-trajectory = { version = "0.5.0", path = "../../libs/cu_trajectory", default-features = false }
+cu-trajectory = { version = "0.6.0", path = "../../libs/cu_trajectory", default-features = false }
 cu29 = { workspace = true }
 libm = { workspace = true }
 serde = { workspace = true }

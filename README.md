@@ -24,7 +24,7 @@ Nothing is published to crates.io yet (`publish = false` workspace-wide; the API
 is pre-1.0 and may change). Depend on the git repository instead:
 
 ```toml
-cu-kinematics = { git = "https://github.com/DavidSeyserGit/cu-moveit", tag = "v0.5.0" }
+cu-kinematics = { git = "https://github.com/DavidSeyserGit/cu-moveit", tag = "v0.6.0" }
 ```
 
 The workspace is versioned and tagged as a whole (`vX.Y.Z`), never per crate.
