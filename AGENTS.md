@@ -30,7 +30,52 @@ Versioning, breaking-change rules, and releases follow `docs/versioning.md`; rec
    - Payloads derive `#[derive(Default, Debug, Clone, Encode, Decode, Serialize, Deserialize, Reflect)]`.
    - `Tov` stays on the `CuMsg` envelope, never inside payload structs.
    - Tasks derive `Reflect` and implement `Freezable` + `CuTask` (or `CuAnytimeTask`).
-7. **Workflow:** Remove generated `Cargo.lock` before a work pass if needed, run `just fmt` after edits, and run `just pr-check` before committing.
+7. **Workflow:** Follow the Git, PR and Release Workflow below. Remove generated `Cargo.lock` before a work pass if needed, run `just fmt` after edits, and run `just pr-check` before committing.
+
+## Git, PR and Release Workflow
+
+These rules apply to every contributor, human or AI agent, and to every tool
+(Claude Code, Codex, Copilot, Cursor, T3, …). They are not optional: `master`
+is protected on GitHub (PR required, `pr-check` and `semver-check` must pass,
+linear history, enforced for admins), so violating them fails anyway.
+Background: `CONTRIBUTING.md` and `docs/versioning.md`.
+
+**Never**
+
+- Commit to, push to, force-push, or reset `master`, even if asked to "commit
+  and push". On `master`, branch first.
+- Create, move, or push `v*` tags, or run `just release --execute`, unless
+  the user explicitly asks for a release.
+- Merge a PR, change branch protection or repository settings, or delete
+  someone else's branch or worktree without explicit approval.
+- Bypass checks (`--no-verify`, skipping `just pr-check`, disabling CI jobs).
+
+**Every change**
+
+1. Start a branch in its own worktree: `just wt <user>/<kind>/<description>`
+   (`kind`: `feat`, `fix`, `refactor`, `docs`, `chore`, `perf`, `test`), then
+   work in the printed `../repose-wt/<description>` directory. Tool-managed
+   worktrees (e.g. `t3/...`) are fine. Never check out one branch in two
+   worktrees.
+2. Keep one focused change per branch. Rebase on `origin/master`; don't merge
+   it in.
+3. Run `just fmt` and `just pr-check` (fmt, clippy std/no_std/reflect, nextest,
+   doctests, SemVer). All must pass before you push.
+4. Record user-visible changes under `## [Unreleased]` in `CHANGELOG.md`.
+   Intentional breaking changes (API, payload encoding, RON config, `cu29`
+   minor, MSRV) go under `### Breaking`. That is what allows the SemVer
+   check to pass, so never work around it any other way.
+5. Push with `git push -u origin <branch>` and open a PR with `gh pr create`.
+   The title becomes the squash commit message; the body says what changed,
+   why, and how it was tested. Follow the attribution rules the user gives you.
+6. Address review comments and failing checks on the same branch. PRs are
+   squash-merged and the branch is deleted on merge. Afterwards, `just wt-clean`
+   in the main checkout removes merged worktrees.
+
+**Releases** (only when asked): follow the release process in
+`docs/versioning.md`. The version bump lands through a release PR via
+`just release <patch|minor> --execute`; after the merge, `just tag` on a clean,
+up-to-date `master` tags it.
 
 ## Roadmap
 

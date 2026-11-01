@@ -27,3 +27,18 @@ jobs:
           cargo nextest run --workspace --features std
           cargo nextest run --workspace --no-default-features
           cargo test --workspace --doc --features std
+
+  semver-check:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # needs the release tags as baseline
+      # Breaks are allowed when CHANGELOG.md lists them under Unreleased (see justfile).
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks,just
+      - name: Check SemVer against the latest release tag
+        run: just semver-check

@@ -38,8 +38,8 @@ repository = "https://github.com/ReposeRobotics/repose"
 # versioned path dependencies, already in place) to start lockstep publishing.
 publish = false
 
-# cargo-release: one shared version, one `vX.Y.Z` tag for the whole workspace.
-# See docs/versioning.md.
+# cargo-release: one shared version for the whole workspace. It only bumps and
+# commits; `just tag` tags the merged release commit. See docs/versioning.md.
 [workspace.metadata.release]
 shared-version = true
 consolidate-commits = true
@@ -47,6 +47,7 @@ tag-name = "v{{version}}"
 pre-release-commit-message = "chore: release v{{version}}"
 publish = false
 push = false
+tag = false
 
 [workspace.dependencies]
 cu29 = { version = "1.3.1", default-features = false, features = ["units"] }
