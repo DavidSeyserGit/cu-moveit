@@ -46,7 +46,7 @@ pub enum CuIoStatus {
 
 /// Digital input levels read by a bridge (`digital_in` channel).
 #[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+#[reflect(no_field_bounds, from_reflect = false)]
 pub struct CuDigitalInputPayload<const N: usize> {
     pub status: CuIoStatus,
     /// Level of each input; `true` is the active (energized) level.
@@ -69,7 +69,7 @@ impl<const N: usize> Default for CuDigitalInputPayload<N> {
 /// leaves the others at their current level, so a command never touches IO
 /// it does not own.
 #[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+#[reflect(no_field_bounds, from_reflect = false)]
 pub struct CuDigitalOutputPayload<const N: usize> {
     #[serde(with = "crate::serde_arrays::bool_array")]
     pub values: [bool; N],

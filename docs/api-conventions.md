@@ -60,9 +60,14 @@ capability still reachable and adjustable by parameters.
 
 ## Types and generics
 
-- Generic tasks keep `TypePath` (no `type_path = false` on task structs) so RON
-  can name `cu_crate::CuThingTask<6, 1024>` directly. Applications never wrap
-  library tasks.
+- Never use `#[reflect(type_path = false)]`, despite the generic-struct advice in
+  the upstream Copper skills. Every reflected type keeps `TypePath`: tasks so RON
+  can name `cu_crate::CuThingTask<6, 1024>` directly (applications never wrap
+  library tasks), and payloads/params because real `bevy_reflect` (the
+  `cu29/reflect` feature) requires it. Generic type parameters that are not
+  reflected get a manual `TypePath` impl (see
+  `cu_motion_planning::impl_planner_type_path!`). `just lint` and `just test`
+  build with `cu29/reflect` to keep this working.
 - Const generics users change most come first; everything else has a default.
   Names: `N` joints, `M` collision shapes, `MAX_*` capacities.
 - Each planner `CuJoint<Algo>` has `CuJoint<Algo>Params` and a task alias

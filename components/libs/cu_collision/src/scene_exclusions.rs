@@ -105,7 +105,7 @@ impl CuSceneExclusion {
 /// Published alongside a [`CuPlanningScene`] snapshot and validated against it on every check,
 /// so exclusions always bind to the current snapshot.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+#[reflect(no_field_bounds, from_reflect = false)]
 pub struct CuSceneExclusions<const MAX_EXCLUSIONS: usize = DEFAULT_MAX_EXCLUSIONS> {
     #[serde(with = "crate::serde_arrays::exclusion_array")]
     exclusions: [CuSceneExclusion; MAX_EXCLUSIONS],

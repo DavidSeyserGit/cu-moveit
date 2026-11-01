@@ -117,7 +117,7 @@ pub enum CuControllerStatus {
 
 /// Unified joint command: the only command payload a bridge has to carry.
 #[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+#[reflect(no_field_bounds, from_reflect = false)]
 pub struct CuJointCommandPayload<const N: usize> {
     #[serde(with = "cu_kinematics::serde_arrays::position_array")]
     pub positions: [CuJointPosition; N],

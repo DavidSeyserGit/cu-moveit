@@ -43,7 +43,7 @@ use crate::quintic::polynomial_extrema;
 /// }
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode, Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+#[reflect(no_field_bounds, from_reflect = false)]
 #[serde(deny_unknown_fields)]
 pub struct CuJointTrajectoryLimits<const N: usize> {
     #[serde(with = "cu_kinematics::serde_arrays::velocity_array")]
@@ -195,7 +195,7 @@ fn default_sample_period() -> Time {
 /// }
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+#[reflect(no_field_bounds, from_reflect = false)]
 // Field-level defaults: serde does not support container `default` on const-generic structs.
 #[serde(deny_unknown_fields)]
 pub struct CuTimingParams<const N: usize> {

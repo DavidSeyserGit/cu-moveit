@@ -209,7 +209,7 @@ impl CuJointSpec {
 /// assert!((ee.to_matrix()[2][3] - 0.15).abs() < 1e-12);
 /// ```
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+#[reflect(no_field_bounds, from_reflect = false)]
 #[serde(deny_unknown_fields)]
 pub struct CuKinematicChain<const N: usize> {
     #[serde(with = "crate::serde_arrays::joint_spec_array")]

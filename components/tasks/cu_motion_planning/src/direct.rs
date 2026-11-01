@@ -127,3 +127,5 @@ impl<const N: usize, const M: usize> CuJointPlanner<N, M> for CuJointDirect<N, M
         quality_from_f32(if self.status.has_path() { 1.0 } else { 0.0 })
     }
 }
+
+crate::impl_planner_type_path!(CuJointDirect, "cu_motion_planning::CuJointDirect");

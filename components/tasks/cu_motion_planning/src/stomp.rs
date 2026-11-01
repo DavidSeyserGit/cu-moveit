@@ -371,3 +371,5 @@ impl<const N: usize, const M: usize> CuJointPlanner<N, M> for CuJointStomp<N, M>
         length_quality(self.straight_cost, self.best_cost)
     }
 }
+
+crate::impl_planner_type_path!(CuJointStomp, "cu_motion_planning::CuJointStomp");

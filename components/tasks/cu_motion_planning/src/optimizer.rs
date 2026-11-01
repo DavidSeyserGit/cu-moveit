@@ -323,3 +323,8 @@ impl<const N: usize, const M: usize> CuJointPlanner<N, M> for CuJointPathOptimiz
         quality_from_f32((self.straight_cost / self.best_cost).clamp(0.0, 1.0) as f32)
     }
 }
+
+crate::impl_planner_type_path!(
+    CuJointPathOptimizer,
+    "cu_motion_planning::CuJointPathOptimizer"
+);

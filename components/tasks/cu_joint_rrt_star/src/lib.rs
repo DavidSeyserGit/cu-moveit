@@ -903,3 +903,5 @@ mod tests {
         }
     }
 }
+
+cu_motion_planning::impl_planner_type_path!(CuJointRrtStar, "cu_joint_rrt_star::CuJointRrtStar");

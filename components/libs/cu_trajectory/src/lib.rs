@@ -63,7 +63,7 @@ pub const MAX_TRAJECTORY_POINTS: usize = 64;
 
 /// Single timestamped joint waypoint with positions and velocities.
 #[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+#[reflect(no_field_bounds, from_reflect = false)]
 pub struct CuTrajectoryPoint<const N: usize> {
     /// Elapsed time since trajectory start.
     pub time_from_start: Time,
@@ -114,7 +114,7 @@ pub enum CuTrajectoryInterpolation {
 
 /// Fixed-capacity timestamped joint trajectory (`CuMsgPayload`-compliant).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+#[reflect(no_field_bounds, from_reflect = false)]
 pub struct CuTrajectoryPayload<const N: usize, const MAX_POINTS: usize = MAX_TRAJECTORY_POINTS> {
     #[serde(with = "crate::serde_arrays::trajectory_point_array")]
     pub points: [CuTrajectoryPoint<N>; MAX_POINTS],

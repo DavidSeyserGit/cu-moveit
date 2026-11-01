@@ -13,12 +13,14 @@ lint:
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets --features std -- --deny warnings
     cargo clippy --workspace --lib --no-default-features -- --deny warnings
+    cargo clippy --workspace --all-targets --features std,cu29/reflect -- --deny warnings
 
 # Run unit tests (std + no_std) with nextest and verify doctests.
 test:
     cargo nextest run --workspace --features std
     cargo nextest run --workspace --no-default-features
     cargo test --workspace --doc --features std
+    cargo nextest run --workspace --features std,cu29/reflect
 
 # Print the current public API for review (needs cargo-public-api + pinned nightly; see copper-workflow).
 # Pre-1.0 this is advisory; at 1.0, diff its output against the previous release before tagging.

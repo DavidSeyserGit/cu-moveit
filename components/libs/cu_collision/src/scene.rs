@@ -330,7 +330,7 @@ struct CuPlanningSceneSnapshot<const MAX_OBSTACLES: usize, const MAX_ATTACHED: u
 /// Every mutation is transactional and increments [`CuSceneRevision`] on success.
 /// [`collision_env`](Self::collision_env) borrows the scene as a zero-copy [`CuCollisionEnv`].
 #[derive(Debug, Clone, PartialEq, Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+#[reflect(no_field_bounds, from_reflect = false)]
 pub struct CuPlanningScene<
     const MAX_OBSTACLES: usize = DEFAULT_MAX_OBSTACLES,
     const MAX_ATTACHED: usize = DEFAULT_MAX_ATTACHED,

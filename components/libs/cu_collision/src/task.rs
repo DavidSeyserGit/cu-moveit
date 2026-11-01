@@ -29,7 +29,7 @@ pub const DEFAULT_MAX_CONTACTS: usize = 16;
 /// Both keys are required. `chain` is a [`CuChainSpec`] and `collision_model` a
 /// [`CuCollisionModelSpec`] (preset name or inline model).
 #[derive(Debug, Clone, Serialize, Deserialize, Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+#[reflect(no_field_bounds, from_reflect = false)]
 // Field-level defaults: serde does not support container `default` on const-generic structs.
 #[serde(deny_unknown_fields)]
 pub struct CuCollisionCheckParams<const N: usize, const M: usize = N> {

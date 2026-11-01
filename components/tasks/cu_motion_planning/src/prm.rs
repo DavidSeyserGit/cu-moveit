@@ -351,3 +351,5 @@ impl<const N: usize, const M: usize> CuJointPlanner<N, M> for CuJointPrm<N, M> {
         )
     }
 }
+
+crate::impl_planner_type_path!(CuJointPrm, "cu_motion_planning::CuJointPrm");

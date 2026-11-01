@@ -49,7 +49,7 @@ mod option_position_array {
 /// config: {"goal": [{"revolute": 0.4}, {"prismatic": 0.1}]}
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+#[reflect(no_field_bounds, from_reflect = false)]
 // Field-level defaults: serde does not support container `default` on const-generic structs.
 #[serde(deny_unknown_fields)]
 pub struct CuJointGoalParams<const N: usize> {

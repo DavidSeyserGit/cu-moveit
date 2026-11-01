@@ -62,6 +62,31 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
+/// Implements [`TypePath`] for a const-generic planner `$ty<N, M>` with the
+/// fixed path `$path` (const arguments are not part of the path).
+#[macro_export]
+macro_rules! impl_planner_type_path {
+    ($ty:ident, $path:literal) => {
+        impl<const N: usize, const M: usize> ::cu29::prelude::TypePath for $ty<N, M> {
+            fn type_path() -> &'static str {
+                $path
+            }
+            fn short_type_path() -> &'static str {
+                ::core::stringify!($ty)
+            }
+            fn type_ident() -> Option<&'static str> {
+                Some(::core::stringify!($ty))
+            }
+            fn crate_name() -> Option<&'static str> {
+                $path.split("::").next()
+            }
+            fn module_path() -> Option<&'static str> {
+                $path.rsplit_once("::").map(|(module, _)| module)
+            }
+        }
+    };
+}
+
 mod astar;
 mod common;
 mod direct;
@@ -133,7 +158,7 @@ pub const MAX_EXCLUSIONS: usize = 16;
 
 /// Joint-space planning request (`CuMsgPayload`-compliant).
 #[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+#[reflect(no_field_bounds, from_reflect = false)]
 pub struct CuJointPlanRequest<const N: usize> {
     pub scene: CuPlanningScene<MAX_OBSTACLES, MAX_ATTACHED_SHAPES>,
     pub exclusions: CuSceneExclusions<MAX_EXCLUSIONS>,
@@ -194,7 +219,7 @@ impl CuPlanStatus {
 
 /// Planned joint-space path (`CuMsgPayload`-compliant).
 #[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+#[reflect(no_field_bounds, from_reflect = false)]
 pub struct CuJointPlanPath<const N: usize> {
     pub waypoints: [CuJointPositionsPayload<N>; MAX_WAYPOINTS],
     /// Number of valid waypoints in `waypoints[..len]`; `0` unless the status
@@ -257,7 +282,11 @@ pub enum CuPlannerKind {
 /// randomness from it so replay reproduces every job.
 ///
 /// `M` is the number of collision-model shapes (default `N`).
-pub trait CuJointPlanner<const N: usize, const M: usize = N>: Sized {
+///
+/// Planners implement [`TypePath`] so the generic planner task stays
+/// nameable and inspectable under Copper's runtime reflection; use
+/// [`impl_planner_type_path!`] for a const-generic planner.
+pub trait CuJointPlanner<const N: usize, const M: usize = N>: Sized + TypePath {
     /// Exploration family, for diagnostics and documentation.
     const KIND: CuPlannerKind;
 

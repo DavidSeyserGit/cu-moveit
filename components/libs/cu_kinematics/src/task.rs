@@ -18,7 +18,7 @@ use serde::Serialize;
 
 /// Fixed-DOF joint position payload (`CuMsgPayload`-compliant).
 #[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+#[reflect(no_field_bounds, from_reflect = false)]
 pub struct CuJointPositionsPayload<const N: usize> {
     #[serde(with = "crate::serde_arrays::position_array")]
     pub positions: [CuJointPosition; N],
@@ -51,7 +51,7 @@ pub enum CuRobotStatus {
 
 /// Measured joint state: the only state payload a bridge has to produce.
 #[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+#[reflect(no_field_bounds, from_reflect = false)]
 pub struct CuJointStatePayload<const N: usize> {
     /// Current health reported by the bridge.
     pub status: CuRobotStatus,
@@ -73,7 +73,7 @@ impl<const N: usize> Default for CuJointStatePayload<N> {
 
 /// Fixed-DOF joint velocity command/state payload (`CuMsgPayload`-compliant).
 #[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+#[reflect(no_field_bounds, from_reflect = false)]
 pub struct CuJointVelocitiesPayload<const N: usize> {
     #[serde(with = "crate::serde_arrays::velocity_array")]
     pub velocities: [CuJointVelocity; N],
@@ -91,7 +91,7 @@ impl<const N: usize> Default for CuJointVelocitiesPayload<N> {
 
 /// Inverse kinematics solution payload carrying solved joint angles and convergence status.
 #[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+#[reflect(no_field_bounds, from_reflect = false)]
 pub struct CuIkSolutionPayload<const N: usize> {
     #[serde(with = "crate::serde_arrays::position_array")]
     pub positions: [CuJointPosition; N],
@@ -135,7 +135,7 @@ fn read_params<T: Default + serde::de::DeserializeOwned>(
 /// config: {"chain": "igus_rebel", "tool_offset": /* optional Transform3D */}
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+#[reflect(no_field_bounds, from_reflect = false)]
 // Field-level defaults: serde does not support container `default` on const-generic structs.
 #[serde(deny_unknown_fields)]
 pub struct CuForwardKinematicsParams<const N: usize> {
@@ -177,7 +177,7 @@ impl<const N: usize> CuForwardKinematicsParams<N> {
 /// config: {"chain": "igus_rebel", "ik": {"max_iterations": 128, "damping": 0.05}}
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+#[reflect(no_field_bounds, from_reflect = false)]
 // Field-level defaults: serde does not support container `default` on const-generic structs.
 #[serde(deny_unknown_fields)]
 pub struct CuInverseKinematicsParams<const N: usize> {
@@ -224,7 +224,7 @@ impl<const N: usize> CuInverseKinematicsParams<N> {
 /// config: {"chain": "igus_rebel", "diff_ik": {"base_damping": 0.02, "limit_margin": 0.15}}
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+#[reflect(no_field_bounds, from_reflect = false)]
 // Field-level defaults: serde does not support container `default` on const-generic structs.
 #[serde(deny_unknown_fields)]
 pub struct CuServoParams<const N: usize> {

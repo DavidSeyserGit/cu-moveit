@@ -334,3 +334,5 @@ impl<const N: usize, const M: usize> CuJointPlanner<N, M> for CuJointRrtConnect<
         )
     }
 }
+
+crate::impl_planner_type_path!(CuJointRrtConnect, "cu_motion_planning::CuJointRrtConnect");

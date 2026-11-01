@@ -44,7 +44,7 @@ pub enum CuFollowStatus {
 /// Single-output analogue of `CuIkSolutionPayload`/`CuJointVelocitiesPayload`:
 /// `CuTask` supports exactly one `Output` type, so status rides with the data.
 #[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+#[reflect(no_field_bounds, from_reflect = false)]
 pub struct CuTrajectoryFollowOutput<const N: usize> {
     #[serde(with = "cu_kinematics::serde_arrays::position_array")]
     pub positions: [CuJointPosition; N],

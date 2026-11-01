@@ -48,7 +48,7 @@ pub struct CuCollisionContact {
 
 /// Fixed-capacity collision report populated in place (`CuMsgPayload`-compliant).
 #[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+#[reflect(no_field_bounds, from_reflect = false)]
 pub struct CuCollisionReport<const MAX_CONTACTS: usize> {
     #[serde(with = "crate::serde_arrays::contact_array")]
     contacts: [CuCollisionContact; MAX_CONTACTS],
@@ -157,7 +157,7 @@ fn validate_margin(margin: Length64) -> CuResult<()> {
 /// Each shape is a [`CuLinkShape`] on a joint frame or the base. Shape indices identify contacts
 /// and collision pairs; several shapes may share a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Reflect)]
-#[reflect(no_field_bounds, from_reflect = false, type_path = false)]
+#[reflect(no_field_bounds, from_reflect = false)]
 pub struct CuRobotCollisionModel<const N: usize, const M: usize = N> {
     shapes: [CuLinkShape; M],
     safety_margin: Length64,
