@@ -48,24 +48,27 @@ follow → control loop against MuJoCo, configured entirely in RON, see
 Only serial kinematic chains are supported. The joint count `N` is part of the task
 and payload types; branched and closed-chain mechanisms are outside the current scope.
 
-Task initialization never selects a robot preset. FK, IK, and servo tasks require
-an explicit `chain` configuration containing exactly `N` joint specifications.
-An optional `tool_offset` overrides the chain's flange-to-tool transform.
+Task initialization never picks a robot implicitly. FK, IK, servo, collision,
+and planner tasks require a `chain`, given either as a preset name or inline
+with exactly `N` joint specifications:
 
-Collision and planner tasks also require an explicit collision model and typed
-`safety_margin`. `CuRobotCollisionModel<N, M>` stores up to `M` shapes attached to
-`N` movable frames or the base. The default `M = N` preserves one-shape-per-joint
+```ron
+config: {"chain": "igus_rebel", "collision_model": "igus_rebel"}
+config: {"chain": {"joints": [...]}, "collision_model": {"shapes": [...], "safety_margin": 0.005}}
+```
+
+An optional `tool_offset` overrides the chain's flange-to-tool transform.
+`CuRobotCollisionModel<N, M>` stores up to `M` shapes attached to `N` movable
+frames or the base. The default `M = N` preserves one-shape-per-joint
 construction; imported robots can have several shapes per link, missing geometry,
 and shapes on fixed links. Contacts identify shape indices.
 
-Use `new_with_chain` or `new_with_model` to supply imported models directly.
+Use `from_params` to supply imported models directly.
 `CuJointPosition` carries `Revolute(Angle)`, `Prismatic(Length)`, or `Fixed`;
-`CuJointVelocity` similarly distinguishes angular and linear velocity. Incorrect
-coordinate units return an error. Planner distances and costs are dimensionless,
-scaled by `CuJointMetric` (default: one radian and one meter).
-
-The igus ReBeL helpers remain optional presets for examples and applications;
-no task initializer uses them automatically.
+`CuJointVelocity`, `CuJointAcceleration`, and `CuJointJerk` similarly distinguish
+angular and linear quantities. Incorrect coordinate units return an error.
+Planner distances and costs are dimensionless, scaled by `CuJointMetric`
+(default: one radian and one meter).
 
 ## URDF and SRDF
 
@@ -73,10 +76,12 @@ no task initializer uses them automatically.
 let robot = CuRobotDescription::<6, 24>::from_urdf_srdf(
     &urdf_xml,
     &srdf_xml,
-    "manipulator",
-    Length::new::<meter>(0.005),
+    CuSrdfImport::new("manipulator").with_collision(CuCollisionModelParams {
+        safety_margin: Length::new::<meter>(0.005),
+        skip_adjacent_links: false,
+    }),
 )?;
-let fk = CuForwardKinematicsTask::new_with_chain(robot.chain);
+let fk = CuForwardKinematicsTask::from_params(robot.chain().clone())?;
 ```
 
 Parsing requires the `cu-robot-description` crate's `std` feature and runs at
